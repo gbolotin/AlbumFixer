@@ -1,0 +1,30 @@
+# .NET build output
+**/bin/
+**/obj/
+
+# Packaged application output
+publish/
+
+# Visual Studio and user-specific files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Test and coverage output
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+~$*
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
