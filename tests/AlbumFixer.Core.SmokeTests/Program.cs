@@ -21,6 +21,12 @@ try
     Console.WriteLine("AlbumFixer.Core smoke tests passed (13/13).");
     return 0;
 }
+catch (Exception error)
+{
+    Console.Error.WriteLine("AlbumFixer.Core smoke tests failed.");
+    Console.Error.WriteLine(error);
+    return 1;
+}
 finally
 {
     if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
