@@ -1,15 +1,110 @@
-<Application x:Class="AlbumFixer.App.App" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" StartupUri="MainWindow.xaml">
+<Application x:Class="AlbumFixer.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
   <Application.Resources>
-    <SolidColorBrush x:Key="Bg" Color="#0B1017"/><SolidColorBrush x:Key="Panel" Color="#111923"/><SolidColorBrush x:Key="Card" Color="#16212D"/><SolidColorBrush x:Key="Line" Color="#263644"/><SolidColorBrush x:Key="Text" Color="#F5F7F9"/><SolidColorBrush x:Key="Muted" Color="#9DAAB7"/><SolidColorBrush x:Key="Mint" Color="#5BE0B3"/><SolidColorBrush x:Key="MintDark" Color="#173E35"/><SolidColorBrush x:Key="Amber" Color="#F4B860"/><SolidColorBrush x:Key="Red" Color="#FF7A7A"/>
-    <Style TargetType="Window"><Setter Property="Background" Value="{StaticResource Bg}"/><Setter Property="Foreground" Value="{StaticResource Text}"/><Setter Property="FontFamily" Value="Segoe UI"/></Style>
+    <SolidColorBrush x:Key="Bg" Color="#0B1017"/>
+    <SolidColorBrush x:Key="Panel" Color="#111923"/>
+    <SolidColorBrush x:Key="Card" Color="#16212D"/>
+    <SolidColorBrush x:Key="Line" Color="#263644"/>
+    <SolidColorBrush x:Key="Text" Color="#F5F7F9"/>
+    <SolidColorBrush x:Key="Muted" Color="#9DAAB7"/>
+    <SolidColorBrush x:Key="Mint" Color="#5BE0B3"/>
+    <SolidColorBrush x:Key="MintDark" Color="#173E35"/>
+    <SolidColorBrush x:Key="Amber" Color="#F4B860"/>
+    <SolidColorBrush x:Key="Red" Color="#FF7A7A"/>
+
+    <Style TargetType="Window">
+      <Setter Property="Background" Value="{StaticResource Bg}"/>
+      <Setter Property="Foreground" Value="{StaticResource Text}"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+    </Style>
     <Style TargetType="TextBlock"><Setter Property="Foreground" Value="{StaticResource Text}"/></Style>
-    <Style x:Key="CardStyle" TargetType="Border"><Setter Property="Background" Value="{StaticResource Card}"/><Setter Property="BorderBrush" Value="{StaticResource Line}"/><Setter Property="BorderThickness" Value="1"/><Setter Property="CornerRadius" Value="14"/><Setter Property="Padding" Value="18"/></Style>
-    <Style x:Key="ButtonStyle" TargetType="Button"><Setter Property="Background" Value="#273746"/><Setter Property="Foreground" Value="{StaticResource Text}"/><Setter Property="BorderThickness" Value="0"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Padding" Value="16,10"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="c" Background="{TemplateBinding Background}" CornerRadius="9" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="c" Property="Opacity" Value=".86"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter TargetName="c" Property="Opacity" Value=".3"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
-    <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource ButtonStyle}"><Setter Property="Background" Value="{StaticResource Mint}"/><Setter Property="Foreground" Value="#071B15"/></Style>
-    <Style TargetType="TextBox"><Setter Property="Background" Value="#0E161F"/><Setter Property="Foreground" Value="{StaticResource Text}"/><Setter Property="CaretBrush" Value="{StaticResource Mint}"/><Setter Property="BorderBrush" Value="{StaticResource Line}"/><Setter Property="Padding" Value="10,8"/></Style>
-    <Style TargetType="ProgressBar"><Setter Property="Foreground" Value="{StaticResource Mint}"/><Setter Property="Background" Value="#26333E"/><Setter Property="BorderThickness" Value="0"/></Style>
-    <Style TargetType="ListBox"><Setter Property="Background" Value="Transparent"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Foreground" Value="{StaticResource Text}"/></Style>
-    <Style TargetType="ListBoxItem"><Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="Padding" Value="0"/></Style>
-    <Style TargetType="TabItem"><Setter Property="Foreground" Value="{StaticResource Muted}"/><Setter Property="Background" Value="Transparent"/><Setter Property="Padding" Value="14,9"/><Setter Property="FontWeight" Value="SemiBold"/><Style.Triggers><Trigger Property="IsSelected" Value="True"><Setter Property="Foreground" Value="{StaticResource Mint}"/><Setter Property="Background" Value="#17232F"/></Trigger></Style.Triggers></Style>
+    <Style x:Key="CardStyle" TargetType="Border">
+      <Setter Property="Background" Value="{StaticResource Card}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="14"/>
+      <Setter Property="Padding" Value="18"/>
+    </Style>
+    <Style x:Key="ButtonStyle" TargetType="Button">
+      <Setter Property="Background" Value="#273746"/>
+      <Setter Property="Foreground" Value="{StaticResource Text}"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Padding" Value="16,10"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="ButtonChrome" Background="{TemplateBinding Background}" CornerRadius="9" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ButtonChrome" Property="Opacity" Value=".86"/></Trigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter TargetName="ButtonChrome" Property="Opacity" Value=".3"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource ButtonStyle}">
+      <Setter Property="Background" Value="{StaticResource Mint}"/>
+      <Setter Property="Foreground" Value="#071B15"/>
+    </Style>
+    <Style TargetType="TextBox">
+      <Setter Property="Background" Value="#0E161F"/>
+      <Setter Property="Foreground" Value="{StaticResource Text}"/>
+      <Setter Property="CaretBrush" Value="{StaticResource Mint}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+      <Setter Property="Padding" Value="10,8"/>
+    </Style>
+    <Style TargetType="ProgressBar">
+      <Setter Property="Foreground" Value="{StaticResource Mint}"/>
+      <Setter Property="Background" Value="#26333E"/>
+      <Setter Property="BorderThickness" Value="0"/>
+    </Style>
+    <Style TargetType="ListBox">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Foreground" Value="{StaticResource Text}"/>
+    </Style>
+    <Style TargetType="ListBoxItem">
+      <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+      <Setter Property="Padding" Value="0"/>
+    </Style>
+    <Style TargetType="TabControl">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+    </Style>
+    <Style TargetType="TabItem">
+      <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Padding" Value="15,9"/>
+      <Setter Property="Margin" Value="0,0,4,0"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TabItem">
+            <Border x:Name="TabChrome"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="Transparent"
+                    BorderThickness="1"
+                    CornerRadius="8"
+                    Padding="{TemplateBinding Padding}">
+              <ContentPresenter ContentSource="Header" HorizontalAlignment="Center" VerticalAlignment="Center" RecognizesAccessKey="True"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="TabChrome" Property="Background" Value="#1B2935"/></Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter Property="Foreground" Value="{StaticResource Mint}"/>
+                <Setter TargetName="TabChrome" Property="Background" Value="#17232F"/>
+                <Setter TargetName="TabChrome" Property="BorderBrush" Value="{StaticResource Line}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
   </Application.Resources>
 </Application>

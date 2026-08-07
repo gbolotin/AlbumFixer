@@ -5,8 +5,9 @@ using System.Text.RegularExpressions;
 
 namespace AlbumFixer.Core;
 
-public enum WorkflowMode { FlacCueSplit, DsdExtraction, ExistingTrackRepair, NeedsInspection, Unsupported }
+public enum WorkflowMode { FlacCueSplit, DsdExtraction, ExistingTrackRepair, MultipleAlbums, NeedsInspection, Unsupported }
 public enum CheckState { Passed, Warning, Failed }
+public enum CodexWorkKind { MetadataEnrichment }
 public enum JobPhase
 {
     Ready = 0, Inventoried = 1, CopyingIn = 2, SourceCopyVerified = 3, Processing = 4,
@@ -26,6 +27,7 @@ public sealed record ScanResult(
         WorkflowMode.FlacCueSplit => "FLAC + CUE image split",
         WorkflowMode.DsdExtraction => "DSD / SACD extraction",
         WorkflowMode.ExistingTrackRepair => "Existing-track metadata repair",
+        WorkflowMode.MultipleAlbums => "Multiple albums detected",
         WorkflowMode.NeedsInspection => "Needs inspection",
         _ => "No supported source found"
     };
@@ -40,9 +42,17 @@ public sealed record PreflightResult(
 }
 
 public sealed record ProgressSnapshot(JobPhase Phase, int Percent, string Status, string Detail, DateTimeOffset UpdatedAt);
-public sealed record RunOptions(string CodexPath, string AlbumRoot, string JobDirectory, bool DeleteOriginals, string SkillPath);
+public sealed record RunOptions(
+    string CodexPath,
+    string AlbumRoot,
+    string JobDirectory,
+    bool DeleteOriginals,
+    string SkillPath,
+    string FfmpegPath,
+    string FfprobePath,
+    CodexWorkKind WorkKind = CodexWorkKind.MetadataEnrichment);
 public sealed record RunEvent(string Kind, string Message, ProgressSnapshot? Progress = null, string? ThreadId = null);
-public sealed record RunResult(int ExitCode, bool Canceled, string? ThreadId, string FinalMessagePath, string EventLogPath);
+public sealed record RunResult(int ExitCode, bool Canceled, string? ThreadId, string FinalMessagePath, string EventLogPath, ProgressSnapshot? LastProgress);
 public sealed record ReportSummary(string Status, string Headline, string Detail, int Tracks, int Sections, bool Deleted, IReadOnlyList<string> Errors, string Json);
 
 public static class SizeText
@@ -125,8 +135,17 @@ public sealed partial class AlbumScanner
 
         var images = media.Where(item => item.Kind.Contains("image", StringComparison.OrdinalIgnoreCase) || item.Kind is "DST stream" or "Raw DSD").ToArray();
         var tracks = media.Where(item => item.Kind.StartsWith("Existing", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var albumRoots = images.Concat(tracks)
+            .Select(item => AlbumScope(root, item.Path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
         WorkflowMode mode;
-        if (tracks.Length >= 2)
+        if (albumRoots.Length > 1)
+        {
+            mode = WorkflowMode.MultipleAlbums;
+            errors.Add($"This folder contains {albumRoots.Length} independent albums. Choose one album folder; batch mode is not available yet.");
+        }
+        else if (tracks.Length >= 2)
         {
             mode = WorkflowMode.ExistingTrackRepair;
             if (images.Length > 0) warnings.Add("Separated tracks coexist with an image. Repair-only mode takes precedence; the image stays until equivalence is proven.");
@@ -144,6 +163,18 @@ public sealed partial class AlbumScanner
             media.Any(item => item.Kind.Contains("DS", StringComparison.OrdinalIgnoreCase) || item.Kind.Contains("SACD", StringComparison.OrdinalIgnoreCase)));
     }
 
+    private static string AlbumScope(string root, string mediaPath)
+    {
+        var relative = Path.GetRelativePath(root, mediaPath);
+        var separators = new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar };
+        var segments = relative.Split(separators, StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length < 2 || DiscOrAreaFolder().IsMatch(segments[0])) return root;
+        return Path.Combine(root, segments[0]);
+    }
+
+    [GeneratedRegex("^(?:(?:cd|disc|disk)\\s*[-_. ]*\\d+|stereo|multichannel)$", RegexOptions.IgnoreCase)]
+    private static partial Regex DiscOrAreaFolder();
+
     [GeneratedRegex("^\\s*FILE\\s+(?:\"(?<q>[^\"]+)\"|(?<u>\\S+))\\s+\\S+", RegexOptions.IgnoreCase)]
     private static partial Regex CueFile();
 }
@@ -152,18 +183,21 @@ public sealed class PreflightService
 {
     public async Task<PreflightResult> CheckAsync(ScanResult scan, string skillPath, CancellationToken token = default)
     {
-        var names = new[] { "codex", "ffmpeg", "ffprobe", "sacd_extract" };
+        var names = new[] { "ffmpeg", "ffprobe", "sacd_extract" };
         var tasks = names.ToDictionary(name => name, name => FindToolAsync(name, token));
         await Task.WhenAll(tasks.Values);
         var tools = tasks.ToDictionary(pair => pair.Key, pair => pair.Value.Result, StringComparer.OrdinalIgnoreCase);
+        tools["codex"] = null;
         var checks = new List<PreflightCheck>
         {
-            tools["codex"] is { } codex ? new("Codex runner", CheckState.Passed, codex) : new("Codex runner", CheckState.Failed, "Codex is not available on PATH.", true),
-            File.Exists(skillPath) ? new("Album Fixer skill", CheckState.Passed, skillPath) : new("Album Fixer skill", CheckState.Failed, "Installed skill was not found.", true)
+            new("Metadata agent (deferred)", CheckState.Passed, "Codex is checked only after the local split, and only when required metadata is missing."),
+            File.Exists(skillPath)
+                ? new("Album Fixer skill (deferred)", CheckState.Passed, "Available for the optional missing-metadata fallback; not copied during a complete local run.")
+                : new("Album Fixer skill (optional)", CheckState.Warning, "Local splitting still works. The optional metadata fallback requires the installed skill.")
         };
         if (scan.HasFlac)
         {
-            Require(checks, "ffmpeg", tools["ffmpeg"], "FLAC decode and equivalence verification");
+            Require(checks, "ffmpeg", tools["ffmpeg"], "local FLAC splitting and tagging");
             Require(checks, "ffprobe", tools["ffprobe"], "stream, tag, and artwork verification");
         }
         else if (scan.HasDsd) Require(checks, "ffprobe", tools["ffprobe"], "DSD container verification");
@@ -184,10 +218,12 @@ public sealed class PreflightService
         checks.Add(available >= required ? new("Local staging capacity", CheckState.Passed, $"{SizeText.Format(available)} available; {SizeText.Format(required)} estimated.") : new("Local staging capacity", CheckState.Failed, $"{SizeText.Format(required)} estimated; only {SizeText.Format(available)} available.", true));
         checks.Add(scan.Mode switch
         {
-            WorkflowMode.Unsupported => new("Album classification", CheckState.Failed, scan.WorkflowLabel, true),
+            WorkflowMode.Unsupported or WorkflowMode.MultipleAlbums => new("Album classification", CheckState.Failed, scan.WorkflowLabel, true),
             WorkflowMode.NeedsInspection => new("Album classification", CheckState.Warning, "Codex must resolve the source type before processing; uncertainty retains the original."),
             _ => new("Album classification", CheckState.Passed, scan.WorkflowLabel)
         });
+        if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.MultipleAlbums and not WorkflowMode.Unsupported)
+            checks.Add(new("Verified write-back", CheckState.Failed, "Host-managed final placement is currently enabled for FLAC + CUE image splits. Other modes stop before changing files.", true));
         checks.AddRange(scan.Errors.Select(error => new PreflightCheck("Inventory", CheckState.Failed, error, true)));
         return new(checks, tempRoot, required, available, tools);
     }
@@ -205,6 +241,8 @@ public sealed class PreflightService
     private static void Require(ICollection<PreflightCheck> checks, string name, string? path, string reason) =>
         checks.Add(path is not null ? new(name, CheckState.Passed, path) : new(name, CheckState.Failed, $"Required for {reason}.", true));
 
+    public static Task<string?> FindOptionalCodexAsync(CancellationToken token = default) => FindToolAsync("codex", token);
+
     private static async Task<string?> FindToolAsync(string name, CancellationToken token)
     {
         var exe = Path.HasExtension(name) ? name : name + ".exe";
@@ -213,58 +251,177 @@ public sealed class PreflightService
             try { var path = Path.Combine(directory.Trim('"'), exe); if (File.Exists(path)) return Path.GetFullPath(path); }
             catch (ArgumentException) { }
         }
-        var info = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "where.exe")) { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true };
+
+        foreach (var linkRoot in new[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "WinGet", "Links"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WinGet", "Links")
+        })
+        {
+            var candidate = Path.Combine(linkRoot, exe);
+            if (File.Exists(candidate)) return Path.GetFullPath(candidate);
+        }
+
+        if (name.Equals("ffmpeg", StringComparison.OrdinalIgnoreCase) || name.Equals("ffprobe", StringComparison.OrdinalIgnoreCase))
+        {
+            var packageRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "WinGet", "Packages");
+            try
+            {
+                var packaged = Directory.EnumerateDirectories(packageRoot, "Gyan.FFmpeg_*", SearchOption.TopDirectoryOnly)
+                    .SelectMany(directory => Directory.EnumerateFiles(directory, exe, SearchOption.AllDirectories))
+                    .FirstOrDefault();
+                if (packaged is not null) return Path.GetFullPath(packaged);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or DirectoryNotFoundException) { }
+        }
+
+        var info = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "where.exe")) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
         info.ArgumentList.Add(name);
         try
         {
-            using var process = Process.Start(info); if (process is null) return null;
-            var output = await process.StandardOutput.ReadToEndAsync(token); await process.WaitForExitAsync(token);
-            return process.ExitCode == 0 ? output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault(File.Exists) : null;
+            using var process = Process.Start(info);
+            if (process is not null)
+            {
+                var outputTask = process.StandardOutput.ReadToEndAsync(token);
+                var errorTask = process.StandardError.ReadToEndAsync(token);
+                await process.WaitForExitAsync(token); await errorTask;
+                var output = await outputTask;
+                var discovered = process.ExitCode == 0 ? output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault(File.Exists) : null;
+                if (discovered is not null) return discovered;
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+
+        if (!name.Equals("codex", StringComparison.OrdinalIgnoreCase)) return null;
+
+        var running = FindRunningCodex();
+        if (running is not null) return running;
+
+        var registered = await FindRegisteredCodexAsync(token);
+        if (registered is not null) return registered;
+
+        var windowsApps = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WindowsApps");
+        try
+        {
+            return Directory.EnumerateDirectories(windowsApps, "OpenAI.Codex_*", SearchOption.TopDirectoryOnly)
+                .OrderByDescending(Directory.GetLastWriteTimeUtc)
+                .Select(path => Path.Combine(path, "app", "resources", "codex.exe"))
+                .FirstOrDefault(File.Exists);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException) { return null; }
+    }
+
+    private static string? FindRunningCodex()
+    {
+        foreach (var processName in new[] { "codex", "codex-code-mode-host" })
+        {
+            foreach (var process in Process.GetProcessesByName(processName))
+            {
+                using (process)
+                {
+                    try
+                    {
+                        var processPath = process.MainModule?.FileName;
+                        if (processPath is null) continue;
+                        var candidate = processName == "codex"
+                            ? processPath
+                            : Path.Combine(Path.GetDirectoryName(processPath)!, "codex.exe");
+                        if (File.Exists(candidate)) return Path.GetFullPath(candidate);
+                    }
+                    catch (Exception error) when (error is InvalidOperationException or NotSupportedException or System.ComponentModel.Win32Exception) { }
+                }
+            }
+        }
+        return null;
+    }
+
+    private static async Task<string?> FindRegisteredCodexAsync(CancellationToken token)
+    {
+        var powershell = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+        if (!File.Exists(powershell)) return null;
+        var info = new ProcessStartInfo(powershell)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        info.ArgumentList.Add("-NoProfile");
+        info.ArgumentList.Add("-NonInteractive");
+        info.ArgumentList.Add("-Command");
+        info.ArgumentList.Add("$p = Get-AppxPackage -Name 'OpenAI.Codex' | Sort-Object Version -Descending | Select-Object -First 1; if ($p) { Join-Path $p.InstallLocation 'app\\resources\\codex.exe' }");
+        try
+        {
+            using var process = Process.Start(info);
+            if (process is null) return null;
+            var outputTask = process.StandardOutput.ReadToEndAsync(token);
+            var errorTask = process.StandardError.ReadToEndAsync(token);
+            await process.WaitForExitAsync(token);
+            await errorTask;
+            var candidate = (await outputTask).Trim();
+            return process.ExitCode == 0 && File.Exists(candidate) ? Path.GetFullPath(candidate) : null;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception) { return null; }
     }
 }
 
 public static class CodexContract
 {
+    public static string WorkerStem(RunOptions options) => "metadata-agent";
+
+    public static string FinalMessagePath(RunOptions options) =>
+        Path.Combine(options.JobDirectory, $"{WorkerStem(options)}-final-message.txt");
+
+    public static string EventLogPath(RunOptions options) =>
+        Path.Combine(options.JobDirectory, $"{WorkerStem(options)}-events.jsonl");
+
     public static IReadOnlyList<string> Arguments(RunOptions options) =>
-    ["--ask-for-approval", "never", "--add-dir", options.JobDirectory, "exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "--cd", options.AlbumRoot, "--output-last-message", Path.Combine(options.JobDirectory, "final-message.txt"), "-"];
+    ["--ask-for-approval", "never", "exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "--cd", options.JobDirectory, "--output-last-message", FinalMessagePath(options), "-"];
 
     public static string Prompt(RunOptions options)
     {
-        var deletion = options.DeleteOriginals
-            ? "The user confirms default deletion of each exact inventoried source only after every final verification gate passes."
-            : "The user explicitly overrides deletion: retain every original source after verification.";
+        const string deletion = "Fast verification policy: retain every original source. Skipping decoded PCM equivalence never authorizes source deletion.";
         return $"""
-Use the installed $album-fixer skill faithfully for this album.
-Album root: {options.AlbumRoot}
-Skill file: {options.SkillPath}
+Use the staged $album-fixer skill faithfully for this local album transaction.
+Local staged album root: {options.AlbumRoot}
+Staged skill file: {options.SkillPath}
 Approved unique Windows Temp job directory: {options.JobDirectory}
+Staged ffmpeg: {options.FfmpegPath}
+Staged ffprobe: {options.FfprobePath}
 {deletion}
 
-This is a non-interactive desktop-app run. Never guess and never wait for an answer. If a required tool, exact release match, tag value, artwork, or signal-equivalence proof is missing or uncertain, stop safely, retain every original, record the reason, and return a concise blocked/failed result. Do not modify anything outside the album root and approved Temp job directory. Preserve all provenance and unrelated files. Create or update conversion-report.json at the album root before any allowed deletion.
+The deterministic desktop processor already copied and SHA-256-verified the source, parsed the CUE, and split every track locally in one FFmpeg process. The user explicitly requested fast verification. Do not run verify-flac-split.ps1, do not fully decode the source or output tracks for PCM byte-count or MD5 comparison, and do not claim signal equivalence. The original source must always be retained.
 
-Atomically replace {Path.Combine(options.JobDirectory, "ui-progress.json")} after every state transition. Use compact UTF-8 JSON with phase, phase_index, phase_count (12), percent, status, detail, updated_at_utc. Use these ordered phase names: Inventoried; Copying in; Source copy verified; Splitting or extracting; Tagging; Local verification passed; Copying back; Network-side hashes verified; Final commit; Final-path verification passed; Source deleted or retained; Local cleanup completed. On failure or cancellation write status=failed or canceled, retain sources, and state the exact stopping point. Begin each user-visible update with ALBUM_FIXER_PROGRESS followed by the same one-line object.
+Read {Path.Combine(options.JobDirectory, "metadata-gaps.json")}. This process was started only because missing_fields names one or more required metadata gaps. Research only those explicitly listed fields. Do not research, replace, or second-guess any nonempty value supplied by the local CUE, rip log, existing tags, folder name, booklet, scans, or library folder. Prefer local evidence; use web research only for a listed gap, and match the exact edition conservatively.
 
-At completion summarize workflow mode, outputs and areas/discs, verification method/status, report path, originals deleted or retained, recovery implications, and errors.
+The split tracks already exist. Never split, extract, or re-encode their audio again. Fill only the recorded gaps, tag the existing outputs, create or embed artwork only when COVER is a recorded gap, complete conversion-report.json, and perform quick ffprobe container, required-tag, and embedded-artwork checks. If a listed gap cannot be resolved confidently, stop safely with status=failed and retain every original.
+
+The original album location is intentionally unavailable to this protected process. Do not probe, map, or access any UNC/network path, and do not perform copy-back or source deletion. Work only inside the approved Temp job directory. Use the staged ffmpeg and ffprobe paths above. Preserve all provenance and unrelated files. Keep paths in conversion-report.json relative to the staged album root. The desktop host independently repeats quick verification, copies files back through destination-side staging, verifies hashes and final paths, updates the report, and retains the original.
+
+Atomically replace {Path.Combine(options.JobDirectory, "ui-progress.json")} after every metadata state transition. Use compact UTF-8 JSON with phase, phase_index, phase_count (12), percent, status, detail, updated_at_utc. The host has completed splitting. You own Tagging and Local verification only; do not claim phases 7-12. On failure or cancellation write status=failed or canceled and state the exact stopping point. Begin each user-visible update with ALBUM_FIXER_PROGRESS followed by the same one-line object. For Windows PowerShell 5.1 atomic writes, write a temporary file in the same directory and use Move-Item -LiteralPath $tmp -Destination $target -Force.
+
+At completion summarize the fields enriched, local values preserved, quick verification status, report path, originals retained, and errors.
 """;
     }
 }
-
 public sealed partial class CodexRunner : IDisposable
 {
     private Process? _active;
     public async Task<RunResult> RunAsync(RunOptions options, IProgress<RunEvent> progress, CancellationToken token)
     {
         Directory.CreateDirectory(options.JobDirectory);
-        var finalPath = Path.Combine(options.JobDirectory, "final-message.txt");
-        var logPath = Path.Combine(options.JobDirectory, "codex-events.jsonl");
-        var info = new ProcessStartInfo(options.CodexPath) { UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true, WorkingDirectory = options.AlbumRoot, StandardInputEncoding = new UTF8Encoding(false), StandardOutputEncoding = new UTF8Encoding(false) };
+        var finalPath = CodexContract.FinalMessagePath(options);
+        var logPath = CodexContract.EventLogPath(options);
+        var codexPath = PrepareExecutable(options);
+        if (!codexPath.Equals(options.CodexPath, StringComparison.OrdinalIgnoreCase))
+            progress.Report(new("setup", "Prepared a local copy of the installed Codex runner."));
+        var info = new ProcessStartInfo(codexPath) { UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true, WorkingDirectory = options.JobDirectory, StandardInputEncoding = new UTF8Encoding(false), StandardOutputEncoding = new UTF8Encoding(false) };
         foreach (var argument in CodexContract.Arguments(options)) info.ArgumentList.Add(argument);
         using var process = new Process { StartInfo = info };
         _active = process;
         var canceled = false;
         string? threadId = null;
+        ProgressSnapshot? lastProgress = null;
         if (!process.Start()) throw new InvalidOperationException("Could not start Codex.");
         using var registration = token.Register(() => { canceled = true; Kill(process); });
         await using var log = new StreamWriter(logPath, false, new UTF8Encoding(false));
@@ -275,24 +432,71 @@ public sealed partial class CodexRunner : IDisposable
                 await log.WriteLineAsync(line); await log.FlushAsync();
                 var parsed = ParseEvent(line); if (parsed is null) continue;
                 if (parsed.ThreadId is not null) threadId = parsed.ThreadId;
+                if (parsed.Progress is not null) lastProgress = parsed.Progress;
                 progress.Report(parsed);
             }
         });
         var stderr = Task.Run(async () =>
         {
-            while (await process.StandardError.ReadLineAsync() is { } line) progress.Report(new("error", line));
+            var pluginNoticeShown = false;
+            while (await process.StandardError.ReadLineAsync() is { } line)
+            {
+                var kind = DiagnosticKind(line);
+                if (kind == "warning" && IsPluginMetadataWarning(line))
+                {
+                    if (!pluginNoticeShown)
+                    {
+                        progress.Report(new("notice", "Codex skipped optional plugin display metadata; album processing is unaffected."));
+                        pluginNoticeShown = true;
+                    }
+                    continue;
+                }
+                progress.Report(new(kind, line));
+            }
         });
         await process.StandardInput.WriteAsync(CodexContract.Prompt(options).AsMemory(), token);
         process.StandardInput.Close();
         await process.WaitForExitAsync(CancellationToken.None);
         await Task.WhenAll(stdout, stderr);
         _active = null;
-        return new(process.ExitCode, canceled, threadId, finalPath, logPath);
+        return new(process.ExitCode, canceled, threadId, finalPath, logPath, lastProgress);
+    }
+
+    public static bool RequiresLocalStaging(string path) =>
+        path.Contains($"{Path.DirectorySeparatorChar}WindowsApps{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase);
+
+    private static string PrepareExecutable(RunOptions options)
+    {
+        if (!RequiresLocalStaging(options.CodexPath)) return options.CodexPath;
+        var toolsRoot = Path.GetFullPath(Path.Combine(options.JobDirectory, "tools"));
+        var jobRoot = Path.GetFullPath(options.JobDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!toolsRoot.StartsWith(jobRoot, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Unsafe Codex staging path.");
+        Directory.CreateDirectory(toolsRoot);
+        var sourceRoot = Path.GetDirectoryName(options.CodexPath) ?? throw new InvalidOperationException("Installed Codex path has no parent directory.");
+        var runnerFiles = new[] { "codex.exe", "codex-code-mode-host.exe", "codex-command-runner.exe", "codex-windows-sandbox-setup.exe", "rg.exe" };
+        foreach (var name in runnerFiles)
+        {
+            var source = Path.Combine(sourceRoot, name);
+            if (!File.Exists(source)) throw new FileNotFoundException($"The installed Codex runner is incomplete: {name} is missing.", source);
+            var destination = Path.Combine(toolsRoot, name);
+            if (!File.Exists(destination)) File.Copy(source, destination, overwrite: false);
+        }
+        return Path.Combine(toolsRoot, "codex.exe");
     }
 
     public void Cancel() { if (_active is { HasExited: false } process) Kill(process); }
     public void Dispose() { Cancel(); GC.SuppressFinalize(this); }
 
+    public static string DiagnosticKind(string line)
+    {
+        if (line.Contains(" WARN ", StringComparison.OrdinalIgnoreCase) || line.StartsWith("WARN", StringComparison.OrdinalIgnoreCase)) return "warning";
+        if (line.Contains(" ERROR ", StringComparison.OrdinalIgnoreCase) || line.StartsWith("ERROR", StringComparison.OrdinalIgnoreCase)) return "error";
+        return "diagnostic";
+    }
+
+    public static bool IsPluginMetadataWarning(string line) =>
+        line.Contains("codex_core::plugins::manifest", StringComparison.OrdinalIgnoreCase) ||
+        line.Contains("codex_core::skills::loader: ignoring interface.icon_", StringComparison.OrdinalIgnoreCase);
     public static bool TryProgress(string json, out ProgressSnapshot snapshot)
     {
         try
@@ -326,6 +530,12 @@ public sealed partial class CodexRunner : IDisposable
             if (type.StartsWith("item."))
             {
                 var item = root.TryGetProperty("item", out var i) ? i : root; var itemType = Text(item, "type") ?? "activity";
+                if (itemType == "error")
+                {
+                    var diagnostic = Useful(Strings(item), "Codex reported a failure.");
+                    var kind = diagnostic.Contains("Skill descriptions were shortened", StringComparison.OrdinalIgnoreCase) ? "notice" : "error";
+                    return new(kind, diagnostic);
+                }
                 var message = itemType switch { "reasoning" => "Planning the next safe step…", "web_search" => "Researching the exact release and artwork…", "command_execution" => "Running an album workflow check…", _ => Useful(Strings(item), "Codex activity…") };
                 return new("activity", message);
             }
@@ -370,7 +580,7 @@ public static class ReportReader
         var errors = new List<string>(); if (verification.ValueKind == JsonValueKind.Object && Prop(verification, "errors", out var e) && e.ValueKind == JsonValueKind.Array) foreach (var item in e.EnumerateArray()) errors.Add(item.ToString());
         var tracks = new HashSet<string>(StringComparer.OrdinalIgnoreCase); Files(root, tracks);
         var sections = Count(root, "discs") + Count(root, "areas") + Count(root, "audio_areas");
-        var label = status.ToLowerInvariant() switch { "passed" => "Verification passed", "failed" => "Verification failed", "blocked" => "Run blocked safely", _ => "Report pending" };
+        var label = status.ToLowerInvariant() switch { "passed" => "Verification passed", "failed" => "Verification failed", "blocked" => "Run blocked safely", "canceled" => "Run canceled safely", _ => "Report pending" };
         return new(status, $"{album} · {label}", string.Join("  •  ", new[] { edition, workflow?.Replace('_', ' '), verification.ValueKind == JsonValueKind.Object ? Get(verification, "method") : null }.Where(x => !string.IsNullOrWhiteSpace(x))), tracks.Count, sections, deleted, errors, json);
     }
     private static string? Get(JsonElement e, string n) => Prop(e, n, out var p) ? p.ValueKind == JsonValueKind.String ? p.GetString() : p.ToString() : null;

@@ -1,0 +1,517 @@
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
+namespace AlbumFixer.Core;
+
+public sealed record StagedSource(string RelativePath, long Size, string Sha256);
+public sealed record StagedJob(
+    string JobDirectory,
+    string AlbumRoot,
+    string SkillPath,
+    string FfmpegPath,
+    string FfprobePath,
+    string ManifestPath,
+    IReadOnlyList<StagedSource> Sources);
+public sealed record HostCommitResult(string ReportPath, int Tracks, bool SourcesDeleted);
+
+public sealed class HostStagingService
+{
+    private const int BufferSize = 1024 * 1024;
+
+    public async Task<StagedJob> StageAsync(
+        ScanResult scan,
+        PreflightResult preflight,
+        string skillPath,
+        string jobDirectory,
+        IProgress<ProgressSnapshot> progress,
+        CancellationToken token = default)
+    {
+        ValidateJobDirectory(jobDirectory, preflight.TempRoot);
+        var albumRoot = Path.Combine(jobDirectory, "album");
+        var toolsRoot = Path.Combine(jobDirectory, "tools");
+        var skillRoot = Path.Combine(jobDirectory, "skill");
+        Directory.CreateDirectory(albumRoot);
+        Directory.CreateDirectory(toolsRoot);
+
+        progress.Report(Snapshot(JobPhase.Inventoried, 1, "Album inventory is complete. The original is unchanged."));
+
+        var sourceFiles = scan.Media
+            .Where(IsSource)
+            .Select(item => item.Path)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (sourceFiles.Length == 0) throw new InvalidOperationException("No exact source file was identified for verified staging.");
+
+        var sourceHashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var source in sourceFiles)
+        {
+            token.ThrowIfCancellationRequested();
+            sourceHashes[source] = await Sha256Async(source, token);
+        }
+
+        var albumFiles = EnumerateTree(scan.AlbumRoot)
+            .Where(path => !Path.GetRelativePath(scan.AlbumRoot, path).Equals("conversion-report.json", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var totalBytes = Math.Max(1L, albumFiles.Sum(path => new FileInfo(path).Length));
+        long copiedBytes = 0;
+        progress.Report(Snapshot(JobPhase.CopyingIn, 2, "Copying the album to the local Windows Temp workspace."));
+        foreach (var source in albumFiles)
+        {
+            token.ThrowIfCancellationRequested();
+            var relative = SafeRelative(scan.AlbumRoot, source);
+            var destination = SafeCombine(albumRoot, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            await CopyFileAsync(source, destination, bytes =>
+            {
+                copiedBytes += bytes;
+                var percent = 2 + (int)Math.Min(13, copiedBytes * 13 / totalBytes);
+                progress.Report(Snapshot(JobPhase.CopyingIn, percent, $"Copying locally: {relative}"));
+            }, token);
+        }
+
+        var stagedSources = new List<StagedSource>();
+        foreach (var source in sourceFiles)
+        {
+            token.ThrowIfCancellationRequested();
+            var relative = SafeRelative(scan.AlbumRoot, source);
+            var localPath = SafeCombine(albumRoot, relative);
+            var localHash = await Sha256Async(localPath, token);
+            var originalHash = sourceHashes[source];
+            var size = new FileInfo(source).Length;
+            if (new FileInfo(localPath).Length != size || !localHash.Equals(originalHash, StringComparison.OrdinalIgnoreCase))
+                throw new IOException($"The local copy of '{relative}' does not match the original SHA-256. The original was retained.");
+            stagedSources.Add(new(relative, size, originalHash));
+        }
+        progress.Report(Snapshot(JobPhase.SourceCopyVerified, 17, "The local source copy matches the original size and SHA-256."));
+
+        var ffmpeg = RequireTool(preflight, "ffmpeg");
+        var ffprobe = RequireTool(preflight, "ffprobe");
+        var stagedFfmpeg = Path.Combine(toolsRoot, "ffmpeg.exe");
+        var stagedFfprobe = Path.Combine(toolsRoot, "ffprobe.exe");
+        await CopyFileAsync(ffmpeg, stagedFfmpeg, null, token);
+        await CopyFileAsync(ffprobe, stagedFfprobe, null, token);
+
+        var manifestPath = Path.Combine(jobDirectory, "host-manifest.json");
+        var manifest = new
+        {
+            schema_version = "1.0",
+            job_id = Path.GetFileName(jobDirectory),
+            original_album_root = scan.AlbumRoot,
+            staged_album_root = albumRoot,
+            created_at_utc = DateTimeOffset.UtcNow,
+            sources = stagedSources.Select(source => new
+            {
+                path = source.RelativePath,
+                size = source.Size,
+                original_sha256 = source.Sha256,
+                staged_sha256 = source.Sha256,
+                copy_in_status = "verified"
+            })
+        };
+        await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false), token);
+
+        return new(jobDirectory, albumRoot, string.Empty, stagedFfmpeg, stagedFfprobe, manifestPath, stagedSources);
+    }
+
+    public async Task<string> StageSkillAsync(string skillPath, string jobDirectory, CancellationToken token = default)
+    {
+        if (!File.Exists(skillPath)) throw new FileNotFoundException("The optional Album Fixer metadata skill is unavailable.", skillPath);
+        var skillRoot = SafeCombine(jobDirectory, "skill");
+        if (Directory.Exists(skillRoot) && Directory.EnumerateFileSystemEntries(skillRoot).Any())
+            throw new IOException("The local metadata-skill staging folder is not empty.");
+        Directory.CreateDirectory(skillRoot);
+        var installedSkillRoot = Path.GetDirectoryName(Path.GetFullPath(skillPath))
+            ?? throw new InvalidOperationException("The Album Fixer skill has no parent directory.");
+        foreach (var source in EnumerateTree(installedSkillRoot))
+        {
+            token.ThrowIfCancellationRequested();
+            var destination = SafeCombine(skillRoot, SafeRelative(installedSkillRoot, source));
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            await CopyFileAsync(source, destination, null, token);
+        }
+        return Path.Combine(skillRoot, "SKILL.md");
+    }
+    public static async Task<string> Sha256Async(string path, CancellationToken token = default)
+    {
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        return Convert.ToHexString(await SHA256.HashDataAsync(stream, token));
+    }
+
+    public static void ValidateJobDirectory(string jobDirectory, string tempRoot)
+    {
+        var root = Path.GetFullPath(tempRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var job = Path.GetFullPath(jobDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!job.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("The local job directory is outside the approved Album Fixer Temp root.");
+    }
+
+    internal static string SafeCombine(string root, string relative)
+    {
+        var rootPrefix = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var path = Path.GetFullPath(Path.Combine(rootPrefix, relative));
+        if (!path.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Unsafe path outside the transaction root: {relative}");
+        return path;
+    }
+
+    internal static string SafeRelative(string root, string path)
+    {
+        var relative = Path.GetRelativePath(Path.GetFullPath(root), Path.GetFullPath(path));
+        if (Path.IsPathRooted(relative) || relative.Equals("..", StringComparison.Ordinal) || relative.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
+            throw new InvalidOperationException($"Path is outside the transaction root: {path}");
+        return relative;
+    }
+
+    private static IEnumerable<string> EnumerateTree(string root)
+    {
+        var pending = new Stack<string>();
+        pending.Push(Path.GetFullPath(root));
+        while (pending.Count > 0)
+        {
+            var directory = pending.Pop();
+            foreach (var child in Directory.EnumerateDirectories(directory))
+            {
+                var info = new DirectoryInfo(child);
+                if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException($"Reparse points are not allowed in an album transaction: {child}");
+                if (!info.Name.StartsWith(".album-fixer-stage-", StringComparison.OrdinalIgnoreCase)) pending.Push(child);
+            }
+            foreach (var file in Directory.EnumerateFiles(directory))
+            {
+                if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException($"Reparse-point files are not allowed in an album transaction: {file}");
+                yield return file;
+            }
+        }
+    }
+
+    private static async Task CopyFileAsync(string source, string destination, Action<int>? copied, CancellationToken token)
+    {
+        await using var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var buffer = new byte[BufferSize];
+        int read;
+        while ((read = await input.ReadAsync(buffer, token)) > 0)
+        {
+            await output.WriteAsync(buffer.AsMemory(0, read), token);
+            copied?.Invoke(read);
+        }
+        await output.FlushAsync(token);
+    }
+
+    private static bool IsSource(MediaItem item) =>
+        item.Kind.Contains("image", StringComparison.OrdinalIgnoreCase) ||
+        item.Kind.StartsWith("Existing", StringComparison.OrdinalIgnoreCase) ||
+        item.Kind is "DST stream" or "Raw DSD";
+
+    private static string RequireTool(PreflightResult preflight, string name) =>
+        preflight.Tools.TryGetValue(name, out var path) && path is not null && File.Exists(path)
+            ? path
+            : throw new FileNotFoundException($"The required {name} tool is unavailable.");
+
+    private static ProgressSnapshot Snapshot(JobPhase phase, int percent, string detail) =>
+        new(phase, percent, "running", detail, DateTimeOffset.UtcNow);
+}
+
+public sealed class HostCommitService
+{
+    public async Task<HostCommitResult> CommitAsync(
+        ScanResult scan,
+        StagedJob staged,
+        bool deleteOriginals,
+        IProgress<ProgressSnapshot> progress,
+        CancellationToken token = default)
+    {
+        if (scan.Mode != WorkflowMode.FlacCueSplit)
+            throw new NotSupportedException("Verified host write-back is currently available for FLAC + CUE image splits only. Every original was retained.");
+
+        var localReportPath = Path.Combine(staged.AlbumRoot, "conversion-report.json");
+        if (!File.Exists(localReportPath)) throw new FileNotFoundException("The local processor did not create the required conversion report.", localReportPath);
+
+        var report = JsonNode.Parse(await File.ReadAllTextAsync(localReportPath, token)) as JsonObject
+            ?? throw new JsonException("The local conversion report is not a JSON object.");
+        var outputs = NormalizeAndCollectOutputs(report, staged.AlbumRoot);
+        if (outputs.Count == 0) throw new InvalidOperationException("The conversion report contains no playback tracks to commit.");
+        await VerifyTrackHeadersAsync(outputs, staged.AlbumRoot, staged, token);
+        SetQuickVerification(report, "local staging", deleteOriginals);
+        await AtomicWriteAsync(localReportPath, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
+        progress.Report(Snapshot(JobPhase.LocalVerificationPassed, 50, "Quick local FLAC, tag, and artwork checks passed. Full PCM comparison was skipped."));
+        var jobId = Path.GetFileName(staged.JobDirectory.TrimEnd(Path.DirectorySeparatorChar));
+        var networkStage = HostStagingService.SafeCombine(scan.AlbumRoot, $".album-fixer-stage-{jobId}");
+        if (Directory.Exists(networkStage) || File.Exists(networkStage)) throw new IOException($"A destination staging path already exists: {networkStage}");
+        Directory.CreateDirectory(networkStage);
+
+        var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        progress.Report(Snapshot(JobPhase.CopyingBack, 58, "Copying verified tracks to a private destination-side staging folder."));
+        foreach (var relative in outputs)
+        {
+            token.ThrowIfCancellationRequested();
+            var local = HostStagingService.SafeCombine(staged.AlbumRoot, relative);
+            if (!File.Exists(local)) throw new FileNotFoundException($"A report-listed output is missing: {relative}", local);
+            var final = HostStagingService.SafeCombine(scan.AlbumRoot, relative);
+            if (File.Exists(final) || Directory.Exists(final)) throw new IOException($"The final path already exists and will not be overwritten: {relative}");
+            var network = HostStagingService.SafeCombine(networkStage, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(network)!);
+            File.Copy(local, network, overwrite: false);
+            var localHash = await HostStagingService.Sha256Async(local, token);
+            var networkHash = await HostStagingService.Sha256Async(network, token);
+            if (!localHash.Equals(networkHash, StringComparison.OrdinalIgnoreCase))
+                throw new IOException($"Destination-side SHA-256 differs for '{relative}'. The original was retained.");
+            hashes[relative] = localHash;
+        }
+        progress.Report(Snapshot(JobPhase.NetworkHashesVerified, 68, "Every destination-side staging file matches its local SHA-256."));
+
+        var existingReport = Path.Combine(scan.AlbumRoot, "conversion-report.json");
+        var previousReport = Path.Combine(networkStage, ".previous-conversion-report.json");
+        if (File.Exists(existingReport)) File.Copy(existingReport, previousReport, overwrite: false);
+
+        progress.Report(Snapshot(JobPhase.FinalCommit, 76, "Committing verified files to previously unoccupied final paths."));
+        var moved = new List<string>();
+        JsonObject commit;
+        JsonObject job;
+        try
+        {
+            foreach (var relative in outputs)
+            {
+                var network = HostStagingService.SafeCombine(networkStage, relative);
+                var final = HostStagingService.SafeCombine(scan.AlbumRoot, relative);
+                Directory.CreateDirectory(Path.GetDirectoryName(final)!);
+                File.Move(network, final, overwrite: false);
+                moved.Add(relative);
+            }
+
+            report["album_root"] = scan.AlbumRoot;
+            commit = report["commit"] as JsonObject ?? new JsonObject();
+            report["commit"] = commit;
+            commit["status"] = "committed";
+            commit["network_side_staging"] = networkStage;
+            commit["network_hashes_verified"] = true;
+            commit["committed_at_utc"] = DateTimeOffset.UtcNow;
+            commit["files"] = new JsonArray(hashes.Select(pair => (JsonNode)new JsonObject
+            {
+                ["file"] = pair.Key,
+                ["sha256"] = pair.Value
+            }).ToArray());
+            job = report["job"] as JsonObject ?? new JsonObject();
+            report["job"] = job;
+            job["identifier"] = jobId;
+            job["original_album_root"] = scan.AlbumRoot;
+            job["local_staging_path"] = staged.JobDirectory;
+            job["host_copy_in_manifest"] = staged.ManifestPath;
+            job["copy_in_status"] = "verified";
+            job["copy_back_status"] = "verified";
+            await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
+        }
+        catch
+        {
+            foreach (var relative in moved.AsEnumerable().Reverse())
+            {
+                try
+                {
+                    var final = HostStagingService.SafeCombine(scan.AlbumRoot, relative);
+                    var network = HostStagingService.SafeCombine(networkStage, relative);
+                    if (File.Exists(final) && !File.Exists(network)) File.Move(final, network, overwrite: false);
+                }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+            }
+            try
+            {
+                if (File.Exists(previousReport)) File.Copy(previousReport, existingReport, overwrite: true);
+                else if (File.Exists(existingReport)) File.Delete(existingReport);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+            throw;
+        }
+
+        token.ThrowIfCancellationRequested();
+        await VerifyTrackHeadersAsync(outputs, scan.AlbumRoot, staged, token);
+        SetQuickVerification(report, "final album path", deleteOriginals);
+        await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
+        progress.Report(Snapshot(JobPhase.FinalVerificationPassed, 90, "Quick final FLAC, tag, artwork, and copy-hash checks passed."));
+
+        const bool deleted = false;
+        progress.Report(Snapshot(JobPhase.SourceDisposition, 96, "The original source image was retained because full PCM equivalence was skipped."));
+        var networkCleaned = TryDeleteDirectory(networkStage);
+        HostStagingService.ValidateJobDirectory(staged.JobDirectory, Path.Combine(Path.GetTempPath(), "album-fixer"));
+        var localCleaned = TryDeleteDirectory(staged.JobDirectory);
+        try
+        {
+            commit = report["commit"] as JsonObject ?? new JsonObject();
+            report["commit"] = commit;
+            commit["status"] = "completed";
+            commit["final_path_verification"] = "passed";
+            commit["completed_at_utc"] = DateTimeOffset.UtcNow;
+            commit["network_side_staging"] = networkCleaned ? null : networkStage;
+            job = report["job"] as JsonObject ?? new JsonObject();
+            report["job"] = job;
+            job["local_staging_cleaned"] = localCleaned;
+            job["network_staging_cleaned"] = networkCleaned;
+            await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
+        {
+            // Final report enrichment is best effort after the quick final checks pass.
+        }
+        var cleanupDetail = localCleaned && networkCleaned
+            ? "Conversion completed; final files and report passed quick checks at the album location. The original was retained."
+            : "Conversion completed with quick checks; a staging folder and the original were retained.";
+        progress.Report(new(JobPhase.CleanupCompleted, 100, "passed", cleanupDetail, DateTimeOffset.UtcNow));
+        return new(existingReport, outputs.Count(path => Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase)), deleted);
+    }
+
+    private static List<string> NormalizeAndCollectOutputs(JsonObject report, string stagedAlbumRoot)
+    {
+        var outputs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var sources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (report["discs"] is not JsonArray discs || discs.Count == 0)
+            throw new JsonException("The conversion report must contain at least one discs entry.");
+        foreach (var discNode in discs)
+        {
+            if (discNode is not JsonObject disc) throw new JsonException("A discs entry is not an object.");
+            var source = NormalizePathValue(disc["source"], stagedAlbumRoot, "disc source");
+            disc["source"] = source;
+            sources.Add(source);
+            if (disc["tracks"] is not JsonArray tracks || tracks.Count == 0)
+                throw new JsonException("A discs entry contains no tracks.");
+            for (var index = 0; index < tracks.Count; index++)
+            {
+                if (tracks[index] is JsonValue value)
+                {
+                    var relative = NormalizePathValue(value, stagedAlbumRoot, "track");
+                    tracks[index] = relative;
+                    outputs.Add(relative);
+                }
+                else if (tracks[index] is JsonObject track)
+                {
+                    var relative = NormalizePathValue(track["file"], stagedAlbumRoot, "track");
+                    track["file"] = relative;
+                    outputs.Add(relative);
+                }
+                else throw new JsonException("A track entry has no file path.");
+            }
+        }
+        if (report["genre"] is not JsonObject genre || string.IsNullOrWhiteSpace(genre["value"]?.GetValue<string>()))
+            throw new JsonException("The conversion report has no nonempty genre value or provenance.");
+        if (report["cover"] is not JsonObject cover || cover["file"] is null)
+            throw new JsonException("The conversion report has no required cover.jpg file entry.");
+        var coverRelative = NormalizePathValue(cover["file"], stagedAlbumRoot, "cover");
+        cover["file"] = coverRelative;
+        if (!sources.Contains(coverRelative)) outputs.Add(coverRelative);
+        return outputs.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static string NormalizePathValue(JsonNode? node, string stagedAlbumRoot, string label)
+    {
+        var value = node?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(value)) throw new JsonException($"The report has an empty {label} path.");
+        var relative = Path.IsPathRooted(value) ? HostStagingService.SafeRelative(stagedAlbumRoot, value) : value;
+        var full = HostStagingService.SafeCombine(stagedAlbumRoot, relative);
+        return HostStagingService.SafeRelative(stagedAlbumRoot, full);
+    }
+
+    private static async Task VerifyTrackHeadersAsync(IEnumerable<string> outputs, string albumRoot, StagedJob staged, CancellationToken token)
+    {
+        foreach (var relative in outputs.Where(path => Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase)))
+        {
+            var path = HostStagingService.SafeCombine(albumRoot, relative);
+            var info = new ProcessStartInfo(staged.FfprobePath)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            foreach (var value in new[] { "-v", "error", "-show_streams", "-show_format", "-of", "json", path }) info.ArgumentList.Add(value);
+            using var process = new Process { StartInfo = info };
+            if (!process.Start()) throw new InvalidOperationException("Could not start ffprobe for quick FLAC verification.");
+            var outputTask = process.StandardOutput.ReadToEndAsync(token);
+            var errorTask = process.StandardError.ReadToEndAsync(token);
+            try { await process.WaitForExitAsync(token); }
+            catch (OperationCanceledException) { try { if (!process.HasExited) process.Kill(true); } catch (InvalidOperationException) { } throw; }
+            var output = await outputTask;
+            var error = await errorTask;
+            if (process.ExitCode != 0) throw new InvalidOperationException($"ffprobe failed for '{relative}': {error.Trim()}");
+
+            using var document = JsonDocument.Parse(output);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("streams", out var streams) || streams.ValueKind != JsonValueKind.Array)
+                throw new InvalidOperationException($"No readable streams were found in '{relative}'.");
+            var hasFlac = streams.EnumerateArray().Any(stream =>
+                Text(stream, "codec_type")?.Equals("audio", StringComparison.OrdinalIgnoreCase) == true &&
+                Text(stream, "codec_name")?.Equals("flac", StringComparison.OrdinalIgnoreCase) == true);
+            var hasCover = streams.EnumerateArray().Any(stream =>
+                Text(stream, "codec_type")?.Equals("video", StringComparison.OrdinalIgnoreCase) == true &&
+                stream.TryGetProperty("disposition", out var disposition) &&
+                disposition.TryGetProperty("attached_pic", out var attached) &&
+                attached.TryGetInt32(out var value) && value == 1);
+            if (!hasFlac) throw new InvalidOperationException($"A FLAC audio stream is missing from '{relative}'.");
+            if (!hasCover) throw new InvalidOperationException($"Embedded front cover is missing from '{relative}'.");
+
+            if (!root.TryGetProperty("format", out var format) ||
+                !format.TryGetProperty("tags", out var tags) ||
+                tags.ValueKind != JsonValueKind.Object)
+                throw new InvalidOperationException($"Required tags are missing from '{relative}'.");
+            var values = tags.EnumerateObject()
+                .ToDictionary(tag => tag.Name, tag => tag.Value.ToString(), StringComparer.OrdinalIgnoreCase);
+            var required = new[]
+            {
+                new[] { "TITLE" }, new[] { "ALBUM" }, new[] { "ARTIST" },
+                new[] { "ALBUMARTIST", "ALBUM_ARTIST" }, new[] { "TRACKNUMBER", "TRACK" },
+                new[] { "DISCNUMBER", "DISC" }, new[] { "DATE", "YEAR" }, new[] { "GENRE" }
+            };
+            var labels = new[] { "TITLE", "ALBUM", "ARTIST", "ALBUMARTIST", "TRACKNUMBER", "DISCNUMBER", "DATE", "GENRE" };
+            var missing = required.Select((group, index) => new { group, index })
+                .Where(item => !item.group.Any(name => values.TryGetValue(name, out var value) && !string.IsNullOrWhiteSpace(value)))
+                .Select(item => labels[item.index])
+                .ToArray();
+            if (missing.Length > 0)
+                throw new InvalidOperationException($"Required tags missing from '{relative}': {string.Join(", ", missing)}.");
+            if (values.TryGetValue("GENRE", out var genre) &&
+                (genre.Contains("classical", StringComparison.OrdinalIgnoreCase) || genre.Contains("opera", StringComparison.OrdinalIgnoreCase)) &&
+                (!values.TryGetValue("COMPOSER", out var composer) || string.IsNullOrWhiteSpace(composer)))
+                throw new InvalidOperationException($"COMPOSER is required for classical/opera track '{relative}'.");
+        }
+    }
+
+    private static string? Text(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+
+    private static void SetQuickVerification(JsonObject report, string stage, bool deletionRequested)
+    {
+        var verification = report["verification"] as JsonObject ?? new JsonObject();
+        report["verification"] = verification;
+        verification["status"] = "passed";
+        verification["method"] = "Quick ffprobe FLAC/header/tag/artwork checks plus SHA-256 copy integrity; decoded PCM byte-count and MD5 comparison skipped by user.";
+        verification["pcm_equivalence"] = "skipped_by_user";
+        verification["verified_stage"] = stage;
+        verification["verified_at_utc"] = DateTimeOffset.UtcNow;
+        verification["source_deletion_requested"] = deletionRequested;
+        verification["sources_deleted"] = false;
+        verification["errors"] = new JsonArray();
+    }
+    private static bool TryDeleteDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+            return !Directory.Exists(path);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { return false; }
+    }
+    private static async Task AtomicWriteAsync(string path, string json, CancellationToken token)
+    {
+        var temporary = Path.Combine(Path.GetDirectoryName(path)!, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            await File.WriteAllTextAsync(temporary, json, new UTF8Encoding(false), token);
+            File.Move(temporary, path, overwrite: true);
+        }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+    }
+
+    private static ProgressSnapshot Snapshot(JobPhase phase, int percent, string detail) =>
+        new(phase, percent, "running", detail, DateTimeOffset.UtcNow);
+}

@@ -1,15 +1,18 @@
 # Album Fixer
 
-Album Fixer is a native Windows control center for the installed `album-fixer` Codex skill. It inventories one album, blocks unsafe starts, streams the skill's 12-stage workflow, and turns `conversion-report.json` into a readable completion report.
+Album Fixer is a native Windows app that locally splits FLAC+CUE album images into tagged tracks, shows the 12-stage transaction, and produces a readable conversion report.
 
 ## What it does
 
-- Classifies FLAC+CUE image splits, SACD/DSD extraction, existing-track metadata repair, and ambiguous sources.
+- Classifies FLAC+CUE image splits, SACD/DSD extraction, existing-track metadata repair, and ambiguous sources. Verified end-to-end write-back is currently enabled for FLAC+CUE; other modes stop before changing files.
 - Gives repair-only mode precedence when separated tracks coexist with an image.
-- Checks Codex, the installed skill, required audio tools, a local fixed Windows Temp volume, and conservative staging capacity before starting.
-- Runs Codex non-interactively with `workspace-write`, `ask-for-approval=never`, the album as the workspace, and only the exact job folder added as another writable directory.
+- Checks required audio tools, a local fixed Windows Temp volume, and conservative staging capacity before starting. Codex is not checked during a complete local run.
+- Copies the selected album and audio tools into a unique Windows Temp job and verifies source size and SHA-256 before processing.
+- Parses the CUE and splits all tracks in one local FFmpeg process, writing locally available tags and embedding local artwork without starting Codex.
+- After every track exists, reads the metadata-gap handoff. Complete local metadata skips Codex entirely; only named missing required fields trigger Codex discovery, skill staging, and one metadata-only process.
+- Uses quick ffprobe container, required-tag, and embedded-artwork checks; writes through destination-side staging and compares SHA-256 copy hashes. Full decoded PCM/MD5 equivalence is skipped, so the original image is always retained.
 - Shows phase progress, live activity, inventory, final verification status, output counts, source disposition, and formatted report JSON.
-- Requires an explicit confirmation before the skill's default verified-source deletion policy can run.
+- Disables source deletion in fast mode because decoded-audio equivalence is intentionally skipped.
 - Retains sources whenever a job is failed, incomplete, canceled, uncertain, or missing required proof.
 
 ## Run
@@ -22,18 +25,18 @@ The packaged app is self-contained for 64-bit Windows and does not require a sep
 
 1. Choose one album folder, not the whole music library.
 2. Select **Scan album** and resolve any blocked preflight checks.
-3. Choose whether verified originals may be deleted after the final pass.
+3. Review the fast-mode source policy: the original image will be retained.
 4. Select **Start safe run** and confirm the policy.
 5. Review the progress timeline and the **Report** tab.
 
 ## Required tools
 
-- Codex CLI, authenticated and able to load `C:\Users\gbolotin\.codex\skills\album-fixer\SKILL.md`.
+- Optional: Codex CLI and the installed album-fixer skill, used only when required metadata or cover art is missing after the local split.
 - `ffmpeg` and `ffprobe` for FLAC workflows.
 - `ffprobe` plus a safe DSF/DFF tagging path for DSD workflows.
 - `sacd_extract` for SACD ISO extraction. A Sony DSD Disc image is probed separately and may not require it.
 
-Album Fixer does not silently download tools. Missing requirements block or safely stop the run, matching the skill contract.
+Album Fixer does not silently download tools. Missing FFmpeg tools block the local run; a missing optional Codex fallback matters only when required metadata is actually absent.
 
 ## Build and test
 
@@ -42,6 +45,6 @@ dotnet build AlbumFixer.release.slnx -c Release
 dotnet run --project tests\AlbumFixer.Core.SmokeTests\AlbumFixer.Core.SmokeTests.csproj -c Release
 ```
 
-The smoke suite covers FLAC+CUE classification, repair-only precedence, progress parsing, report summarization, and safe Codex command flags.
+The smoke suite covers FLAC+CUE classification, multi-album blocking, repair-only precedence, verified local staging, a real one-process local split with tags and embedded artwork, the no-Codex path, terminal reports, progress parsing, and the metadata-only Codex boundary.
 
 The runner uses the documented stable `codex exec --json` JSONL interface. See the [Codex developer command reference](https://developers.openai.com/codex/cli/reference).
