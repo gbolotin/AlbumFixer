@@ -68,7 +68,6 @@ public sealed class MainViewModel : NotifyBase, IDisposable
     private string _statusDetail = "Inventory first. Originals stay in place whenever a proof is missing.";
     private double _progress;
     private bool _busy;
-    private bool _deleteOriginals;
     private string _reportHeadline = "No conversion report yet";
     private string _reportDetail = "A validated summary and JSON report will appear here.";
     private string _reportJson = "";
@@ -110,7 +109,7 @@ public sealed class MainViewModel : NotifyBase, IDisposable
     public AsyncCommand RefreshReportCommand { get; }
     public Command OpenAlbumCommand { get; }
     public Command CopyReportCommand { get; }
-    public Func<bool, bool>? ConfirmStart { get; set; }
+    public Func<bool>? ConfirmStart { get; set; }
 
     public string AlbumPath { get => _albumPath; set { if (!Set(ref _albumPath, value)) return; Invalidate(); ScanCommand.Refresh(); OpenAlbumCommand.Refresh(); } }
     public string AlbumName { get => _albumName; private set => Set(ref _albumName, value); }
@@ -123,7 +122,6 @@ public sealed class MainViewModel : NotifyBase, IDisposable
     public bool Busy { get => _busy; private set { if (!Set(ref _busy, value)) return; Raise(nameof(CanStart)); Raise(nameof(CanBrowse)); ScanCommand.Refresh(); StartCommand.Refresh(); CancelCommand.Refresh(); } }
     public bool CanBrowse => !Busy;
     public bool CanStart => !Busy && _scan is not null && _preflight?.CanStart == true;
-    public bool DeleteOriginals { get => _deleteOriginals; set => Set(ref _deleteOriginals, value); }
     public string ReportHeadline { get => _reportHeadline; private set => Set(ref _reportHeadline, value); }
     public string ReportDetail { get => _reportDetail; private set => Set(ref _reportDetail, value); }
     public string ReportJson { get => _reportJson; private set { if (Set(ref _reportJson, value)) CopyReportCommand.Refresh(); } }
@@ -162,14 +160,14 @@ public sealed class MainViewModel : NotifyBase, IDisposable
 
     private async Task StartAsync()
     {
-        if (!CanStart || _scan is null || _preflight is null || ConfirmStart is not null && !ConfirmStart(DeleteOriginals)) return;
+        if (!CanStart || _scan is null || _preflight is null || ConfirmStart is not null && !ConfirmStart()) return;
         Busy = true; Progress = 1; foreach (var item in Timeline) item.State = "Pending"; _cancel = new();
         _lastPhase = JobPhase.Ready; _lastRunStatus = "running"; _lastRunDetail = "Starting the safe run.";
         _runStartedAt = _lastActivityAt = _lastProgressAt = _lastHeartbeatAt = DateTimeOffset.UtcNow; _startupNoticeLogged = false;
         ReportStatus = "Pending"; ReportTracks = ReportSections = ReportDisposition = "—"; ReportJson = "";
         ReportHeadline = "Run in progress"; ReportDetail = "A terminal report will be preserved even if the run stops.";
         JobDirectory = PreflightService.CreateJobDirectory(_preflight.TempRoot);
-        StatusTitle = "Starting the fast workflow…"; StatusDetail = "Full PCM comparison is skipped; every original will be retained."; Log("START", JobDirectory);
+        StatusTitle = "Starting the fast workflow…"; StatusDetail = "PCM/MD5 comparison is skipped; the original FLAC image will be deleted only after successful final quick checks."; Log("START", JobDirectory);
         using var monitorCancel = CancellationTokenSource.CreateLinkedTokenSource(_cancel.Token);
         Task monitor = Task.CompletedTask;
         try
@@ -192,7 +190,7 @@ public sealed class MainViewModel : NotifyBase, IDisposable
                 Apply(new(JobPhase.Tagging, Math.Max((int)Progress, 44), "running", $"Only missing metadata is being deferred to Codex: {fields}.", DateTimeOffset.UtcNow));
                 Log("METADATA", $"Starting one optional metadata-only agent for: {fields}.");
                 var stagedSkillPath = await _staging.StageSkillAsync(SkillPath, JobDirectory, _cancel.Token);
-                var metadataOptions = new RunOptions(codexPath, staged.AlbumRoot, JobDirectory, false, stagedSkillPath, staged.FfmpegPath, staged.FfprobePath, CodexWorkKind.MetadataEnrichment);
+                var metadataOptions = new RunOptions(codexPath, staged.AlbumRoot, JobDirectory, stagedSkillPath, staged.FfmpegPath, staged.FfprobePath, CodexWorkKind.MetadataEnrichment);
                 monitor = MonitorAsync(Path.Combine(JobDirectory, "ui-progress.json"), monitorCancel.Token);
                 var metadataResult = await _runner.RunAsync(metadataOptions, new Progress<RunEvent>(OnRunEvent), _cancel.Token);
                 ThreadId = metadataResult.ThreadId ?? "—";
@@ -205,12 +203,12 @@ public sealed class MainViewModel : NotifyBase, IDisposable
                 Log("METADATA", "All required metadata and artwork were found locally. Codex was not started.");
             }
             monitorCancel.Cancel(); await IgnoreCancel(monitor);
-            var committed = await _commit.CommitAsync(_scan, staged, DeleteOriginals, new Progress<ProgressSnapshot>(Apply), _cancel.Token);
+            var committed = await _commit.CommitAsync(_scan, staged, new Progress<ProgressSnapshot>(Apply), _cancel.Token);
             await LoadReportAsync();
             if (!ReportStatus.Equals("passed", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("Final verification did not produce a passed conversion report. Every original was retained.");
+                throw new InvalidOperationException("Final quick verification did not produce a passed conversion report. The source was not authorized for deletion.");
             Progress = 100; StatusTitle = "Album completed with quick checks";
-            StatusDetail = $"{committed.Tracks} track{S(committed.Tracks)} passed quick checks and were written to the album. Original source retained.";
+            StatusDetail = $"{committed.Tracks} track{S(committed.Tracks)} passed quick checks. The original FLAC image was deleted.";
             Log("DONE", $"Report status: passed; {committed.Tracks} tracks.");
         }
         catch (OperationCanceledException)
@@ -256,7 +254,7 @@ public sealed class MainViewModel : NotifyBase, IDisposable
             Directory.Exists(JobDirectory) ? Path.Combine(JobDirectory, "conversion-report.json") : ""
         }.Where(File.Exists).OrderByDescending(File.GetLastWriteTimeUtc).ToArray();
         if (candidates.Length == 0) return;
-        try { var report = await ReportReader.LoadAsync(candidates[0]); ReportHeadline = report.Headline; ReportDetail = report.Detail; ReportJson = report.Json; ReportStatus = report.Status; ReportTracks = report.Tracks.ToString(); ReportSections = report.Sections.ToString(); ReportDisposition = report.Deleted ? "Deleted after proof" : "Retained"; Replace(ReportErrors, report.Errors); }
+        try { var report = await ReportReader.LoadAsync(candidates[0]); ReportHeadline = report.Headline; ReportDetail = report.Detail; ReportJson = report.Json; ReportStatus = report.Status; ReportTracks = report.Tracks.ToString(); ReportSections = report.Sections.ToString(); ReportDisposition = report.Deleted ? "Deleted after quick checks" : "Retained"; Replace(ReportErrors, report.Errors); }
         catch (Exception error) when (error is IOException or System.Text.Json.JsonException) { ReportHeadline = "Report is not readable yet"; ReportDetail = error.Message; }
     }
 
@@ -267,7 +265,7 @@ public sealed class MainViewModel : NotifyBase, IDisposable
         {
             await HostReportWriter.EnsureTerminalReportAsync(_scan, _preflight, JobDirectory,
                 canceled ? "canceled" : "failed", _lastPhase, (int)Progress, _lastRunDetail,
-                exitCode, threadId, DeleteOriginals);
+                exitCode, threadId);
             Log("REPORT", "A terminal report was preserved; every original remains in place.");
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)

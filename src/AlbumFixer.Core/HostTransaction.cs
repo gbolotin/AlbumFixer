@@ -221,7 +221,6 @@ public sealed class HostCommitService
     public async Task<HostCommitResult> CommitAsync(
         ScanResult scan,
         StagedJob staged,
-        bool deleteOriginals,
         IProgress<ProgressSnapshot> progress,
         CancellationToken token = default)
     {
@@ -236,7 +235,7 @@ public sealed class HostCommitService
         var outputs = NormalizeAndCollectOutputs(report, staged.AlbumRoot);
         if (outputs.Count == 0) throw new InvalidOperationException("The conversion report contains no playback tracks to commit.");
         await VerifyTrackHeadersAsync(outputs, staged.AlbumRoot, staged, token);
-        SetQuickVerification(report, "local staging", deleteOriginals);
+        SetQuickVerification(report, "local staging");
         await AtomicWriteAsync(localReportPath, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
         progress.Report(Snapshot(JobPhase.LocalVerificationPassed, 50, "Quick local FLAC, tag, and artwork checks passed. Full PCM comparison was skipped."));
         var jobId = Path.GetFileName(staged.JobDirectory.TrimEnd(Path.DirectorySeparatorChar));
@@ -328,12 +327,53 @@ public sealed class HostCommitService
 
         token.ThrowIfCancellationRequested();
         await VerifyTrackHeadersAsync(outputs, scan.AlbumRoot, staged, token);
-        SetQuickVerification(report, "final album path", deleteOriginals);
+        SetQuickVerification(report, "final album path");
+        token.ThrowIfCancellationRequested();
+        var deletionTargets = ResolveDeletionTargets(scan, staged);
+        var deletion = new JsonObject
+        {
+            ["status"] = "pending",
+            ["policy"] = "user_requested_without_pcm_equivalence",
+            ["authorized_after"] = "quick_final_path_checks",
+            ["files"] = new JsonArray(deletionTargets.Select(target => JsonValue.Create(target.RelativePath)).ToArray()),
+            ["performed"] = false
+        };
+        report["deletion"] = deletion;
         await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
         progress.Report(Snapshot(JobPhase.FinalVerificationPassed, 90, "Quick final FLAC, tag, artwork, and copy-hash checks passed."));
 
-        const bool deleted = false;
-        progress.Report(Snapshot(JobPhase.SourceDisposition, 96, "The original source image was retained because full PCM equivalence was skipped."));
+        progress.Report(Snapshot(JobPhase.SourceDisposition, 94, "Deleting the exact inventoried FLAC image as requested; PCM/MD5 comparison was skipped."));
+        try
+        {
+            foreach (var target in deletionTargets) File.Delete(target.FullPath);
+            if (deletionTargets.Any(target => File.Exists(target.FullPath)))
+                throw new IOException("An inventoried source image still exists after deletion.");
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            deletion["status"] = "failed";
+            deletion["performed"] = false;
+            deletion["error"] = error.Message;
+            var verification = report["verification"] as JsonObject ?? new JsonObject();
+            report["verification"] = verification;
+            verification["status"] = "failed";
+            verification["sources_deleted"] = false;
+            verification["errors"] = new JsonArray(JsonValue.Create($"Tracks passed quick checks, but source deletion failed: {error.Message}"));
+            try { await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None); }
+            catch (Exception reportError) when (reportError is IOException or UnauthorizedAccessException) { }
+            throw new IOException("Tracks were committed, but the original FLAC image could not be deleted. Review the report and source path.", error);
+        }
+
+        const bool deleted = true;
+        deletion["status"] = "completed";
+        deletion["performed"] = true;
+        deletion["completed_at_utc"] = DateTimeOffset.UtcNow;
+        var finalVerification = report["verification"] as JsonObject ?? new JsonObject();
+        report["verification"] = finalVerification;
+        finalVerification["sources_deleted"] = true;
+        await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None);
+        progress.Report(Snapshot(JobPhase.SourceDisposition, 96, "The exact inventoried FLAC image was deleted after quick final checks."));
+
         var networkCleaned = TryDeleteDirectory(networkStage);
         HostStagingService.ValidateJobDirectory(staged.JobDirectory, Path.Combine(Path.GetTempPath(), "album-fixer"));
         var localCleaned = TryDeleteDirectory(staged.JobDirectory);
@@ -356,8 +396,8 @@ public sealed class HostCommitService
             // Final report enrichment is best effort after the quick final checks pass.
         }
         var cleanupDetail = localCleaned && networkCleaned
-            ? "Conversion completed; final files and report passed quick checks at the album location. The original was retained."
-            : "Conversion completed with quick checks; a staging folder and the original were retained.";
+            ? "Conversion completed; final files and report passed quick checks, and the original FLAC image was deleted."
+            : "Conversion completed and the original FLAC image was deleted; a staging folder may require cleanup.";
         progress.Report(new(JobPhase.CleanupCompleted, 100, "passed", cleanupDetail, DateTimeOffset.UtcNow));
         return new(existingReport, outputs.Count(path => Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase)), deleted);
     }
@@ -479,7 +519,31 @@ public sealed class HostCommitService
     private static string? Text(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
-    private static void SetQuickVerification(JsonObject report, string stage, bool deletionRequested)
+    private static IReadOnlyList<DeletionTarget> ResolveDeletionTargets(ScanResult scan, StagedJob staged)
+    {
+        if (staged.Sources.Count != 1)
+            throw new InvalidOperationException($"Automatic source deletion requires exactly one inventoried FLAC image; found {staged.Sources.Count}.");
+
+        var source = staged.Sources[0];
+        if (!Path.GetExtension(source.RelativePath).Equals(".flac", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Automatic source deletion is limited to an inventoried .flac image.");
+        if (!scan.Media.Any(item =>
+                item.Kind.Equals("FLAC image", StringComparison.OrdinalIgnoreCase) &&
+                item.RelativePath.Equals(source.RelativePath, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException("The deletion target is not the FLAC image identified by the read-only inventory.");
+
+        var fullPath = HostStagingService.SafeCombine(scan.AlbumRoot, source.RelativePath);
+        if (!File.Exists(fullPath)) throw new FileNotFoundException("The inventoried original FLAC image is already missing.", fullPath);
+        var info = new FileInfo(fullPath);
+        if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("Album Fixer will not delete a reparse-point source.");
+        if (info.Length != source.Size)
+            throw new IOException("The original FLAC image size changed during the run; it was not deleted.");
+        return [new(source.RelativePath, fullPath)];
+    }
+
+    private sealed record DeletionTarget(string RelativePath, string FullPath);
+    private static void SetQuickVerification(JsonObject report, string stage)
     {
         var verification = report["verification"] as JsonObject ?? new JsonObject();
         report["verification"] = verification;
@@ -488,7 +552,7 @@ public sealed class HostCommitService
         verification["pcm_equivalence"] = "skipped_by_user";
         verification["verified_stage"] = stage;
         verification["verified_at_utc"] = DateTimeOffset.UtcNow;
-        verification["source_deletion_requested"] = deletionRequested;
+        verification["source_deletion_requested"] = true;
         verification["sources_deleted"] = false;
         verification["errors"] = new JsonArray();
     }

@@ -46,7 +46,6 @@ public sealed record RunOptions(
     string CodexPath,
     string AlbumRoot,
     string JobDirectory,
-    bool DeleteOriginals,
     string SkillPath,
     string FfmpegPath,
     string FfprobePath,
@@ -380,7 +379,7 @@ public static class CodexContract
 
     public static string Prompt(RunOptions options)
     {
-        const string deletion = "Fast verification policy: retain every original source. Skipping decoded PCM equivalence never authorizes source deletion.";
+        const string deletion = "Source policy: after successful final quick checks, the desktop host deletes the exact inventoried FLAC image as explicitly requested, without decoded PCM equivalence.";
         return $"""
 Use the staged $album-fixer skill faithfully for this local album transaction.
 Local staged album root: {options.AlbumRoot}
@@ -390,17 +389,17 @@ Staged ffmpeg: {options.FfmpegPath}
 Staged ffprobe: {options.FfprobePath}
 {deletion}
 
-The deterministic desktop processor already copied and SHA-256-verified the source, parsed the CUE, and split every track locally in one FFmpeg process. The user explicitly requested fast verification. Do not run verify-flac-split.ps1, do not fully decode the source or output tracks for PCM byte-count or MD5 comparison, and do not claim signal equivalence. The original source must always be retained.
+The deterministic desktop processor already copied and SHA-256-verified the source, parsed the CUE, and split every track locally in one FFmpeg process. The user explicitly requested fast verification and deletion without decoded-audio comparison. Do not run verify-flac-split.ps1, do not fully decode the source or output tracks for PCM byte-count or MD5 comparison, and do not claim signal equivalence. Do not delete the source yourself; the desktop host owns exact-path deletion after final quick checks.
 
 Read {Path.Combine(options.JobDirectory, "metadata-gaps.json")}. This process was started only because missing_fields names one or more required metadata gaps. Research only those explicitly listed fields. Do not research, replace, or second-guess any nonempty value supplied by the local CUE, rip log, existing tags, folder name, booklet, scans, or library folder. Prefer local evidence; use web research only for a listed gap, and match the exact edition conservatively.
 
 The split tracks already exist. Never split, extract, or re-encode their audio again. Fill only the recorded gaps, tag the existing outputs, create or embed artwork only when COVER is a recorded gap, complete conversion-report.json, and perform quick ffprobe container, required-tag, and embedded-artwork checks. If a listed gap cannot be resolved confidently, stop safely with status=failed and retain every original.
 
-The original album location is intentionally unavailable to this protected process. Do not probe, map, or access any UNC/network path, and do not perform copy-back or source deletion. Work only inside the approved Temp job directory. Use the staged ffmpeg and ffprobe paths above. Preserve all provenance and unrelated files. Keep paths in conversion-report.json relative to the staged album root. The desktop host independently repeats quick verification, copies files back through destination-side staging, verifies hashes and final paths, updates the report, and retains the original.
+The original album location is intentionally unavailable to this protected process. Do not probe, map, or access any UNC/network path, and do not perform copy-back or source deletion. Work only inside the approved Temp job directory. Use the staged ffmpeg and ffprobe paths above. Preserve all provenance and unrelated files. Keep paths in conversion-report.json relative to the staged album root. The desktop host independently repeats quick verification, copies files back through destination-side staging, verifies hashes and final paths, updates the report, and then applies the user-requested exact source deletion.
 
 Atomically replace {Path.Combine(options.JobDirectory, "ui-progress.json")} after every metadata state transition. Use compact UTF-8 JSON with phase, phase_index, phase_count (12), percent, status, detail, updated_at_utc. The host has completed splitting. You own Tagging and Local verification only; do not claim phases 7-12. On failure or cancellation write status=failed or canceled and state the exact stopping point. Begin each user-visible update with ALBUM_FIXER_PROGRESS followed by the same one-line object. For Windows PowerShell 5.1 atomic writes, write a temporary file in the same directory and use Move-Item -LiteralPath $tmp -Destination $target -Force.
 
-At completion summarize the fields enriched, local values preserved, quick verification status, report path, originals retained, and errors.
+At completion summarize the fields enriched, local values preserved, quick verification status, report path, source disposition left to the desktop host, and errors.
 """;
     }
 }

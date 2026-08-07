@@ -12,13 +12,14 @@ try
     await HostStagesAndVerifiesSource(root);
     await LocalSplitterRunsWithoutCodex(root);
     await HostCommitsVerifiedFlac(root);
+    await HostCommitFailureRetainsSource(root);
     await FailureReportIsAlwaysWritten(root);
     await MetadataHandoffIsConditional(root);
     ProgressContractParses();
     DiagnosticContractClassifies();
     await ReportSummaryLoads(root);
     CommandContractIsSandboxed(root);
-    Console.WriteLine("AlbumFixer.Core smoke tests passed (13/13).");
+    Console.WriteLine("AlbumFixer.Core smoke tests passed (14/14).");
     return 0;
 }
 catch (Exception error)
@@ -207,13 +208,60 @@ static async Task HostCommitsVerifiedFlac(string root)
     """;
     await File.WriteAllTextAsync(Path.Combine(stagedAlbum, "conversion-report.json"), report);
     var manifest = Path.Combine(job, "host-manifest.json"); await File.WriteAllTextAsync(manifest, "{}");
-    var staged = new StagedJob(job, stagedAlbum, Path.Combine(stagedSkill, "SKILL.md"), ffmpeg, ffprobe, manifest, []);
-    var result = await new HostCommitService().CommitAsync(scan, staged, true, new Progress<ProgressSnapshot>());
-    Assert(result.Tracks == 1 && !result.SourcesDeleted, "Fast verification must retain the source even when deletion was requested.");
+    var stagedSource = new StagedSource("source.flac", new FileInfo(source).Length, await HostStagingService.Sha256Async(source));
+    var staged = new StagedJob(job, stagedAlbum, Path.Combine(stagedSkill, "SKILL.md"), ffmpeg, ffprobe, manifest, [stagedSource]);
+    var result = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>());
+    Assert(result.Tracks == 1 && result.SourcesDeleted, "The exact source must be deleted after final quick checks.");
     Assert(File.Exists(Path.Combine(destination, "Tracks", "CD1", "01 - Test.flac")) && File.Exists(Path.Combine(destination, "cover.jpg")), "Verified outputs were not committed to final paths.");
-    Assert(File.Exists(source) && File.Exists(result.ReportPath), "Fast verification must preserve the source and the final report.");
+    Assert(!File.Exists(source) && File.Exists(cue) && File.Exists(result.ReportPath), "Only the source FLAC should be deleted; the CUE and final report must remain.");
     var summary = await ReportReader.LoadAsync(result.ReportPath);
-    Assert(summary.Status == "passed" && summary.Tracks == 1 && !summary.Deleted, "Quick final checks did not produce a passed, source-retaining report.");
+    Assert(summary.Status == "passed" && summary.Tracks == 1 && summary.Deleted, "The final report did not record quick-check source deletion.");
+}
+
+static async Task HostCommitFailureRetainsSource(string root)
+{
+    const string installedSkill = @"C:\Users\gbolotin\.codex\skills\album-fixer\SKILL.md";
+    if (!File.Exists(installedSkill)) return;
+    var destination = Path.Combine(root, "failed-commit-destination"); Directory.CreateDirectory(destination);
+    var source = Path.Combine(destination, "source.flac");
+    var cue = Path.Combine(destination, "source.cue");
+    await File.WriteAllTextAsync(cue, "FILE \"source.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00");
+    var provisionalScan = await new AlbumScanner().ScanAsync(destination);
+    var preflight = await new PreflightService().CheckAsync(provisionalScan, installedSkill);
+    if (preflight.Tools["ffmpeg"] is not { } ffmpeg || preflight.Tools["ffprobe"] is not { } ffprobe) return;
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=750:duration=0.25", "-c:a", "flac", source);
+    var scan = await new AlbumScanner().ScanAsync(destination);
+
+    var job = Path.Combine(root, "failed-commit-job");
+    var stagedAlbum = Path.Combine(job, "album"); Directory.CreateDirectory(stagedAlbum);
+    File.Copy(source, Path.Combine(stagedAlbum, "source.flac"));
+    File.Copy(cue, Path.Combine(stagedAlbum, "source.cue"));
+    var trackDirectory = Path.Combine(stagedAlbum, "Tracks", "CD1"); Directory.CreateDirectory(trackDirectory);
+    var track = Path.Combine(trackDirectory, "01 - Invalid.flac");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-i", Path.Combine(stagedAlbum, "source.flac"), "-c:a", "copy", track);
+    var cover = Path.Combine(stagedAlbum, "cover.jpg");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=64x64", "-frames:v", "1", "-update", "1", cover);
+    await File.WriteAllTextAsync(Path.Combine(stagedAlbum, "conversion-report.json"), """
+    {
+      "album": "Invalid transaction test",
+      "workflow_mode": "flac_cue_split",
+      "genre": { "value": "Rock", "source_type": "inferred", "confidence": "high", "rationale": "test" },
+      "cover": { "file": "cover.jpg" },
+      "discs": [{ "disc": 1, "source": "source.flac", "tracks": [{ "disc": 1, "track": 1, "title": "Invalid", "file": "Tracks/CD1/01 - Invalid.flac" }] }],
+      "verification": { "status": "pending", "sources_deleted": false, "errors": [] }
+    }
+    """);
+    var stagedSource = new StagedSource("source.flac", new FileInfo(source).Length, await HostStagingService.Sha256Async(source));
+    var staged = new StagedJob(job, stagedAlbum, string.Empty, ffmpeg, ffprobe, Path.Combine(job, "host-manifest.json"), [stagedSource]);
+
+    Exception? failure = null;
+    try { await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>()); }
+    catch (Exception error) { failure = error; }
+
+    Assert(failure is InvalidOperationException && failure.Message.Contains("cover", StringComparison.OrdinalIgnoreCase),
+        "The invalid track must fail the quick embedded-cover check.");
+    Assert(File.Exists(source), "A failed commit must retain the exact source FLAC.");
+    Assert(!Directory.Exists(Path.Combine(destination, "Tracks")), "A failed local check must not commit output tracks.");
 }
 
 static async Task RunToolAsync(string tool, params string[] arguments)
@@ -234,7 +282,7 @@ static async Task FailureReportIsAlwaysWritten(string root)
     var preflight = new PreflightResult([], Path.GetTempPath(), 0, long.MaxValue, tools);
     var job = Path.Combine(root, "failed-job");
     var path = await HostReportWriter.EnsureTerminalReportAsync(scan, preflight, job, "failed", JobPhase.Failed, 1,
-        "Inventory access was denied.", 0, "test-thread", true);
+        "Inventory access was denied.", 0, "test-thread");
     Assert(File.Exists(path), "A stopped run must preserve a conversion report.");
     var report = await ReportReader.LoadAsync(path);
     Assert(report.Status == "failed" && !report.Deleted && report.Errors.Count == 1, "Failure report status or retention state is wrong.");
@@ -284,7 +332,7 @@ static async Task ReportSummaryLoads(string root)
 
 static void CommandContractIsSandboxed(string root)
 {
-    var options = new RunOptions("codex.exe", root, Path.Combine(root, "job"), false, "SKILL.md", Path.Combine(root, "ffmpeg.exe"), Path.Combine(root, "ffprobe.exe"), CodexWorkKind.MetadataEnrichment);
+    var options = new RunOptions("codex.exe", root, Path.Combine(root, "job"), "SKILL.md", Path.Combine(root, "ffmpeg.exe"), Path.Combine(root, "ffprobe.exe"), CodexWorkKind.MetadataEnrichment);
     var args = CodexContract.Arguments(options);
     Assert(args.Contains("workspace-write") && args.Contains("never") && !args.Any(value => value.Contains("yolo", StringComparison.OrdinalIgnoreCase)), "Unsafe Codex command flags detected.");
     Assert(args.Zip(args.Skip(1)).Any(pair => pair.First == "--cd" && pair.Second == options.JobDirectory), "The local staging job must be the Codex workspace.");
@@ -294,7 +342,7 @@ static void CommandContractIsSandboxed(string root)
     Assert(CodexRunner.RequiresLocalStaging(protectedRunner), "Protected WindowsApps runners must be staged locally.");
     Assert(!CodexRunner.RequiresLocalStaging(normalRunner), "Normal Codex executables must run in place.");
     var prompt = CodexContract.Prompt(options);
-    Assert(prompt.Contains("retain every original", StringComparison.OrdinalIgnoreCase), "Keep-original override is missing.");
+    Assert(prompt.Contains("deletes the exact inventoried FLAC image", StringComparison.OrdinalIgnoreCase), "The single source-deletion policy is missing.");
     Assert(prompt.Contains("do not fully decode", StringComparison.OrdinalIgnoreCase) && prompt.Contains("do not run verify-flac-split.ps1", StringComparison.OrdinalIgnoreCase), "Fast mode must prohibit full PCM/MD5 verification.");
     Assert(prompt.Contains("Do not probe, map, or access any UNC/network path", StringComparison.OrdinalIgnoreCase), "The local-only runner boundary is missing.");
     Assert(prompt.Contains("already", StringComparison.OrdinalIgnoreCase) && prompt.Contains("split every track locally", StringComparison.OrdinalIgnoreCase), "The metadata agent must receive already-split tracks.");

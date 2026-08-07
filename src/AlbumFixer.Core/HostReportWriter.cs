@@ -21,7 +21,6 @@ public static class HostReportWriter
         string detail,
         int? exitCode,
         string? threadId,
-        bool deletionWasRequested,
         CancellationToken token = default)
     {
         var normalizedStatus = status.Equals("canceled", StringComparison.OrdinalIgnoreCase) ? "canceled" : "failed";
@@ -81,7 +80,7 @@ public static class HostReportWriter
             },
             deletion = new
             {
-                requested_after_verification = deletionWasRequested,
+                requested_after_verification = true,
                 performed = false,
                 reason = "Failure or cancellation retains every original source"
             },

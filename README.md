@@ -10,9 +10,9 @@ Album Fixer is a native Windows app that locally splits FLAC+CUE album images in
 - Copies the selected album and audio tools into a unique Windows Temp job and verifies source size and SHA-256 before processing.
 - Parses the CUE and splits all tracks in one local FFmpeg process, writing locally available tags and embedding local artwork without starting Codex.
 - After every track exists, reads the metadata-gap handoff. Complete local metadata skips Codex entirely; only named missing required fields trigger Codex discovery, skill staging, and one metadata-only process.
-- Uses quick ffprobe container, required-tag, and embedded-artwork checks; writes through destination-side staging and compares SHA-256 copy hashes. Full decoded PCM/MD5 equivalence is skipped, so the original image is always retained.
+- Uses quick ffprobe container, required-tag, and embedded-artwork checks; writes through destination-side staging and compares SHA-256 copy hashes. Decoded PCM/MD5 comparison is skipped, then the exact original FLAC image is deleted as requested.
 - Shows phase progress, live activity, inventory, final verification status, output counts, source disposition, and formatted report JSON.
-- Disables source deletion in fast mode because decoded-audio equivalence is intentionally skipped.
+- Has one source policy: successful FLAC+CUE runs delete the exact inventoried image after final quick checks; failed, incomplete, canceled, or uncertain runs keep it.
 - Retains sources whenever a job is failed, incomplete, canceled, uncertain, or missing required proof.
 
 ## Run
@@ -25,8 +25,8 @@ The packaged app is self-contained for 64-bit Windows and does not require a sep
 
 1. Choose one album folder, not the whole music library.
 2. Select **Scan album** and resolve any blocked preflight checks.
-3. Review the fast-mode source policy: the original image will be retained.
-4. Select **Start safe run** and confirm the policy.
+3. Review the deletion warning: PCM/MD5 comparison is skipped and the exact original FLAC image is deleted after successful final quick checks.
+4. Select **Start split** and confirm permanent source deletion.
 5. Review the progress timeline and the **Report** tab.
 
 ## Required tools
