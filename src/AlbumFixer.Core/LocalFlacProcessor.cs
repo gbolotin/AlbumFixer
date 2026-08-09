@@ -14,6 +14,8 @@ public sealed record LocalSplitResult(
 
 public sealed class LocalFlacProcessor
 {
+    private const long MaximumPreparedCoverBytes = 1L * 1024 * 1024;
+    private const int MaximumPreparedCoverDimension = 600;
     private static readonly Regex FileLine = new("^\\s*FILE\\s+(?:\"(?<quoted>[^\"]+)\"|(?<plain>\\S+))\\s+\\S+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex TrackLine = new("^\\s*TRACK\\s+(?<number>\\d+)\\s+AUDIO\\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex IndexLine = new("^\\s*INDEX\\s+(?<index>\\d+)\\s+(?<minute>\\d+):(?<second>\\d+):(?<frame>\\d+)\\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -42,7 +44,8 @@ public sealed class LocalFlacProcessor
         if (cuePaths.Length == 0)
             throw new InvalidOperationException("The local splitter requires at least one CUE sheet.");
 
-        var cover = await PrepareCoverAsync(staged, token);
+        var preparedCover = await PrepareCoverAsync(staged, token);
+        var cover = preparedCover.Cover;
         var inputs = new List<LocalInput>();
         var sources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         for (var index = 0; index < cuePaths.Length; index++)
@@ -95,7 +98,7 @@ public sealed class LocalFlacProcessor
             : "Local tags and front-cover artwork were written during the split."));
 
         var reportPath = Path.Combine(staged.AlbumRoot, "conversion-report.json");
-        await WriteReportAsync(scan, staged, discs, cover, missing, reportPath, token);
+        await WriteReportAsync(scan, staged, discs, cover, preparedCover.Issue, missing, reportPath, token);
         var evidence = LocalEvidence(scan, cuePaths, cover);
         await WriteGapManifestAsync(staged.JobDirectory, missing, evidence, token);
         var gapResult = new MetadataGapResult(true, missing.Count > 0, missing, evidence);
@@ -265,36 +268,105 @@ public sealed class LocalFlacProcessor
         return null;
     }
 
-    private static async Task<LocalCover?> PrepareCoverAsync(StagedJob staged, CancellationToken token)
+    private static async Task<CoverPreparation> PrepareCoverAsync(StagedJob staged, CancellationToken token)
     {
         var candidates = Directory.EnumerateFiles(staged.AlbumRoot, "*", SearchOption.AllDirectories)
             .Where(path => new[] { ".jpg", ".jpeg", ".png" }.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase))
             .Where(path => !HostStagingService.SafeRelative(staged.AlbumRoot, path).StartsWith($"Tracks{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
-            .OrderBy(path => CoverRank(staged.AlbumRoot, path))
+            .OrderBy(CoverRank)
             .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        if (candidates.Length == 0) return null;
+        var explicitFront = candidates.FirstOrDefault(path => CoverRank(path) < 2);
+        var bookletFront = explicitFront is null
+            ? candidates.FirstOrDefault(IsFirstBookletScan)
+            : null;
+        var source = explicitFront ?? bookletFront;
+        if (source is null)
+            return new(null, "No dedicated front-cover image or recognizable first booklet spread was found in the album scans.");
 
-        var source = candidates[0];
+        var derivesBookletPanel = bookletFront is not null;
         var target = Path.Combine(staged.AlbumRoot, "cover.jpg");
-        if (!source.Equals(target, StringComparison.OrdinalIgnoreCase))
+        var temporary = Path.Combine(staged.AlbumRoot, $".album-fixer-cover-{Guid.NewGuid():N}.jpg");
+        try
         {
-            if (File.Exists(target)) throw new IOException("A different root cover.jpg already exists in local staging.");
-            if (Path.GetExtension(source).Equals(".jpg", StringComparison.OrdinalIgnoreCase) || Path.GetExtension(source).Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
-                File.Copy(source, target, overwrite: false);
+            var sourceSize = await ProbeImageAsync(staged.FfprobePath, source, token);
+            string filter;
+            if (derivesBookletPanel)
+            {
+                if (sourceSize.Width < sourceSize.Height * 3 / 2)
+                    return new(null, $"The first booklet scan is not a recognizable landscape cover spread: {JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, source))}.");
+                var crop = Math.Min(sourceSize.Height, sourceSize.Width / 2);
+                var output = Math.Min(crop, MaximumPreparedCoverDimension);
+                filter = $"crop={crop}:{crop}:{sourceSize.Width - crop}:0,scale={output}:{output}";
+            }
             else
-                await RunProcessAsync(staged.FfmpegPath, ["-hide_banner", "-nostdin", "-loglevel", "error", "-n", "-i", source, "-frames:v", "1", "-q:v", "2", target], null, token);
+            {
+                var crop = Math.Min(sourceSize.Width, sourceSize.Height);
+                var output = Math.Min(crop, MaximumPreparedCoverDimension);
+                filter = $"crop={crop}:{crop}:{(sourceSize.Width - crop) / 2}:{(sourceSize.Height - crop) / 2},scale={output}:{output}";
+            }
+
+            await RunProcessAsync(staged.FfmpegPath,
+                ["-hide_banner", "-nostdin", "-loglevel", "error", "-n", "-i", source, "-vf", filter, "-frames:v", "1", "-q:v", "4", temporary], null, token);
+            if (new FileInfo(temporary).Length > MaximumPreparedCoverBytes)
+            {
+                File.Delete(temporary);
+                await RunProcessAsync(staged.FfmpegPath,
+                    ["-hide_banner", "-nostdin", "-loglevel", "error", "-n", "-i", source, "-vf", filter, "-frames:v", "1", "-q:v", "7", temporary], null, token);
+            }
+            if (new FileInfo(temporary).Length > MaximumPreparedCoverBytes)
+                return new(null, $"The prepared front cover still exceeds the safe {MaximumPreparedCoverBytes / (1024 * 1024)} MB embedding limit.");
+
+            File.Move(temporary, target, overwrite: true);
+            var preparedSize = await ProbeImageAsync(staged.FfprobePath, target, token);
+            var relative = JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, source));
+            var sourceDescription = derivesBookletPanel
+                ? $"local file: {relative} (right-side front-panel crop; normalized JPEG)"
+                : $"local file: {relative} (normalized JPEG)";
+            return new(new(target, sourceDescription, preparedSize.Width, preparedSize.Height), null);
         }
-        return new(target, $"local file: {JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, source))}");
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidDataException or InvalidOperationException or JsonException)
+        {
+            return new(null, $"The local front cover could not be prepared safely: {error.Message}");
+        }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
     }
 
-    private static int CoverRank(string root, string path)
+    private static int CoverRank(string path)
     {
         var name = Path.GetFileNameWithoutExtension(path);
         if (name.Equals("cover", StringComparison.OrdinalIgnoreCase) || name.Equals("folder", StringComparison.OrdinalIgnoreCase) || name.Equals("front", StringComparison.OrdinalIgnoreCase)) return 0;
-        if (name.Contains("front", StringComparison.OrdinalIgnoreCase) || name.Contains("cover", StringComparison.OrdinalIgnoreCase)) return 1;
-        if (Path.GetDirectoryName(path)?.Contains($"{Path.DirectorySeparatorChar}Covers", StringComparison.OrdinalIgnoreCase) == true) return 2;
-        return Path.GetDirectoryName(path)?.Equals(root, StringComparison.OrdinalIgnoreCase) == true ? 3 : 4;
+        if (name.Contains("front", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("cover", StringComparison.OrdinalIgnoreCase) && !name.Contains("back", StringComparison.OrdinalIgnoreCase)) return 1;
+        return IsFirstBookletScan(path) ? 2 : int.MaxValue;
+    }
+
+    private static bool IsFirstBookletScan(string path)
+    {
+        var compact = Regex.Replace(Path.GetFileNameWithoutExtension(path), "[^a-z0-9]", string.Empty, RegexOptions.IgnoreCase);
+        return compact.Equals("booklet1", StringComparison.OrdinalIgnoreCase) ||
+               compact.Equals("booklet01", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<ImageSize> ProbeImageAsync(string ffprobe, string path, CancellationToken token)
+    {
+        var output = await RunProcessAsync(ffprobe,
+            ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", path], null, token);
+        using var document = JsonDocument.Parse(output);
+        if (!document.RootElement.TryGetProperty("streams", out var streams) || streams.ValueKind != JsonValueKind.Array || streams.GetArrayLength() == 0)
+            throw new InvalidDataException($"No readable image stream was found in '{Path.GetFileName(path)}'.");
+        var stream = streams[0];
+        if (!stream.TryGetProperty("width", out var widthValue) || !widthValue.TryGetInt32(out var width) || width <= 0 ||
+            !stream.TryGetProperty("height", out var heightValue) || !heightValue.TryGetInt32(out var height) || height <= 0)
+            throw new InvalidDataException($"The image dimensions are invalid in '{Path.GetFileName(path)}'.");
+        return new(width, height);
     }
 
     private static IReadOnlyList<TrackOutput> BuildOutputs(IReadOnlyList<CueTrack> tracks, string outputRoot)
@@ -451,6 +523,7 @@ public sealed class LocalFlacProcessor
         StagedJob staged,
         IReadOnlyList<LocalDisc> discs,
         LocalCover? cover,
+        string? coverIssue,
         IReadOnlyList<string> missing,
         string reportPath,
         CancellationToken token)
@@ -523,9 +596,18 @@ public sealed class LocalFlacProcessor
             report["cover"] = new JsonObject
             {
                 ["file"] = "cover.jpg",
-                ["size"] = new JsonArray(0, 0),
+                ["size"] = new JsonArray(cover.Width, cover.Height),
                 ["source"] = cover.Source
             };
+        }
+        else
+        {
+            report["artwork"] = new JsonObject
+            {
+                ["status"] = "incomplete",
+                ["reason"] = coverIssue ?? "No usable front-cover artwork was available."
+            };
+            ((JsonObject)report["verification"]!)["warnings"] = new JsonArray(JsonValue.Create(coverIssue ?? "Front-cover artwork is missing."));
         }
         if (missing.Count > 0) ((JsonObject)report["verification"]!)["missing_metadata"] = new JsonArray(missing.Select(value => JsonValue.Create(value)).ToArray());
         await AtomicWriteAsync(reportPath, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
@@ -613,7 +695,9 @@ public sealed class LocalFlacProcessor
 
     private sealed record AudioProbe(int SampleRate, long? TotalSamples);
     private sealed record ResolvedMetadata(string? Album, string? AlbumArtist, string? Date, string? Genre, string? Composer, bool GenreInferred);
-    private sealed record LocalCover(string Path, string Source);
+    private sealed record ImageSize(int Width, int Height);
+    private sealed record LocalCover(string Path, string Source, int Width, int Height);
+    private sealed record CoverPreparation(LocalCover? Cover, string? Issue);
     private sealed record TrackOutput(CueTrack Track, string Path);
     private sealed record LocalInput(CueSheet Cue, string Source, AudioProbe Probe, ResolvedMetadata Metadata);
     private sealed record LocalDisc(

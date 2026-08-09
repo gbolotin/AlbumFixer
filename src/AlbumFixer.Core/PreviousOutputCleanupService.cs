@@ -42,8 +42,7 @@ public static class PreviousOutputCleanupService
 
             var hashes = CommitHashes(report);
             var tracksRoot = HostStagingService.SafeCombine(root, "Tracks");
-            var files = EnumerateFileValues(report)
-                .Where(IsLegacyTrackPath)
+            var files = EnumerateReportedOutputs(report)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Select(relative =>
                 {
@@ -52,7 +51,9 @@ public static class PreviousOutputCleanupService
                     hashes.TryGetValue(normalized, out var sha256);
                     return new PreviousOutputFile(normalized, fullPath, sha256);
                 })
-                .Where(file => IsWithin(tracksRoot, file.FullPath))
+                .Where(file => IsLegacyTrackPath(file.RelativePath)
+                    ? IsWithin(tracksRoot, file.FullPath)
+                    : file.Sha256 is not null)
                 .Where(file => File.Exists(file.FullPath))
                 .OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
                 .ToArray();

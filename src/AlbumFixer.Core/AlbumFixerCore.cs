@@ -566,7 +566,7 @@ public static class CodexContract
 
     public static string Prompt(RunOptions options)
     {
-        const string deletion = "Source policy: after successful final quick checks, the desktop host deletes one exact inventoried FLAC image when confirmed; when several FLAC images are present, it retains every original because multi-image deletion is not authorized.";
+        const string deletion = "Source policy: after successful final quick checks, the desktop host deletes one exact inventoried FLAC image only when required artwork is complete; incomplete artwork retains the source. When several FLAC images are present, it retains every original because multi-image deletion is not authorized.";
         return $"""
 Use the staged $album-fixer skill faithfully for this local album transaction.
 Local staged album root: {options.AlbumRoot}
@@ -580,7 +580,7 @@ The deterministic desktop processor already copied and SHA-256-verified every so
 
 Read {Path.Combine(options.JobDirectory, "metadata-gaps.json")}. This process was started only because missing_fields names one or more required metadata gaps. Research only those explicitly listed fields. Do not research, replace, or second-guess any nonempty value supplied by the local CUE, rip log, existing tags, folder name, booklet, scans, or library folder. Prefer local evidence; use web research only for a listed gap, and match the exact edition conservatively.
 
-The split tracks already exist. Never split, extract, or re-encode their audio again. Fill only the recorded gaps, tag the existing outputs, create or embed artwork only when COVER is a recorded gap, complete conversion-report.json, and perform quick ffprobe container, required-tag, and embedded-artwork checks. If a listed gap cannot be resolved confidently, stop safely with status=failed and retain every original.
+The split tracks already exist. Never split, extract, or re-encode their audio again. Fill only the recorded gaps, tag the existing outputs, create or embed artwork only when COVER is a recorded gap, complete conversion-report.json, and perform quick ffprobe container, required-tag, and embedded-artwork checks. Never use an image identified as back, rear, inlay, tray, disc, matrix, or an interior booklet page as the front cover. Normalize the confirmed front to a square JPEG no larger than 600x600 and 1 MB before embedding it. Preserve full-resolution scans as provenance. If COVER is the only unresolved gap, record verification.status=incomplete, preserve the usable tracks, and return successfully so the desktop host can deliver them while retaining the source. Any unresolved non-artwork gap remains a failure.
 
 The original album location is intentionally unavailable to this protected process. Do not probe, map, or access any UNC/network path, and do not perform copy-back or source deletion. Work only inside the approved Temp job directory. Use the staged ffmpeg and ffprobe paths above. Preserve all provenance and unrelated files. Keep paths in conversion-report.json relative to the staged album root. The desktop host independently repeats quick verification, copies files back through destination-side staging, verifies hashes and final paths, updates the report, and then applies the user-requested exact source deletion.
 
@@ -764,9 +764,10 @@ public static class ReportReader
         var verification = Prop(root, "verification", out var v) ? v : default; var status = verification.ValueKind == JsonValueKind.Object ? Get(verification, "status") ?? "pending" : "pending";
         var deleted = verification.ValueKind == JsonValueKind.Object && Bool(verification, "sources_deleted");
         var errors = new List<string>(); if (verification.ValueKind == JsonValueKind.Object && Prop(verification, "errors", out var e) && e.ValueKind == JsonValueKind.Array) foreach (var item in e.EnumerateArray()) errors.Add(item.ToString());
+        if (verification.ValueKind == JsonValueKind.Object && Prop(verification, "warnings", out var warnings) && warnings.ValueKind == JsonValueKind.Array) foreach (var item in warnings.EnumerateArray()) errors.Add(item.ToString());
         var tracks = new HashSet<string>(StringComparer.OrdinalIgnoreCase); Files(root, tracks);
         var sections = Count(root, "discs") + Count(root, "areas") + Count(root, "audio_areas");
-        var label = status.ToLowerInvariant() switch { "passed" => "Verification passed", "failed" => "Verification failed", "blocked" => "Run blocked safely", "canceled" => "Run canceled safely", _ => "Report pending" };
+        var label = status.ToLowerInvariant() switch { "passed" => "Verification passed", "incomplete" => "Tracks ready · artwork incomplete", "failed" => "Verification failed", "blocked" => "Run blocked safely", "canceled" => "Run canceled safely", _ => "Report pending" };
         return new(status, $"{album} · {label}", string.Join("  •  ", new[] { edition, workflow?.Replace('_', ' '), verification.ValueKind == JsonValueKind.Object ? Get(verification, "method") : null }.Where(x => !string.IsNullOrWhiteSpace(x))), tracks.Count, sections, deleted, errors, json);
     }
     private static string? Get(JsonElement e, string n) => Prop(e, n, out var p) ? p.ValueKind == JsonValueKind.String ? p.GetString() : p.ToString() : null;
