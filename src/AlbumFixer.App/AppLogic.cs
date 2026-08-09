@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Input;
 using AlbumFixer.Core;
@@ -35,7 +36,32 @@ public sealed class AsyncCommand(Func<Task> action, Func<bool>? allowed = null) 
 
 public sealed record ActivityRow(string Time, string Kind, string Message);
 public sealed record MediaRow(string Path, string Kind, string Size, string Note);
-public sealed record CheckRow(string Name, string State, string Detail, CheckState RawState);
+public sealed record AlbumJobOutcome(string JobDirectory, string ReportPath, int Tracks, bool SourcesDeleted, string? ThreadId);
+public sealed record JobUiUpdate(int Index, int AlbumIndex, string AlbumName, ProgressSnapshot? Progress = null, string? Kind = null, string? Message = null, string? ThreadId = null);
+public sealed record BatchAlbumReportEntry(int Index, string Album, string AlbumRoot, string Status, string? JobDirectory, string? ReportPath, int Tracks, bool SourcesDeleted, string? ThreadId, string? Error);
+
+public sealed class CheckRow : NotifyBase
+{
+    private string _state;
+    private string _detail;
+    private CheckState _rawState;
+    public CheckRow(string name, string state, string detail, CheckState rawState, int? albumIndex = null, string? albumFolderPath = null)
+    { Name = name; _state = state; _detail = detail; _rawState = rawState; AlbumIndex = albumIndex; AlbumFolderPath = albumFolderPath; }
+    public string Name { get; }
+    public int? AlbumIndex { get; }
+    public string? AlbumFolderPath { get; }
+    public bool HasAlbumFolder => !string.IsNullOrWhiteSpace(AlbumFolderPath);
+    public Visibility AlbumNameTextVisibility => HasAlbumFolder ? Visibility.Collapsed : Visibility.Visible;
+    public Visibility AlbumNameLinkVisibility => HasAlbumFolder ? Visibility.Visible : Visibility.Collapsed;
+    public string State { get => _state; set => Set(ref _state, value); }
+    public string Detail { get => _detail; set => Set(ref _detail, value); }
+    public CheckState RawState { get => _rawState; set => Set(ref _rawState, value); }
+}
+
+public sealed class CallbackProgress<T>(Action<T> callback) : IProgress<T>
+{
+    public void Report(T value) => callback(value);
+}
 
 public sealed class TimelineRow : NotifyBase
 {
@@ -52,16 +78,19 @@ public sealed class MainViewModel : NotifyBase, IDisposable
     private const string SkillPath = @"C:\Users\gbolotin\.codex\skills\album-fixer\SKILL.md";
     private readonly AlbumScanner _scanner = new();
     private readonly PreflightService _preflightService = new();
-    private readonly CodexRunner _runner = new();
     private readonly HostStagingService _staging = new();
     private readonly LocalFlacProcessor _localProcessor = new();
+    private readonly LocalDsdProcessor _localDsdProcessor = new();
     private readonly HostCommitService _commit = new();
     private CancellationTokenSource? _cancel;
     private ScanResult? _scan;
+    private IReadOnlyList<ScanResult> _scans = [];
+    private IReadOnlyList<AlbumPreflightResult> _albumPreflights = [];
     private PreflightResult? _preflight;
-    private string _albumPath = "";
-    private string _albumName = "No album selected";
-    private string _workflow = "Choose one album folder to begin";
+    private readonly Dictionary<int, ProgressSnapshot> _jobProgress = [];
+    private readonly Dictionary<int, CheckRow> _albumCheckRows = [];
+    private string _albumName = "No source folders selected";
+    private string _workflow = "Choose one or more source folders to begin";
     private string _inventory = "—";
     private string _sourceSize = "—";
     private string _statusTitle = "Ready for a safe run";
@@ -88,16 +117,18 @@ public sealed class MainViewModel : NotifyBase, IDisposable
 
     public MainViewModel()
     {
-        ScanCommand = new(ScanAsync, () => !Busy && !string.IsNullOrWhiteSpace(AlbumPath));
+        ScanCommand = new(ScanAsync, () => !Busy && SourceFolders.Count > 0);
         StartCommand = new(StartAsync, () => CanStart);
         CancelCommand = new(Cancel, () => Busy);
-        RefreshReportCommand = new(LoadReportAsync, () => !string.IsNullOrWhiteSpace(AlbumPath));
-        OpenAlbumCommand = new(OpenAlbum, () => Directory.Exists(AlbumPath));
+        RefreshReportCommand = new(LoadReportAsync, () => !Busy && SourceFolders.Count > 0);
+        OpenSourceFoldersCommand = new(OpenSourceFolders, () => SourceFolders.Any(Directory.Exists));
+        ClearSourceFoldersCommand = new(ClearSourceFolders, () => !Busy && SourceFolders.Count > 0);
         CopyReportCommand = new(CopyReport, () => ReportJson.Length > 0);
         var titles = new[] { "Inventoried", "Copying in", "Source copy verified", "Split / extract", "Tagging", "Local verification", "Copying back", "Network hashes", "Final commit", "Final verification", "Source disposition", "Cleanup" };
         for (var i = 0; i < titles.Length; i++) Timeline.Add(new() { Number = i + 1, Phase = (JobPhase)(i + 1), Title = titles[i] });
     }
 
+    public ObservableCollection<string> SourceFolders { get; } = [];
     public ObservableCollection<CheckRow> Checks { get; } = [];
     public ObservableCollection<MediaRow> Media { get; } = [];
     public ObservableCollection<TimelineRow> Timeline { get; } = [];
@@ -107,11 +138,13 @@ public sealed class MainViewModel : NotifyBase, IDisposable
     public AsyncCommand StartCommand { get; }
     public Command CancelCommand { get; }
     public AsyncCommand RefreshReportCommand { get; }
-    public Command OpenAlbumCommand { get; }
+    public Command OpenSourceFoldersCommand { get; }
+    public Command ClearSourceFoldersCommand { get; }
     public Command CopyReportCommand { get; }
     public Func<bool>? ConfirmStart { get; set; }
 
-    public string AlbumPath { get => _albumPath; set { if (!Set(ref _albumPath, value)) return; Invalidate(); ScanCommand.Refresh(); OpenAlbumCommand.Refresh(); } }
+    public int SourceFolderCount => SourceFolders.Count;
+    public string? BrowseInitialDirectory => SourceFolders.LastOrDefault(Directory.Exists);
     public string AlbumName { get => _albumName; private set => Set(ref _albumName, value); }
     public string Workflow { get => _workflow; private set => Set(ref _workflow, value); }
     public string Inventory { get => _inventory; private set => Set(ref _inventory, value); }
@@ -119,9 +152,33 @@ public sealed class MainViewModel : NotifyBase, IDisposable
     public string StatusTitle { get => _statusTitle; private set => Set(ref _statusTitle, value); }
     public string StatusDetail { get => _statusDetail; private set => Set(ref _statusDetail, value); }
     public double Progress { get => _progress; private set => Set(ref _progress, value); }
-    public bool Busy { get => _busy; private set { if (!Set(ref _busy, value)) return; Raise(nameof(CanStart)); Raise(nameof(CanBrowse)); ScanCommand.Refresh(); StartCommand.Refresh(); CancelCommand.Refresh(); } }
+    public bool Busy { get => _busy; private set { if (!Set(ref _busy, value)) return; Raise(nameof(CanStart)); Raise(nameof(CanBrowse)); ScanCommand.Refresh(); StartCommand.Refresh(); CancelCommand.Refresh(); RefreshReportCommand.Refresh(); OpenSourceFoldersCommand.Refresh(); ClearSourceFoldersCommand.Refresh(); } }
     public bool CanBrowse => !Busy;
-    public bool CanStart => !Busy && _scan is not null && _preflight?.CanStart == true;
+    public bool CanStart => !Busy && _scans.Count > 0 && _preflight?.CanStart == true;
+    public int AlbumCount => _scans.Count;
+    public int RunnableAlbumCount => _albumPreflights.Count(album => album.CanStart);
+    public BatchPipelineLimits BatchPipeline => PreflightService.PipelineLimits(_albumPreflights);
+    public int BatchWorkerLimit => BatchPipeline.MaxInFlight;
+    public string BatchPipelineDescription => BatchPipeline.Description;
+    public int PreviousOutputFileCount => _albumPreflights.Sum(album =>
+        PreviousOutputCleanupService.Discover(album.Scan.AlbumRoot)?.Files.Count ?? 0);
+    public bool IsBatch => AlbumCount > 1;
+    public bool IsSingleSacd => AlbumCount == 1 && _scans[0].Mode == WorkflowMode.DsdExtraction;
+    public bool HasSacdWorkflows => _scans.Any(scan => scan.Mode == WorkflowMode.DsdExtraction);
+    public bool DeletesSourceAfterSuccess => RunnableAlbumCount > 0 && _albumPreflights.Where(album => album.CanStart).All(album => album.Scan is { ImageCount: 1, TrackCount: 0 });
+    public bool DeletesAnySourceAfterSuccess => _albumPreflights.Any(album => album.CanStart && album.Scan is { ImageCount: 1, TrackCount: 0 });
+    public string StartActionLabel => IsBatch ? "Start album batch" : IsSingleSacd ? "Start SACD extraction" : "Start split";
+    public string SourceActionTitle => IsBatch
+        ? "Each album owns its source disposition"
+        : IsSingleSacd ? "Original SACD ISO is deleted only after full DSD verification"
+        : DeletesSourceAfterSuccess ? "Original FLAC image is deleted after success" : "Original FLAC images are retained";
+    public string SourceActionDetail => IsBatch
+        ? $"Hardware-aware pipeline: {BatchPipelineDescription}. Every album remains isolated, blocked albums are skipped, and SACD areas stay sequential inside each album. Failed or canceled albums retain their originals."
+        : IsSingleSacd
+            ? "Every reported SACD area is extracted to DSF and verified twice. Tags and artwork must leave the DSD payload unchanged, and final network paths are reverified before the exact ISO may be deleted."
+        : DeletesSourceAfterSuccess
+            ? "PCM/MD5 comparison is skipped. Album Fixer deletes only the exact inventoried image, and only after tracks are committed and pass quick FLAC, tag, artwork, and copy-hash checks. A failure or cancellation before deletion keeps it."
+            : "PCM/MD5 comparison is skipped. Multiple original images are retained after tracks are committed and pass quick checks.";
     public string ReportHeadline { get => _reportHeadline; private set => Set(ref _reportHeadline, value); }
     public string ReportDetail { get => _reportDetail; private set => Set(ref _reportDetail, value); }
     public string ReportJson { get => _reportJson; private set { if (Set(ref _reportJson, value)) CopyReportCommand.Refresh(); } }
@@ -132,127 +189,491 @@ public sealed class MainViewModel : NotifyBase, IDisposable
     public string JobDirectory { get => _jobDirectory; private set => Set(ref _jobDirectory, value); }
     public string ThreadId { get => _threadId; private set => Set(ref _threadId, value); }
 
+    public void AddSourceFolders(IEnumerable<string> folders)
+    {
+        if (Busy) return;
+        var added = 0;
+        var collapsed = 0;
+        var ignored = 0;
+        foreach (var folder in folders)
+        {
+            var normalized = NormalizeSourceFolder(folder);
+            if (normalized is null)
+            {
+                ignored++;
+                continue;
+            }
+
+            if (SourceFolders.Any(existing => IsSameOrNestedFolder(normalized, existing)))
+            {
+                ignored++;
+                continue;
+            }
+
+            var nestedSources = SourceFolders.Where(existing => IsSameOrNestedFolder(existing, normalized)).ToArray();
+            foreach (var nestedSource in nestedSources) SourceFolders.Remove(nestedSource);
+            collapsed += nestedSources.Length;
+            SourceFolders.Add(normalized);
+            added++;
+        }
+
+        if (added == 0) return;
+        Invalidate();
+        StatusTitle = "Source folders ready to scan";
+        StatusDetail = $"{SourceFolderCount} parent folder{S(SourceFolderCount)} will be scanned recursively.";
+        if (collapsed > 0) StatusDetail += $" {collapsed} nested selection{S(collapsed)} already covered by a parent folder { (collapsed == 1 ? "was" : "were") } removed.";
+        if (ignored > 0) StatusDetail += $" {ignored} duplicate or unavailable selection{S(ignored)} { (ignored == 1 ? "was" : "were") } ignored.";
+        Log("SOURCE", StatusDetail);
+    }
+
     private async Task ScanAsync()
     {
-        Busy = true; StatusTitle = "Inventorying the album…"; StatusDetail = "Reading media, CUE references, artwork, and provenance without changing files."; Log("SCAN", "Read-only inventory started.");
+        Busy = true; StatusTitle = "Inventorying albums…"; StatusDetail = "Reading media, CUE references, artwork, and provenance without changing files."; Log("SCAN", "Read-only inventory started.");
         try
         {
-            _scan = await _scanner.ScanAsync(AlbumPath); AlbumName = _scan.AlbumName; Workflow = _scan.WorkflowLabel;
-            Inventory = $"{_scan.ImageCount} image{S(_scan.ImageCount)}  •  {_scan.TrackCount} track{S(_scan.TrackCount)}  •  {_scan.CueCount} CUE"; SourceSize = SizeText.Format(_scan.SourceBytes);
-            Replace(Media, _scan.Media.Select(item => new MediaRow(item.RelativePath, item.Kind, item.Size > 0 ? SizeText.Format(item.Size) : "—", item.Note)));
-            StatusTitle = "Checking safe-run prerequisites…"; _preflight = await _preflightService.CheckAsync(_scan, SkillPath);
-            Replace(Checks, _preflight.Checks.Select(item => new CheckRow(item.Name, item.State switch { CheckState.Passed => "Ready", CheckState.Warning => "Review", _ => "Blocked" }, item.Detail, item.State)));
-            if (_scan.Mode == WorkflowMode.MultipleAlbums)
+            var sourceScans = new List<(string Folder, ScanResult RootScan, IReadOnlyList<ScanResult> Albums)>();
+            foreach (var sourceFolder in SourceFolders)
             {
-                StatusTitle = "Choose one album folder";
-                StatusDetail = _scan.Errors.First(error => error.Contains("independent albums", StringComparison.OrdinalIgnoreCase));
+                var rootScan = await _scanner.ScanAsync(sourceFolder);
+                var albums = rootScan.Mode == WorkflowMode.MultipleAlbums
+                    ? await _scanner.ScanAlbumsAsync(sourceFolder)
+                    : [rootScan];
+                sourceScans.Add((sourceFolder, rootScan, albums));
             }
-            else
+            _scans = sourceScans
+                .SelectMany(source => source.Albums)
+                .GroupBy(scan => scan.AlbumRoot, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .ToArray();
+            var firstRootScan = sourceScans[0].RootScan;
+            _scan = _scans.Count == 1 ? _scans[0] : firstRootScan;
+            AlbumName = IsBatch
+                ? SourceFolderCount == 1 ? $"{firstRootScan.AlbumName} ({AlbumCount} albums)" : $"{AlbumCount} albums from {SourceFolderCount} source folder{S(SourceFolderCount)}"
+                : _scan.AlbumName;
+            Workflow = IsBatch ? $"Parallel album batch ({AlbumCount} discovered across {SourceFolderCount} source folder{S(SourceFolderCount)})" : _scan.WorkflowLabel;
+            var images = _scans.Sum(scan => scan.ImageCount);
+            var tracks = _scans.Sum(scan => scan.TrackCount);
+            var cues = _scans.Sum(scan => scan.CueCount);
+            Inventory = $"{AlbumCount} album{S(AlbumCount)}  •  {images} image{S(images)}  •  {tracks} track{S(tracks)}  •  {cues} CUE";
+            SourceSize = SizeText.Format(_scans.Sum(scan => scan.SourceBytes));
+            Replace(Media, sourceScans.SelectMany(source => source.RootScan.Media.Select(item => new MediaRow(
+                SourceFolderCount == 1 ? item.RelativePath : Path.Combine(source.Folder, item.RelativePath),
+                item.Kind, item.Size > 0 ? SizeText.Format(item.Size) : "—", item.Note))));
+            StatusTitle = "Checking safe-run prerequisites…";
+            _albumPreflights = await _preflightService.CheckAlbumsAsync(_scans, SkillPath);
+            _preflight = PreflightService.CombineBatch(_albumPreflights);
+            _albumCheckRows.Clear();
+            var rows = new List<CheckRow>();
+            foreach (var item in _preflight.Checks)
             {
-                StatusTitle = _preflight.CanStart ? "Ready to process" : "Run blocked safely";
-                StatusDetail = _preflight.CanStart ? "Every blocking preflight check passed. The source remains until final verification." : "Resolve the blocked checks below. No album files were changed.";
+                var album = _albumPreflights.FirstOrDefault(candidate =>
+                    item.Name.Equals($"Album {candidate.Index + 1}: {candidate.Scan.AlbumName}", StringComparison.Ordinal));
+                var row = new CheckRow(item.Name,
+                    album is not null ? album.CanStart ? "Ready" : "Blocked" : item.State switch { CheckState.Passed => "Ready", CheckState.Warning => "Review", _ => "Blocked" },
+                    item.Detail, item.State, album?.Index, album?.Scan.AlbumRoot);
+                rows.Add(row);
+                if (album is not null) _albumCheckRows[album.Index] = row;
             }
+            Replace(Checks, rows);
+            Raise(nameof(AlbumCount)); Raise(nameof(RunnableAlbumCount)); Raise(nameof(BatchWorkerLimit)); Raise(nameof(PreviousOutputFileCount)); Raise(nameof(IsBatch)); Raise(nameof(IsSingleSacd)); Raise(nameof(HasSacdWorkflows)); Raise(nameof(DeletesSourceAfterSuccess)); Raise(nameof(DeletesAnySourceAfterSuccess)); Raise(nameof(StartActionLabel)); Raise(nameof(SourceActionTitle)); Raise(nameof(SourceActionDetail));
+            var blocked = AlbumCount - RunnableAlbumCount;
+            StatusTitle = _preflight.CanStart ? (IsBatch ? "Batch ready to process" : "Ready to process") : "Run blocked safely";
+            StatusDetail = _preflight.CanStart
+                ? IsBatch
+                    ? $"{RunnableAlbumCount} album{S(RunnableAlbumCount)} ready; {blocked} blocked album{S(blocked)} will be skipped."
+                    : "Every blocking preflight check passed. The source remains until final verification."
+                : "Resolve the blocked checks below. No album files were changed.";
             Log(_preflight.CanStart ? "READY" : "BLOCKED", StatusDetail); await LoadReportAsync();
         }
-        catch (Exception error) { _scan = null; _preflight = null; StatusTitle = "Could not inventory this folder"; StatusDetail = error.Message; Log("ERROR", error.Message); }
+        catch (Exception error) { _scan = null; _scans = []; _albumPreflights = []; _preflight = null; _albumCheckRows.Clear(); StatusTitle = "Could not inventory this folder"; StatusDetail = error.Message; Log("ERROR", error.Message); }
         finally { Busy = false; Raise(nameof(CanStart)); StartCommand.Refresh(); }
     }
 
     private async Task StartAsync()
     {
-        if (!CanStart || _scan is null || _preflight is null || ConfirmStart is not null && !ConfirmStart()) return;
+        var runnable = _albumPreflights.Where(album => album.CanStart).ToArray();
+        if (!CanStart || runnable.Length == 0 || _preflight is null || ConfirmStart is not null && !ConfirmStart()) return;
         Busy = true; Progress = 1; foreach (var item in Timeline) item.State = "Pending"; _cancel = new();
+        _jobProgress.Clear();
+        for (var index = 0; index < runnable.Length; index++)
+            _jobProgress[index] = new(JobPhase.Ready, 0, "pending", "Waiting for a batch worker.", DateTimeOffset.UtcNow);
+        foreach (var album in runnable)
+            if (_albumCheckRows.TryGetValue(album.Index, out var row))
+            {
+                row.State = "Queued · 0%";
+                row.Detail = "Waiting for an available album worker.";
+                row.RawState = CheckState.Warning;
+            }
         _lastPhase = JobPhase.Ready; _lastRunStatus = "running"; _lastRunDetail = "Starting the safe run.";
         _runStartedAt = _lastActivityAt = _lastProgressAt = _lastHeartbeatAt = DateTimeOffset.UtcNow; _startupNoticeLogged = false;
         ReportStatus = "Pending"; ReportTracks = ReportSections = ReportDisposition = "—"; ReportJson = "";
         ReportHeadline = "Run in progress"; ReportDetail = "A terminal report will be preserved even if the run stops.";
         JobDirectory = PreflightService.CreateJobDirectory(_preflight.TempRoot);
-        StatusTitle = "Starting the fast workflow…"; StatusDetail = "PCM/MD5 comparison is skipped; the original FLAC image will be deleted only after successful final quick checks."; Log("START", JobDirectory);
-        using var monitorCancel = CancellationTokenSource.CreateLinkedTokenSource(_cancel.Token);
-        Task monitor = Task.CompletedTask;
+        var pipelineLimits = PreflightService.PipelineLimits(_albumPreflights);
+        var workerLimit = pipelineLimits.MaxInFlight;
+        using var pipeline = new BatchPipelineScheduler(pipelineLimits);
+        StatusTitle = IsBatch ? "Starting parallel album workers…" : IsSingleSacd ? "Starting verified SACD extraction…" : "Starting the fast workflow…";
+        StatusDetail = IsBatch
+            ? $"{runnable.Length} admitted album{S(runnable.Length)}; {pipelineLimits.Description}. {AlbumCount - runnable.Length} blocked album{S(AlbumCount - runnable.Length)} will be skipped."
+            : SourceActionDetail;
+        Log("START", JobDirectory);
         try
         {
-            var staged = await _staging.StageAsync(_scan, _preflight, SkillPath, JobDirectory, new Progress<ProgressSnapshot>(Apply), _cancel.Token);
-            Log("SPLIT", "Starting the deterministic local CUE/FFmpeg splitter. No Codex process is running.");
-            var localResult = await _localProcessor.ProcessAsync(_scan, staged, new Progress<ProgressSnapshot>(Apply), _cancel.Token);
-            Log("SPLIT", $"Local split completed: {localResult.Tracks} tracks.");
+            IProgress<JobUiUpdate> uiUpdates = new Progress<JobUiUpdate>(ApplyJobUpdate);
+            var results = await BoundedBatchProcessor.RunAsync<AlbumPreflightResult, AlbumJobOutcome>(
+                runnable,
+                (album, index, token) => ProcessAlbumAsync(album.Scan, index, album.Index, pipeline, uiUpdates, token),
+                workerLimit,
+                _cancel.Token);
+
+            if (IsBatch) await WriteBatchReportAsync(results, _cancel.IsCancellationRequested, pipelineLimits, pipeline.Telemetry);
+            await LoadReportAsync();
+            var succeeded = results.Count(result => result.Succeeded);
+            var failed = results.Count(result => !result.Succeeded && !result.Canceled);
+            var canceled = results.Count(result => result.Canceled);
+            var tracks = results.Where(result => result.Succeeded).Sum(result => result.Value!.Tracks);
+            var deleted = results.Count(result => result.Succeeded && result.Value!.SourcesDeleted);
+            var blocked = AlbumCount - runnable.Length;
+
+            if (_cancel.IsCancellationRequested || canceled > 0)
+            {
+                var detail = IsBatch
+                    ? $"Batch canceled after {succeeded} of {runnable.Length} admitted album{S(runnable.Length)} completed. Unfinished and blocked albums retained their originals."
+                    : "Run canceled. The unfinished album transaction retained its original source.";
+                Apply(new(JobPhase.Canceled, (int)Progress, "canceled", detail, DateTimeOffset.UtcNow));
+                Log("CANCELED", detail);
+            }
+            else if (failed > 0)
+            {
+                var detail = IsBatch
+                    ? $"{succeeded} of {runnable.Length} admitted album{S(runnable.Length)} completed; {failed} failed and {blocked} preflight-blocked. Other albums were not interrupted."
+                    : results[0].Error?.Message ?? "The album transaction failed and retained its original source.";
+                Apply(new(JobPhase.Failed, (int)Progress, "failed", detail, DateTimeOffset.UtcNow));
+                Log("ERROR", detail);
+            }
+            else
+            {
+                Apply(new(JobPhase.CleanupCompleted, 100, blocked > 0 ? "partial_success" : "passed", $"{succeeded} album{S(succeeded)} completed in isolated transactions; {blocked} blocked album{S(blocked)} skipped.", DateTimeOffset.UtcNow));
+                StatusTitle = IsBatch ? "Batch completed with quick checks" : "Album completed with quick checks";
+                StatusDetail = $"{tracks} track{S(tracks)} passed quick checks across {succeeded} album{S(succeeded)}; {blocked} blocked album{S(blocked)} skipped; {deleted} source image{S(deleted)} deleted.";
+                Log("DONE", $"{succeeded} albums completed, {blocked} skipped, {tracks} tracks passed.");
+            }
+        }
+        catch (Exception error)
+        {
+            Apply(new(JobPhase.Failed, (int)Progress, "failed", error.Message, DateTimeOffset.UtcNow)); Log("ERROR", error.Message);
+            if (_scans.Count == 1) await EnsureTerminalReportAsync(null, false, ThreadId == "—" ? null : ThreadId);
+            await LoadReportAsync();
+        }
+        finally { _cancel.Dispose(); _cancel = null; Busy = false; }
+    }
+
+    private async Task<AlbumJobOutcome> ProcessAlbumAsync(
+        ScanResult scan,
+        int index,
+        int albumIndex,
+        BatchPipelineScheduler pipeline,
+        IProgress<JobUiUpdate> uiUpdates,
+        CancellationToken token)
+    {
+        if (_preflight is null) throw new InvalidOperationException("Batch preflight is unavailable.");
+        var jobDirectory = IsBatch
+            ? Path.Combine(JobDirectory, $"album-{albumIndex + 1:000}")
+            : JobDirectory;
+        Directory.CreateDirectory(jobDirectory);
+        var last = new ProgressSnapshot(JobPhase.Ready, 0, "pending", "Waiting for a batch worker.", DateTimeOffset.UtcNow);
+        string? threadId = null;
+        void Report(ProgressSnapshot snapshot)
+        {
+            last = snapshot;
+            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: snapshot));
+        }
+        var progress = new CallbackProgress<ProgressSnapshot>(Report);
+
+        try
+        {
+            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "START", Message: $"Isolated transaction: {jobDirectory}"));
+            Report(new(JobPhase.Ready, 0, "queued", "Waiting for an available NAS copy-in lane.", DateTimeOffset.UtcNow));
+            var staged = await pipeline.RunCopyInAsync(
+                ct => _staging.StageAsync(scan, _preflight, SkillPath, jobDirectory, progress, ct), token);
+            staged = staged with { PipelineLimits = pipeline.Limits };
+            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "SPLIT", Message: scan.Mode == WorkflowMode.DsdExtraction
+                ? "Starting sequential SACD extraction and independent DSD verification."
+                : "Starting the deterministic local CUE/FFmpeg splitter."));
+            Report(new(JobPhase.SourceCopyVerified, Math.Max(last.Percent, 17), "queued", "Source copy verified; waiting for a local processing lane.", DateTimeOffset.UtcNow));
+            var localResult = await pipeline.RunProcessingAsync(scan.Mode == WorkflowMode.DsdExtraction, ct =>
+                scan.Mode == WorkflowMode.DsdExtraction
+                    ? _localDsdProcessor.ProcessAsync(scan, staged, progress, ct)
+                    : _localProcessor.ProcessAsync(scan, staged, progress, ct), token);
+            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "SPLIT", Message: $"Local processing completed: {localResult.Tracks} tracks."));
 
             var gaps = localResult.Metadata;
             if (gaps.RequiresResearch)
             {
                 var fields = string.Join(", ", gaps.MissingFields);
-                var codexPath = await PreflightService.FindOptionalCodexAsync(_cancel.Token);
+                var codexPath = await PreflightService.FindOptionalCodexAsync(token);
                 if (codexPath is null || !File.Exists(codexPath))
-                    throw new InvalidOperationException($"The local split completed, but required metadata is missing ({fields}) and the optional Codex metadata agent is unavailable. Local results are preserved at {staged.AlbumRoot}.");
+                    throw new InvalidOperationException($"Required metadata is missing ({fields}) and the optional Codex metadata agent is unavailable. Local results are preserved at {staged.AlbumRoot}.");
                 if (!File.Exists(SkillPath))
-                    throw new InvalidOperationException($"The local split completed, but required metadata is missing ({fields}) and the Album Fixer skill is unavailable. Local results are preserved at {staged.AlbumRoot}.");
+                    throw new InvalidOperationException($"Required metadata is missing ({fields}) and the Album Fixer skill is unavailable. Local results are preserved at {staged.AlbumRoot}.");
 
-                Apply(new(JobPhase.Tagging, Math.Max((int)Progress, 44), "running", $"Only missing metadata is being deferred to Codex: {fields}.", DateTimeOffset.UtcNow));
-                Log("METADATA", $"Starting one optional metadata-only agent for: {fields}.");
-                var stagedSkillPath = await _staging.StageSkillAsync(SkillPath, JobDirectory, _cancel.Token);
-                var metadataOptions = new RunOptions(codexPath, staged.AlbumRoot, JobDirectory, stagedSkillPath, staged.FfmpegPath, staged.FfprobePath, CodexWorkKind.MetadataEnrichment);
-                monitor = MonitorAsync(Path.Combine(JobDirectory, "ui-progress.json"), monitorCancel.Token);
-                var metadataResult = await _runner.RunAsync(metadataOptions, new Progress<RunEvent>(OnRunEvent), _cancel.Token);
-                ThreadId = metadataResult.ThreadId ?? "—";
-                if (metadataResult.LastProgress is not null) Apply(metadataResult.LastProgress);
+                Report(new(JobPhase.Tagging, Math.Max(last.Percent, 44), "running", $"Only missing metadata is being deferred to Codex: {fields}.", DateTimeOffset.UtcNow));
+                uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: $"Starting the optional metadata-only agent for: {fields}."));
+                var stagedSkillPath = await _staging.StageSkillAsync(SkillPath, jobDirectory, token);
+                var options = new RunOptions(codexPath, staged.AlbumRoot, jobDirectory, stagedSkillPath, staged.FfmpegPath, staged.FfprobePath, CodexWorkKind.MetadataEnrichment);
+                using var runner = new CodexRunner();
+                var events = new CallbackProgress<RunEvent>(item =>
+                {
+                    if (item.ThreadId is not null) threadId = item.ThreadId;
+                    if (item.Progress is not null) Report(item.Progress);
+                    if (item.Message.Length > 0)
+                        uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: item.Kind.ToUpperInvariant(), Message: item.Message, ThreadId: item.ThreadId));
+                });
+                var metadataResult = await runner.RunAsync(options, events, token);
+                threadId = metadataResult.ThreadId ?? threadId;
+                if (metadataResult.LastProgress is not null) Report(metadataResult.LastProgress);
                 await EnsureWorkerSucceededAsync(metadataResult, "Metadata agent");
             }
             else
             {
-                ThreadId = "Not required";
-                Log("METADATA", "All required metadata and artwork were found locally. Codex was not started.");
+                uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: "All required metadata and artwork were found locally; Codex was not started."));
             }
-            monitorCancel.Cancel(); await IgnoreCancel(monitor);
-            var committed = await _commit.CommitAsync(_scan, staged, new Progress<ProgressSnapshot>(Apply), _cancel.Token);
-            await LoadReportAsync();
-            if (!ReportStatus.Equals("passed", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("Final quick verification did not produce a passed conversion report. The source was not authorized for deletion.");
-            Progress = 100; StatusTitle = "Album completed with quick checks";
-            StatusDetail = $"{committed.Tracks} track{S(committed.Tracks)} passed quick checks. The original FLAC image was deleted.";
-            Log("DONE", $"Report status: passed; {committed.Tracks} tracks.");
+
+            Report(new(JobPhase.LocalVerificationPassed, Math.Max(last.Percent, 50), "queued", "Local verification passed; waiting for an available NAS write-back lane.", DateTimeOffset.UtcNow));
+            var committed = await pipeline.RunCopyBackAsync(ct =>
+            {
+                var commitStaged = staged with { PipelineTelemetry = pipeline.Telemetry };
+                return _commit.CommitAsync(scan, commitStaged, progress, ct);
+            }, token);
+            return new(jobDirectory, committed.ReportPath, committed.Tracks, committed.SourcesDeleted, threadId);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException error)
         {
-            monitorCancel.Cancel(); await IgnoreCancel(monitor);
-            Apply(new(JobPhase.Canceled, (int)Progress, "canceled", "Run canceled. Inspect preserved staging before resuming; every original was retained.", DateTimeOffset.UtcNow));
-            await EnsureTerminalReportAsync(null, true, ThreadId == "—" ? null : ThreadId); await LoadReportAsync();
+            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: new(JobPhase.Canceled, last.Percent, "canceled", error.Message, DateTimeOffset.UtcNow)));
+            await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, true, threadId, uiUpdates, index, albumIndex);
+            throw;
         }
         catch (Exception error)
         {
-            monitorCancel.Cancel(); await IgnoreCancel(monitor);
-            Apply(new(JobPhase.Failed, (int)Progress, "failed", error.Message, DateTimeOffset.UtcNow)); Log("ERROR", error.Message);
-            await EnsureTerminalReportAsync(null, false, ThreadId == "—" ? null : ThreadId); await LoadReportAsync();
+            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: new(JobPhase.Failed, last.Percent, "failed", error.Message, DateTimeOffset.UtcNow)));
+            await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, false, threadId, uiUpdates, index, albumIndex);
+            throw;
         }
-        finally { _cancel.Dispose(); _cancel = null; Busy = false; }
     }
-    private async Task MonitorAsync(string path, CancellationToken token)
+
+    private void ApplyJobUpdate(JobUiUpdate update)
     {
-        var last = DateTime.MinValue;
-        while (!token.IsCancellationRequested)
+        _lastActivityAt = DateTimeOffset.UtcNow;
+        if (update.ThreadId is not null) ThreadId = update.ThreadId;
+        if (update.Kind is not null && update.Message is not null)
         {
-            try { if (File.Exists(path) && File.GetLastWriteTimeUtc(path) > last) { var text = await File.ReadAllTextAsync(path, token); if (CodexRunner.TryProgress(text, out var progress)) { Apply(progress); last = File.GetLastWriteTimeUtc(path); await LoadReportAsync(); } } }
-            catch (IOException error) { Log("WAIT", error.Message); }
-            var now = DateTimeOffset.UtcNow;
-            if (_runStartedAt != default && now - _lastHeartbeatAt >= TimeSpan.FromSeconds(10))
-            {
-                var elapsed = Clock(now - _runStartedAt);
-                var quiet = Clock(now - _lastActivityAt);
-                StatusDetail = $"{_lastRunDetail} Still working locally — elapsed {elapsed}; latest runner activity {quiet} ago.";
-                if (now - _lastHeartbeatAt >= TimeSpan.FromMinutes(1)) Log("WORKING", $"Local phase {_lastPhase}: elapsed {elapsed}; latest runner activity {quiet} ago.");
-                _lastHeartbeatAt = now;
-            }
-            await Task.Delay(600, token);
+            if (!IsStartupNoise(update.Message)) Log(update.Kind, $"[{update.AlbumName}] {update.Message}");
         }
+        if (update.Progress is null) return;
+        _jobProgress[update.Index] = update.Progress;
+        if (_albumCheckRows.TryGetValue(update.AlbumIndex, out var albumRow))
+        {
+            albumRow.State = AlbumProgressLabel(update.Progress);
+            albumRow.Detail = update.Progress.Detail;
+            albumRow.RawState = update.Progress.Phase switch
+            {
+                JobPhase.Failed => CheckState.Failed,
+                JobPhase.Canceled => CheckState.Warning,
+                JobPhase.CleanupCompleted => CheckState.Passed,
+                _ => CheckState.Warning
+            };
+        }
+        if (!IsBatch)
+        {
+            Apply(update.Progress);
+            return;
+        }
+
+        var snapshots = Enumerable.Range(0, RunnableAlbumCount).Select(index => _jobProgress[index]).ToArray();
+        Progress = snapshots.Average(snapshot => snapshot.Percent);
+        var completed = snapshots.Count(snapshot => snapshot.Phase == JobPhase.CleanupCompleted);
+        var active = snapshots.Count(snapshot => snapshot.Phase is >= JobPhase.Inventoried and < JobPhase.CleanupCompleted);
+        var pipelinePhases = snapshots
+            .Where(snapshot => snapshot.Phase is >= JobPhase.Inventoried and <= JobPhase.CleanupCompleted)
+            .Select(snapshot => snapshot.Phase)
+            .ToArray();
+        var minimumPhase = pipelinePhases.Length > 0 ? pipelinePhases.Min() : JobPhase.Ready;
+        _lastPhase = minimumPhase;
+        _lastRunStatus = "running";
+        _lastRunDetail = $"{update.AlbumName}: {update.Progress.Detail}";
+        _lastProgressAt = _lastActivityAt;
+        StatusTitle = $"{completed}/{RunnableAlbumCount} admitted albums complete · {active} running · {AlbumCount - RunnableAlbumCount} blocked";
+        StatusDetail = _lastRunDetail;
+        var number = (int)minimumPhase;
+        foreach (var item in Timeline)
+        {
+            item.State = item.Number < number
+                ? "Complete"
+                : item.Number == number && number > 0 ? "Active" : "Pending";
+        }
+    }
+
+    private async Task EnsureAlbumTerminalReportAsync(
+        ScanResult scan,
+        string jobDirectory,
+        ProgressSnapshot last,
+        bool canceled,
+        string? threadId,
+        IProgress<JobUiUpdate> uiUpdates,
+        int index,
+        int albumIndex)
+    {
+        if (_preflight is null || !Directory.Exists(jobDirectory)) return;
+        try
+        {
+            await HostReportWriter.EnsureTerminalReportAsync(scan, _preflight, jobDirectory,
+                canceled ? "canceled" : "failed", last.Phase, last.Percent, last.Detail, null, threadId);
+            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "REPORT", Message: "A terminal report was preserved; this album's originals remain in place."));
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
+        {
+            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "REPORT", Message: $"Could not preserve the fallback report: {error.Message}"));
+        }
+    }
+
+    private static string AlbumProgressLabel(ProgressSnapshot snapshot) => snapshot.Phase switch
+    {
+        JobPhase.Ready => $"Queued · {snapshot.Percent}%",
+        JobPhase.Inventoried => $"Inventoried · {snapshot.Percent}%",
+        JobPhase.CopyingIn => $"Copying in · {snapshot.Percent}%",
+        JobPhase.SourceCopyVerified => $"Source verified · {snapshot.Percent}%",
+        JobPhase.Processing => $"Splitting · {snapshot.Percent}%",
+        JobPhase.Tagging => $"Tagging · {snapshot.Percent}%",
+        JobPhase.LocalVerificationPassed => $"Locally verified · {snapshot.Percent}%",
+        JobPhase.CopyingBack => $"Copying back · {snapshot.Percent}%",
+        JobPhase.NetworkHashesVerified => $"Hashes verified · {snapshot.Percent}%",
+        JobPhase.FinalCommit => $"Committing · {snapshot.Percent}%",
+        JobPhase.FinalVerificationPassed => $"Final verified · {snapshot.Percent}%",
+        JobPhase.SourceDisposition => $"Source action · {snapshot.Percent}%",
+        JobPhase.CleanupCompleted => "Complete · 100%",
+        JobPhase.Failed => "Failed",
+        JobPhase.Canceled => "Canceled",
+        _ => $"Working · {snapshot.Percent}%"
+    };
+
+    private async Task WriteBatchReportAsync(
+        IReadOnlyList<BatchItemResult<AlbumPreflightResult, AlbumJobOutcome>> results,
+        bool cancellationRequested,
+        BatchPipelineLimits pipelineLimits,
+        BatchPipelineTelemetry pipelineTelemetry)
+    {
+        var succeeded = results.Count(result => result.Succeeded);
+        var failed = results.Count(result => !result.Succeeded && !result.Canceled);
+        var canceled = results.Count(result => result.Canceled);
+        var blocked = _albumPreflights.Count(album => !album.CanStart);
+        var status = cancellationRequested || canceled > 0
+            ? "canceled"
+            : failed > 0 ? succeeded == 0 ? "failed" : "partial_failure"
+            : blocked > 0 ? "partial_success" : "passed";
+        var deleted = results.Count(result => result.Succeeded && result.Value!.SourcesDeleted);
+        var sourceImages = _scans.Sum(scan => scan.ImageCount);
+        var albumEntries = _albumPreflights.Select(album =>
+        {
+            var result = results.FirstOrDefault(candidate => candidate.Item.Index == album.Index);
+            if (!album.CanStart)
+                return new BatchAlbumReportEntry(album.Index + 1, album.Scan.AlbumName, album.Scan.AlbumRoot, "blocked",
+                    null, null, 0, false, null, album.Detail);
+            if (result is null)
+                return new BatchAlbumReportEntry(album.Index + 1, album.Scan.AlbumName, album.Scan.AlbumRoot, "canceled",
+                    Path.Combine(JobDirectory, $"album-{album.Index + 1:000}"), null, 0, false, null, "The admitted job did not start.");
+            return new BatchAlbumReportEntry(album.Index + 1, album.Scan.AlbumName, album.Scan.AlbumRoot,
+                result.Succeeded ? "passed" : result.Canceled ? "canceled" : "failed",
+                result.Value?.JobDirectory ?? Path.Combine(JobDirectory, $"album-{album.Index + 1:000}"),
+                result.Value?.ReportPath, result.Value?.Tracks ?? 0, result.Value?.SourcesDeleted ?? false,
+                result.Value?.ThreadId, result.Error?.Message);
+        }).OrderBy(album => album.Index).ToArray();
+        var report = new
+        {
+            schema_version = "1.0",
+            workflow_mode = "parallel_album_batch",
+            source_folders = SourceFolders.ToArray(),
+            created_at_utc = DateTimeOffset.UtcNow,
+            status,
+            worker_limit = pipelineLimits.MaxInFlight,
+            pipeline_limits = new
+            {
+                maximum_in_flight = pipelineLimits.MaxInFlight,
+                copy_in_workers = pipelineLimits.CopyInWorkers,
+                processing_workers = pipelineLimits.ProcessingWorkers,
+                sacd_processing_workers = pipelineLimits.DsdProcessingWorkers,
+                copy_back_workers = pipelineLimits.CopyBackWorkers
+            },
+            pipeline_observed = new
+            {
+                copy_in_workers = pipelineTelemetry.MaximumCopyIn,
+                processing_workers = pipelineTelemetry.MaximumProcessing,
+                sacd_processing_workers = pipelineTelemetry.MaximumDsdProcessing,
+                copy_back_workers = pipelineTelemetry.MaximumCopyBack
+            },
+            albums_total = AlbumCount,
+            albums_admitted = results.Count,
+            albums_blocked = blocked,
+            albums_succeeded = succeeded,
+            albums_failed = failed,
+            albums_canceled = canceled,
+            tracks = results.Where(result => result.Succeeded).Sum(result => result.Value!.Tracks),
+            source_images_total = sourceImages,
+            source_images_deleted = deleted,
+            albums = albumEntries
+        };
+        var path = Path.Combine(JobDirectory, "batch-report.json");
+        await File.WriteAllTextAsync(path, JsonSerializer.Serialize(report, new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
+        }), new UTF8Encoding(false));
     }
 
     private async Task LoadReportAsync()
     {
-        var candidates = new[]
+        var batchReport = Directory.Exists(JobDirectory) ? Path.Combine(JobDirectory, "batch-report.json") : "";
+        if (File.Exists(batchReport))
         {
-            Path.Combine(AlbumPath, "conversion-report.json"),
-            Directory.Exists(JobDirectory) ? Path.Combine(JobDirectory, "album", "conversion-report.json") : "",
-            Directory.Exists(JobDirectory) ? Path.Combine(JobDirectory, "conversion-report.json") : ""
-        }.Where(File.Exists).OrderByDescending(File.GetLastWriteTimeUtc).ToArray();
+            try
+            {
+                var json = await File.ReadAllTextAsync(batchReport, Encoding.UTF8);
+                using var document = JsonDocument.Parse(json);
+                var root = document.RootElement;
+                var status = root.GetProperty("status").GetString() ?? "pending";
+                var total = root.GetProperty("albums_total").GetInt32();
+                var succeeded = root.GetProperty("albums_succeeded").GetInt32();
+                var failed = root.GetProperty("albums_failed").GetInt32();
+                var canceled = root.GetProperty("albums_canceled").GetInt32();
+                var blocked = root.TryGetProperty("albums_blocked", out var blockedValue) ? blockedValue.GetInt32() : 0;
+                var tracks = root.GetProperty("tracks").GetInt32();
+                var sourceImages = root.GetProperty("source_images_total").GetInt32();
+                var deleted = root.GetProperty("source_images_deleted").GetInt32();
+                ReportStatus = status;
+                ReportHeadline = $"Batch {status.Replace('_', ' ')} · {succeeded}/{total} albums completed";
+                ReportDetail = $"{tracks} tracks · {failed} failed · {blocked} blocked · {canceled} canceled · worker limit {root.GetProperty("worker_limit").GetInt32()}";
+                ReportJson = JsonSerializer.Serialize(root, new JsonSerializerOptions { WriteIndented = true });
+                ReportTracks = tracks.ToString();
+                ReportSections = total.ToString();
+                ReportDisposition = $"{deleted} deleted · {sourceImages - deleted} retained";
+                Replace(ReportErrors, root.GetProperty("albums").EnumerateArray()
+                    .Where(album => album.GetProperty("error").ValueKind == JsonValueKind.String)
+                    .Select(album => $"{album.GetProperty("album").GetString()}: {album.GetProperty("error").GetString()}"));
+                return;
+            }
+            catch (Exception error) when (error is IOException or JsonException)
+            {
+                ReportHeadline = "Batch report is not readable yet";
+                ReportDetail = error.Message;
+                return;
+            }
+        }
+
+        var candidates = SourceFolders.Select(folder => Path.Combine(folder, "conversion-report.json"))
+            .Append(Directory.Exists(JobDirectory) ? Path.Combine(JobDirectory, "album", "conversion-report.json") : "")
+            .Append(Directory.Exists(JobDirectory) ? Path.Combine(JobDirectory, "conversion-report.json") : "")
+            .Where(File.Exists)
+            .OrderByDescending(File.GetLastWriteTimeUtc)
+            .ToArray();
         if (candidates.Length == 0) return;
         try { var report = await ReportReader.LoadAsync(candidates[0]); ReportHeadline = report.Headline; ReportDetail = report.Detail; ReportJson = report.Json; ReportStatus = report.Status; ReportTracks = report.Tracks.ToString(); ReportSections = report.Sections.ToString(); ReportDisposition = report.Deleted ? "Deleted after quick checks" : "Retained"; Replace(ReportErrors, report.Errors); }
         catch (Exception error) when (error is IOException or System.Text.Json.JsonException) { ReportHeadline = "Report is not readable yet"; ReportDetail = error.Message; }
@@ -312,10 +733,46 @@ public sealed class MainViewModel : NotifyBase, IDisposable
         if (value < TimeSpan.Zero) value = TimeSpan.Zero;
         return value.TotalHours >= 1 ? $"{(int)value.TotalHours}:{value.Minutes:00}:{value.Seconds:00}" : $"{value.Minutes}:{value.Seconds:00}";
     }
-    private void Cancel() { if (!Busy) return; StatusTitle = "Stopping at the next safe boundary…"; StatusDetail = "An incomplete job cannot authorize source deletion."; Log("CANCEL", "Cancellation requested."); _cancel?.Cancel(); _runner.Cancel(); }
-    private void OpenAlbum() { if (Directory.Exists(AlbumPath)) Process.Start(new ProcessStartInfo(AlbumPath) { UseShellExecute = true }); }
+    private void Cancel() { if (!Busy) return; StatusTitle = "Stopping album workers at safe boundaries…"; StatusDetail = "Incomplete album jobs cannot authorize source deletion."; Log("CANCEL", "Cancellation requested for every active album worker."); _cancel?.Cancel(); }
+    private void ClearSourceFolders()
+    {
+        if (Busy || SourceFolders.Count == 0) return;
+        SourceFolders.Clear();
+        Invalidate();
+        StatusTitle = "Source folders cleared";
+        StatusDetail = "Add one or more album or parent folders, then scan recursively.";
+        Log("SOURCE", "Source folder list cleared.");
+    }
+
+    private void OpenSourceFolders()
+    {
+        foreach (var folder in SourceFolders.Where(Directory.Exists))
+            Process.Start(new ProcessStartInfo(folder) { UseShellExecute = true });
+    }
+
     private void CopyReport() { if (ReportJson.Length > 0) Clipboard.SetText(ReportJson); }
-    private void Invalidate() { if (Busy) return; _scan = null; _preflight = null; Checks.Clear(); Media.Clear(); AlbumName = string.IsNullOrWhiteSpace(AlbumPath) ? "No album selected" : Path.GetFileName(AlbumPath.TrimEnd(Path.DirectorySeparatorChar)); Workflow = "Scan to classify this album"; Inventory = SourceSize = "—"; StatusTitle = "Ready to scan"; StatusDetail = "Inventory is read-only."; Raise(nameof(CanStart)); StartCommand.Refresh(); }
+    private void Invalidate() { if (Busy) return; _scan = null; _scans = []; _albumPreflights = []; _preflight = null; _albumCheckRows.Clear(); Checks.Clear(); Media.Clear(); AlbumName = SourceFolderCount switch { 0 => "No source folders selected", 1 => Path.GetFileName(SourceFolders[0].TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)), _ => $"{SourceFolderCount} source folders selected" }; Workflow = "Scan to classify albums recursively"; Inventory = SourceSize = "—"; StatusTitle = "Ready to scan"; StatusDetail = "Inventory is read-only."; Raise(nameof(SourceFolderCount)); Raise(nameof(BrowseInitialDirectory)); Raise(nameof(CanStart)); Raise(nameof(AlbumCount)); Raise(nameof(RunnableAlbumCount)); Raise(nameof(BatchWorkerLimit)); Raise(nameof(PreviousOutputFileCount)); Raise(nameof(IsBatch)); Raise(nameof(IsSingleSacd)); Raise(nameof(HasSacdWorkflows)); Raise(nameof(DeletesSourceAfterSuccess)); Raise(nameof(DeletesAnySourceAfterSuccess)); Raise(nameof(StartActionLabel)); Raise(nameof(SourceActionTitle)); Raise(nameof(SourceActionDetail)); ScanCommand.Refresh(); StartCommand.Refresh(); RefreshReportCommand.Refresh(); OpenSourceFoldersCommand.Refresh(); ClearSourceFoldersCommand.Refresh(); }
+    private static string? NormalizeSourceFolder(string? folder)
+    {
+        if (string.IsNullOrWhiteSpace(folder)) return null;
+        try
+        {
+            var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(folder));
+            return Directory.Exists(normalized) ? normalized : null;
+        }
+        catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException or IOException)
+        {
+            return null;
+        }
+    }
+    private static bool IsSameOrNestedFolder(string path, string parent)
+    {
+        if (path.Equals(parent, StringComparison.OrdinalIgnoreCase)) return true;
+        var parentWithSeparator = parent.EndsWith(Path.DirectorySeparatorChar) || parent.EndsWith(Path.AltDirectorySeparatorChar)
+            ? parent
+            : parent + Path.DirectorySeparatorChar;
+        return path.StartsWith(parentWithSeparator, StringComparison.OrdinalIgnoreCase);
+    }
     private void Log(string kind, string message) { Activity.Insert(0, new(DateTime.Now.ToString("HH:mm:ss"), kind, message.ReplaceLineEndings(" "))); while (Activity.Count > 250) Activity.RemoveAt(Activity.Count - 1); }
     private static void Replace<T>(ObservableCollection<T> target, IEnumerable<T> items) { target.Clear(); foreach (var item in items) target.Add(item); }
     private static string S(int count) => count == 1 ? "" : "s";
@@ -332,5 +789,5 @@ public sealed class MainViewModel : NotifyBase, IDisposable
     }
     private static async Task<string?> FinalMessage(string path) { if (!File.Exists(path)) return null; var text = (await File.ReadAllTextAsync(path, Encoding.UTF8)).Trim(); return text.Length <= 800 ? text : text[..799] + "…"; }
     private static async Task IgnoreCancel(Task task) { try { await task; } catch (OperationCanceledException) { } }
-    public void Dispose() { _cancel?.Cancel(); _cancel?.Dispose(); _runner.Dispose(); GC.SuppressFinalize(this); }
+    public void Dispose() { _cancel?.Cancel(); _cancel?.Dispose(); GC.SuppressFinalize(this); }
 }

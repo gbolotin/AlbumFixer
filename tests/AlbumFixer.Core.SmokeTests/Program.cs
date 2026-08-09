@@ -1,17 +1,29 @@
 using System.Diagnostics;
 using AlbumFixer.Core;
 
+if (args is ["--process-sacd", var sacdAlbum])
+    return await ProcessSacdAlbum(sacdAlbum);
+
 var root = Path.Combine(Path.GetTempPath(), "album-fixer-tests", Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(root);
 try
 {
     await ScannerClassifiesFlacCue(root);
     await ScannerPrefersExistingTracks(root);
-    await ScannerBlocksMultipleAlbums(root);
+    await ScannerPlansMultipleAlbums(root);
+    await ScannerAcceptsMultipleImagesInOneAlbumFolder(root);
+    await ScannerRecognizesAndCleansIncompletePreviousOutput(root);
+    BatchPreflightSkipsBlockedAlbums();
+    await BoundedBatchRunsConcurrentlyAndIsolatesFailures();
+    PipelineLimitsScaleWithHardwareAndCapacity();
+    await StageAwarePipelineBoundsEveryLane();
     await PreflightFindsRunningCodex(root);
     await HostStagesAndVerifiesSource(root);
     await LocalSplitterRunsWithoutCodex(root);
+    await LocalSplitterCreatesCdFoldersForMultipleImages(root);
     await HostCommitsVerifiedFlac(root);
+    await HostReplacesVerifiedRootOutput(root);
+    await HostCommitsMultipleImagesAndRetainsSources(root);
     await HostCommitFailureRetainsSource(root);
     await FailureReportIsAlwaysWritten(root);
     await MetadataHandoffIsConditional(root);
@@ -19,7 +31,7 @@ try
     DiagnosticContractClassifies();
     await ReportSummaryLoads(root);
     CommandContractIsSandboxed(root);
-    Console.WriteLine("AlbumFixer.Core smoke tests passed (14/14).");
+    Console.WriteLine("AlbumFixer.Core smoke tests passed (23/23).");
     return 0;
 }
 catch (Exception error)
@@ -55,7 +67,7 @@ static async Task ScannerPrefersExistingTracks(string root)
     Assert(result.Warnings.Any(value => value.Contains("coexist", StringComparison.OrdinalIgnoreCase)), "Coexisting image warning is missing.");
 }
 
-static async Task ScannerBlocksMultipleAlbums(string root)
+static async Task ScannerPlansMultipleAlbums(string root)
 {
     var folder = Path.Combine(root, "artist");
     var first = Path.Combine(folder, "Album One");
@@ -63,11 +75,177 @@ static async Task ScannerBlocksMultipleAlbums(string root)
     Directory.CreateDirectory(first); Directory.CreateDirectory(second);
     await File.WriteAllBytesAsync(Path.Combine(first, "album.flac"), [1]);
     await File.WriteAllTextAsync(Path.Combine(first, "album.cue"), "FILE \"album.flac\" WAVE");
+    var covers = Path.Combine(first, "Covers"); Directory.CreateDirectory(covers);
+    await File.WriteAllBytesAsync(Path.Combine(covers, "cover.jpg"), [3]);
     await File.WriteAllBytesAsync(Path.Combine(second, "album.flac"), [2]);
     await File.WriteAllTextAsync(Path.Combine(second, "album.cue"), "FILE \"album.flac\" WAVE");
     var result = await new AlbumScanner().ScanAsync(folder);
-    Assert(result.Mode == WorkflowMode.MultipleAlbums, "An artist folder must not be processed as one album.");
-    Assert(result.Errors.Any(value => value.Contains("2 independent albums", StringComparison.OrdinalIgnoreCase)), "Multiple-album guidance is missing.");
+    Assert(result.Mode == WorkflowMode.MultipleAlbums, "An artist folder must be classified as a batch, not one album.");
+    Assert(result.Warnings.Any(value => value.Contains("2 independent albums", StringComparison.OrdinalIgnoreCase)), "Multiple-album batch guidance is missing.");
+    var albums = await new AlbumScanner().ScanAlbumsAsync(folder);
+    Assert(albums.Count == 2, "The batch scanner must create one plan per independent album root.");
+    Assert(albums.All(album => album.Mode == WorkflowMode.FlacCueSplit), "Every discovered FLAC+CUE album must be independently runnable.");
+    Assert(albums.Select(album => album.AlbumRoot).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 2, "Batch album roots must be disjoint.");
+    Assert(albums.All(album => !album.AlbumName.Equals("Covers", StringComparison.OrdinalIgnoreCase)), "Artwork-only folders must not become blocked batch albums.");
+}
+
+static async Task ScannerAcceptsMultipleImagesInOneAlbumFolder(string root)
+{
+    var folder = Path.Combine(root, "multi-image-album"); Directory.CreateDirectory(folder);
+    await File.WriteAllBytesAsync(Path.Combine(folder, "disc1.flac"), [1]);
+    await File.WriteAllTextAsync(Path.Combine(folder, "disc1.cue"), "FILE \"disc1.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00");
+    await File.WriteAllBytesAsync(Path.Combine(folder, "disc2.flac"), [2]);
+    await File.WriteAllTextAsync(Path.Combine(folder, "disc2.cue"), "FILE \"disc2.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00");
+    var result = await new AlbumScanner().ScanAsync(folder);
+    Assert(result.Mode == WorkflowMode.FlacCueSplit, "Multiple FLAC+CUE images in one album folder should use image-split mode.");
+    Assert(result.ImageCount == 2 && result.CueCount == 2, "The multi-image album inventory counts are wrong.");
+}
+
+static async Task ScannerRecognizesAndCleansIncompletePreviousOutput(string root)
+{
+    var folder = Path.Combine(root, "stale-legacy-output");
+    var tracks = Path.Combine(folder, "Tracks", "CD1");
+    Directory.CreateDirectory(tracks);
+    var source = Path.Combine(folder, "album.flac");
+    var previousTrack = Path.Combine(tracks, "01 - Previous.flac");
+    await File.WriteAllBytesAsync(source, [1, 2, 3]);
+    await File.WriteAllTextAsync(Path.Combine(folder, "album.cue"), "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00");
+    await File.WriteAllBytesAsync(previousTrack, [4, 5, 6]);
+    await File.WriteAllTextAsync(Path.Combine(folder, "conversion-report.json"), """
+    {
+      "workflow_mode": "flac_cue_split",
+      "discs": [{ "tracks": [{ "file": "Tracks/CD1/01 - Previous.flac" }] }],
+      "verification": { "status": "failed", "sources_deleted": false }
+    }
+    """);
+
+    var scan = await new AlbumScanner().ScanAsync(folder);
+    Assert(scan.Mode == WorkflowMode.FlacCueSplit, "Report-proven incomplete legacy output must not be classified as a second album or a complete repair set.");
+    Assert(scan.Media.Count(item => item.Kind == "Previous Album Fixer output") == 1, "The stale legacy track was not identified for cleanup.");
+    var cleanup = await PreviousOutputCleanupService.CleanupAsync(folder);
+    Assert(cleanup?.DeletedFiles == 1 && !File.Exists(previousTrack), "The exact report-listed legacy track was not deleted.");
+    Assert(File.Exists(source) && File.Exists(Path.Combine(folder, "album.cue")), "Previous-output cleanup must preserve the source image and CUE.");
+    Assert(!File.Exists(Path.Combine(folder, "conversion-report.json")) && File.Exists(cleanup!.ArchivedReportPath), "The incomplete report must be archived for provenance.");
+    Assert(!Directory.Exists(Path.Combine(folder, "Tracks")), "Empty legacy Tracks directories should be removed without recursive deletion.");
+
+    var completed = Path.Combine(root, "completed-legacy-output");
+    var completedTracks = Path.Combine(completed, "Tracks", "CD1"); Directory.CreateDirectory(completedTracks);
+    await File.WriteAllBytesAsync(Path.Combine(completedTracks, "01 - Verified.flac"), [7, 8, 9]);
+    await File.WriteAllTextAsync(Path.Combine(completed, "conversion-report.json"), """
+    { "workflow_mode": "flac_cue_split", "discs": [{ "tracks": [{ "file": "Tracks/CD1/01 - Verified.flac" }] }], "verification": { "status": "passed" } }
+    """);
+    Assert(PreviousOutputCleanupService.Discover(completed) is null, "A successfully verified prior track set must never be scheduled for deletion.");
+    Assert(PreviousOutputCleanupService.DiscoverVerified(completed) is not null, "A successfully verified prior track set must be recognized for safe replacement.");
+
+    var completedRoot = Path.Combine(root, "completed-root-output"); Directory.CreateDirectory(completedRoot);
+    var completedSource = Path.Combine(completedRoot, "album.flac");
+    var completedTrack = Path.Combine(completedRoot, "01 - Verified.flac");
+    await File.WriteAllBytesAsync(completedSource, [1, 2, 3]);
+    await File.WriteAllBytesAsync(completedTrack, [4, 5, 6]);
+    await File.WriteAllTextAsync(Path.Combine(completedRoot, "album.cue"), "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00");
+    await File.WriteAllTextAsync(Path.Combine(completedRoot, "conversion-report.json"), """
+    { "workflow_mode": "flac_cue_split", "discs": [{ "tracks": [{ "file": "01 - Verified.flac" }] }], "verification": { "status": "passed" }, "commit": { "files": [{ "file": "01 - Verified.flac", "sha256": "DUMMY" }] } }
+    """);
+    var completedRootScan = await new AlbumScanner().ScanAsync(completedRoot);
+    Assert(completedRootScan.Mode == WorkflowMode.FlacCueSplit && completedRootScan.Media.Count(item => item.Kind == "Previous Album Fixer output") == 1,
+        "A report-proven root output must be retried as a FLAC+CUE split instead of repair-only mode.");
+
+    var retainedInner = Path.Combine(root, "retained-inner-output"); Directory.CreateDirectory(Path.Combine(retainedInner, "Tracks", "CD1"));
+    await File.WriteAllBytesAsync(Path.Combine(retainedInner, "album.flac"), [1, 2, 3]);
+    await File.WriteAllTextAsync(Path.Combine(retainedInner, "album.cue"), "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00");
+    await File.WriteAllBytesAsync(Path.Combine(retainedInner, "Tracks", "CD1", "01 - Retained.flac"), [4]);
+    await File.WriteAllBytesAsync(Path.Combine(retainedInner, "Tracks", "CD1", "02 - Retained.flac"), [5]);
+    var retainedInnerScan = await new AlbumScanner().ScanAsync(retainedInner);
+    Assert(retainedInnerScan.Mode == WorkflowMode.FlacCueSplit && retainedInnerScan.Media.Count(item => item.Kind == "Inner-folder FLAC") == 2,
+        "Inner-folder tracks must be retained without blocking a new album-root split.");
+
+    var traversal = Path.Combine(root, "malicious-legacy-report"); Directory.CreateDirectory(Path.Combine(traversal, "Tracks"));
+    var protectedFile = Path.Combine(traversal, "protected.flac"); await File.WriteAllBytesAsync(protectedFile, [10]);
+    await File.WriteAllTextAsync(Path.Combine(traversal, "conversion-report.json"), """
+    { "workflow_mode": "flac_cue_split", "discs": [{ "tracks": [{ "file": "Tracks/../protected.flac" }] }], "verification": { "status": "failed" } }
+    """);
+    Assert(PreviousOutputCleanupService.Discover(traversal) is null && File.Exists(protectedFile), "A report path that escapes the legacy Tracks directory must never become a deletion target.");
+}
+
+static void BatchPreflightSkipsBlockedAlbums()
+{
+    var readyScan = new ScanResult("C:\\Ready", "Ready", WorkflowMode.FlacCueSplit, [], [], [], 1, 1, 0, 1, true, false);
+    var blockedScan = new ScanResult("C:\\Blocked", "Blocked", WorkflowMode.ExistingTrackRepair, [], [], [], 1, 0, 2, 0, true, false);
+    var tools = new Dictionary<string, string?> { ["ffmpeg"] = "ffmpeg.exe", ["ffprobe"] = "ffprobe.exe" };
+    var ready = new PreflightResult([new("Album classification", CheckState.Passed, "FLAC + CUE", true)], "C:\\Temp", 100, 1000, tools);
+    var blocked = new PreflightResult([new("Verified write-back", CheckState.Failed, "Unsupported workflow", true)], "C:\\Temp", 100, 1000, tools);
+    AlbumPreflightResult[] albums = [new(0, readyScan, ready), new(1, blockedScan, blocked)];
+    var combined = PreflightService.CombineBatch(albums);
+
+    Assert(combined.CanStart, "One album-specific blocker must not block a healthy sibling album.");
+    Assert(PreflightService.WorkerLimit(albums) == 1, "Only admitted albums may consume batch workers.");
+    var blockedRow = combined.Checks.Single(check => check.Name.StartsWith("Album 2:", StringComparison.Ordinal));
+    Assert(blockedRow.State == CheckState.Failed && !blockedRow.BlocksRun, "The blocked album must remain visible without becoming a global blocker.");
+}
+
+static async Task BoundedBatchRunsConcurrentlyAndIsolatesFailures()
+{
+    var active = 0;
+    var maximum = 0;
+    var started = 0;
+    var firstPairStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var results = await BoundedBatchProcessor.RunAsync<int, int>([1, 2, 3, 4], async (item, _, token) =>
+    {
+        var nowActive = Interlocked.Increment(ref active);
+        int observed;
+        do
+        {
+            observed = Volatile.Read(ref maximum);
+            if (observed >= nowActive) break;
+        } while (Interlocked.CompareExchange(ref maximum, nowActive, observed) != observed);
+        if (Interlocked.Increment(ref started) == 2) firstPairStarted.TrySetResult();
+        try
+        {
+            await firstPairStarted.Task.WaitAsync(token);
+            await Task.Delay(25, token);
+            if (item == 2) throw new InvalidOperationException("expected isolated failure");
+            return item * 10;
+        }
+        finally
+        {
+            Interlocked.Decrement(ref active);
+        }
+    }, maxParallelism: 2);
+
+    Assert(maximum == 2, "The batch processor must run two independent jobs simultaneously and never exceed its worker limit.");
+    Assert(results.Count(result => result.Succeeded) == 3, "A failed album must not stop the other batch jobs.");
+    Assert(results.Single(result => !result.Succeeded).Item == 2, "The batch processor reported the wrong failed item.");
+    Assert(results.Where(result => result.Succeeded).Select(result => result.Value).SequenceEqual([10, 30, 40]), "Successful batch results must remain ordered by input album.");
+}
+
+static void PipelineLimitsScaleWithHardwareAndCapacity()
+{
+    const long gib = 1024L * 1024 * 1024;
+    var strong = BatchPipelineLimits.Recommend(Enumerable.Repeat(2 * gib, 33).ToArray(), 1000 * gib, 16, 32 * gib);
+    Assert(strong == new BatchPipelineLimits(6, 2, 4, 2, 2), "A strong CPU, NVMe staging volume, and ample memory should use the optimized six-job pipeline.");
+
+    var capacityBound = BatchPipelineLimits.Recommend([10 * gib, 10 * gib, 10 * gib], 25 * gib, 16, 32 * gib);
+    Assert(capacityBound.MaxInFlight == 2, "The 20% staging reserve must reduce in-flight admissions before local storage is overcommitted.");
+
+    var constrained = BatchPipelineLimits.Recommend(Enumerable.Repeat(2 * gib, 8).ToArray(), 100 * gib, 2, 4 * gib);
+    Assert(constrained == new BatchPipelineLimits(2, 1, 1, 1, 1), "Constrained hardware must fall back to one worker per stage and only two in-flight jobs.");
+}
+
+static async Task StageAwarePipelineBoundsEveryLane()
+{
+    using var pipeline = new BatchPipelineScheduler(new(6, 2, 4, 2, 2));
+    static async Task<int> BriefWork(CancellationToken token)
+    {
+        await Task.Delay(40, token);
+        return 1;
+    }
+
+    await Task.WhenAll(Enumerable.Range(0, 12).Select(_ => pipeline.RunCopyInAsync(BriefWork)));
+    await Task.WhenAll(Enumerable.Range(0, 12).Select(_ => pipeline.RunProcessingAsync(false, BriefWork)));
+    await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => pipeline.RunProcessingAsync(true, BriefWork)));
+    await Task.WhenAll(Enumerable.Range(0, 12).Select(_ => pipeline.RunCopyBackAsync(BriefWork)));
+    var observed = pipeline.Telemetry;
+    Assert(observed == new BatchPipelineTelemetry(2, 4, 2, 2), "Each independent pipeline lane must reach, but never exceed, its configured bound.");
 }
 
 static async Task PreflightFindsRunningCodex(string root)
@@ -138,14 +316,14 @@ static async Task LocalSplitterRunsWithoutCodex(string root)
     var result = await new LocalFlacProcessor().ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
 
     Assert(result.Tracks == 2 && !result.Metadata.RequiresResearch, "Complete local CUE metadata and artwork must split without Codex.");
-    Assert(File.Exists(Path.Combine(stagedAlbum, "Tracks", "CD1", "01 - First.flac")) &&
-           File.Exists(Path.Combine(stagedAlbum, "Tracks", "CD1", "02 - Second.flac")), "The local splitter did not create both CUE tracks.");
+    Assert(File.Exists(Path.Combine(stagedAlbum, "01 - First.flac")) &&
+           File.Exists(Path.Combine(stagedAlbum, "02 - Second.flac")), "A single image must create both CUE tracks directly in the album folder.");
     Assert(File.Exists(Path.Combine(stagedAlbum, "cover.jpg")) && File.Exists(result.ReportPath), "The local cover or conversion report is missing.");
     var handoff = await MetadataGapService.LoadAsync(job);
     Assert(!handoff.RequiresResearch && handoff.MissingFields.Count == 0, "Complete local evidence must produce an empty metadata handoff.");
     Assert(!File.Exists(Path.Combine(job, "metadata-agent-events.jsonl")) && !File.Exists(Path.Combine(job, "metadata-agent-final-message.txt")), "The complete local path must not start Codex.");
 
-    var probeJson = await RunToolOutputAsync(ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", Path.Combine(stagedAlbum, "Tracks", "CD1", "01 - First.flac"));
+    var probeJson = await RunToolOutputAsync(ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", Path.Combine(stagedAlbum, "01 - First.flac"));
     using var document = System.Text.Json.JsonDocument.Parse(probeJson);
     var streams = document.RootElement.GetProperty("streams");
     Assert(streams.EnumerateArray().Any(stream => stream.GetProperty("codec_type").GetString() == "audio" && stream.GetProperty("codec_name").GetString() == "flac"), "The local output has no FLAC stream.");
@@ -153,6 +331,54 @@ static async Task LocalSplitterRunsWithoutCodex(string root)
     var tags = document.RootElement.GetProperty("format").GetProperty("tags");
     Assert(tags.EnumerateObject().Any(tag => tag.Name.Equals("TITLE", StringComparison.OrdinalIgnoreCase) && tag.Value.GetString() == "First"), "The local track title tag is missing.");
     Assert(tags.EnumerateObject().Any(tag => (tag.Name.Equals("ALBUMARTIST", StringComparison.OrdinalIgnoreCase) || tag.Name.Equals("ALBUM_ARTIST", StringComparison.OrdinalIgnoreCase)) && tag.Value.GetString() == "Test Artist"), "The local album-artist tag is missing.");
+}
+
+static async Task LocalSplitterCreatesCdFoldersForMultipleImages(string root)
+{
+    var installedSkill = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "skills", "album-fixer", "SKILL.md");
+    var album = Path.Combine(root, "Rock", "Test Artist", "(2026) Multi Image Album");
+    Directory.CreateDirectory(album);
+    var cover = Path.Combine(album, "front.jpg");
+    var provisional = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var preflight = await new PreflightService().CheckAsync(provisional, installedSkill);
+    if (preflight.Tools["ffmpeg"] is not { } ffmpeg || preflight.Tools["ffprobe"] is not { } ffprobe) return;
+
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=green:s=96x96", "-frames:v", "1", "-update", "1", cover);
+    for (var disc = 1; disc <= 2; disc++)
+    {
+        var source = Path.Combine(album, $"disc{disc}.flac");
+        await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", $"sine=frequency={400 + disc * 100}:duration=0.25", "-c:a", "flac", source);
+        await File.WriteAllTextAsync(Path.Combine(album, $"disc{disc}.cue"), $"""
+        REM GENRE Rock
+        REM DATE 2026
+        PERFORMER "Test Artist"
+        TITLE "Multi Image Album"
+        FILE "disc{disc}.flac" WAVE
+          TRACK 01 AUDIO
+            TITLE "Disc {disc} Track"
+            INDEX 01 00:00:00
+        """);
+    }
+
+    var scan = await new AlbumScanner().ScanAsync(album);
+    var job = Path.Combine(root, "multi-local-split-job");
+    var stagedAlbum = Path.Combine(job, "album");
+    Directory.CreateDirectory(stagedAlbum);
+    foreach (var file in Directory.EnumerateFiles(album)) File.Copy(file, Path.Combine(stagedAlbum, Path.GetFileName(file)));
+    var stagedSources = scan.Media.Where(item => item.Kind == "FLAC image")
+        .Select(item => new StagedSource(item.RelativePath, item.Size, string.Empty)).ToArray();
+    var staged = new StagedJob(job, stagedAlbum, string.Empty, ffmpeg, ffprobe, Path.Combine(job, "host-manifest.json"), stagedSources);
+    var result = await new LocalFlacProcessor().ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+
+    Assert(result.Tracks == 2, "Both FLAC images must be split.");
+    Assert(File.Exists(Path.Combine(stagedAlbum, "CD1", "01 - Disc 1 Track.flac")) &&
+           File.Exists(Path.Combine(stagedAlbum, "CD2", "01 - Disc 2 Track.flac")), "Multiple images must create deterministic CD<n> folders.");
+    Assert(!Directory.Exists(Path.Combine(stagedAlbum, "Tracks")), "The obsolete Tracks wrapper folder must not be created.");
+    using var report = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(result.ReportPath));
+    var discs = report.RootElement.GetProperty("discs");
+    Assert(discs.GetArrayLength() == 2 &&
+           discs[0].GetProperty("tracks")[0].GetProperty("file").GetString() == "CD1/01 - Disc 1 Track.flac" &&
+           discs[1].GetProperty("tracks")[0].GetProperty("file").GetString() == "CD2/01 - Disc 2 Track.flac", "The conversion report must preserve the CD<n> output paths.");
 }
 static async Task<string> RunToolOutputAsync(string tool, params string[] arguments)
 {
@@ -189,8 +415,7 @@ static async Task HostCommitsVerifiedFlac(string root)
     File.Copy(installedSkill, Path.Combine(stagedSkill, "SKILL.md"));
     var cover = Path.Combine(stagedAlbum, "cover.jpg");
     await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=64x64", "-frames:v", "1", "-update", "1", cover);
-    var tracks = Path.Combine(stagedAlbum, "Tracks", "CD1"); Directory.CreateDirectory(tracks);
-    var track = Path.Combine(tracks, "01 - Test.flac");
+    var track = Path.Combine(stagedAlbum, "01 - Test.flac");
     await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-i", Path.Combine(stagedAlbum, "source.flac"), "-i", cover,
         "-map", "0:a:0", "-map", "1:v:0", "-c:a", "copy", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic",
         "-metadata", "TITLE=Test", "-metadata", "ALBUM=Test Album", "-metadata", "ARTIST=Tester", "-metadata", "ALBUMARTIST=Tester",
@@ -202,20 +427,144 @@ static async Task HostCommitsVerifiedFlac(string root)
       "workflow_mode": "flac_cue_split",
       "genre": { "value": "Rock", "source_type": "inferred", "confidence": "high", "rationale": "test" },
       "cover": { "file": "cover.jpg", "size": [64, 64], "source": "generated test fixture" },
-      "discs": [{ "disc": 1, "source": "source.flac", "tracks": [{ "disc": 1, "track": 1, "title": "Test", "file": "Tracks/CD1/01 - Test.flac" }] }],
+      "discs": [{ "disc": 1, "source": "source.flac", "tracks": [{ "disc": 1, "track": 1, "title": "Test", "file": "01 - Test.flac" }] }],
       "verification": { "status": "pending", "sources_deleted": false, "errors": [] }
     }
     """;
     await File.WriteAllTextAsync(Path.Combine(stagedAlbum, "conversion-report.json"), report);
     var manifest = Path.Combine(job, "host-manifest.json"); await File.WriteAllTextAsync(manifest, "{}");
     var stagedSource = new StagedSource("source.flac", new FileInfo(source).Length, await HostStagingService.Sha256Async(source));
-    var staged = new StagedJob(job, stagedAlbum, Path.Combine(stagedSkill, "SKILL.md"), ffmpeg, ffprobe, manifest, [stagedSource]);
+    var staged = new StagedJob(job, stagedAlbum, Path.Combine(stagedSkill, "SKILL.md"), ffmpeg, ffprobe, manifest, [stagedSource],
+        PipelineLimits: new(6, 2, 4, 2, 2), PipelineTelemetry: new(2, 4, 1, 2));
     var result = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>());
     Assert(result.Tracks == 1 && result.SourcesDeleted, "The exact source must be deleted after final quick checks.");
-    Assert(File.Exists(Path.Combine(destination, "Tracks", "CD1", "01 - Test.flac")) && File.Exists(Path.Combine(destination, "cover.jpg")), "Verified outputs were not committed to final paths.");
+    Assert(File.Exists(Path.Combine(destination, "01 - Test.flac")) && File.Exists(Path.Combine(destination, "cover.jpg")), "Verified outputs were not committed to the album folder.");
     Assert(!File.Exists(source) && File.Exists(cue) && File.Exists(result.ReportPath), "Only the source FLAC should be deleted; the CUE and final report must remain.");
     var summary = await ReportReader.LoadAsync(result.ReportPath);
     Assert(summary.Status == "passed" && summary.Tracks == 1 && summary.Deleted, "The final report did not record quick-check source deletion.");
+    using var finalReport = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(result.ReportPath));
+    var pipeline = finalReport.RootElement.GetProperty("pipeline");
+    Assert(pipeline.GetProperty("configured").GetProperty("processing_workers").GetInt32() == 4 &&
+           pipeline.GetProperty("observed_at_commit").GetProperty("copy_back_workers").GetInt32() == 2,
+        "The final album report must record configured and observed stage-aware pipeline limits.");
+}
+
+static async Task HostReplacesVerifiedRootOutput(string root)
+{
+    const string installedSkill = @"C:\Users\gbolotin\.codex\skills\album-fixer\SKILL.md";
+    if (!File.Exists(installedSkill)) return;
+    var destination = Path.Combine(root, "replace-verified-root-output"); Directory.CreateDirectory(destination);
+    var source = Path.Combine(destination, "source.flac");
+    var cue = Path.Combine(destination, "source.cue");
+    await File.WriteAllTextAsync(cue, "FILE \"source.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00");
+    var provisional = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var preflight = await new PreflightService().CheckAsync(provisional, installedSkill);
+    if (preflight.Tools["ffmpeg"] is not { } ffmpeg || preflight.Tools["ffprobe"] is not { } ffprobe) return;
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=900:duration=0.25", "-c:a", "flac", source);
+    var cover = Path.Combine(destination, "cover.jpg");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=green:s=64x64", "-frames:v", "1", "-update", "1", cover);
+    var priorTrack = Path.Combine(destination, "01 - Test.flac");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-i", source, "-c:a", "copy", priorTrack);
+    var priorTrackHash = await HostStagingService.Sha256Async(priorTrack);
+    var coverHash = await HostStagingService.Sha256Async(cover);
+    await File.WriteAllTextAsync(Path.Combine(destination, "conversion-report.json"), $$"""
+    {
+      "workflow_mode": "flac_cue_split",
+      "discs": [{ "disc": 1, "source": "source.flac", "tracks": [{ "file": "01 - Test.flac" }] }],
+      "cover": { "file": "cover.jpg" },
+      "verification": { "status": "passed" },
+      "commit": { "files": [
+        { "file": "01 - Test.flac", "sha256": "{{priorTrackHash}}" },
+        { "file": "cover.jpg", "sha256": "{{coverHash}}" }
+      ] }
+    }
+    """);
+    var scan = await new AlbumScanner().ScanAsync(destination);
+    Assert(scan.Mode == WorkflowMode.FlacCueSplit, "A verified root output must permit a new FLAC+CUE split.");
+    var plan = PreviousOutputCleanupService.DiscoverVerified(destination);
+    Assert(plan is not null, "The verified root output was not available for transactional replacement.");
+
+    var job = Path.Combine(Path.GetTempPath(), "album-fixer", $"replace-verified-root-output-{Guid.NewGuid():N}");
+    var stagedAlbum = Path.Combine(job, "album"); Directory.CreateDirectory(stagedAlbum);
+    File.Copy(source, Path.Combine(stagedAlbum, "source.flac"));
+    File.Copy(cue, Path.Combine(stagedAlbum, "source.cue"));
+    File.Copy(cover, Path.Combine(stagedAlbum, "cover.jpg"));
+    var replacementTrack = Path.Combine(stagedAlbum, "01 - Test.flac");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-i", Path.Combine(stagedAlbum, "source.flac"), "-i", Path.Combine(stagedAlbum, "cover.jpg"),
+        "-map", "0:a:0", "-map", "1:v:0", "-c:a", "copy", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic",
+        "-metadata", "TITLE=Replacement", "-metadata", "ALBUM=Replacement Album", "-metadata", "ARTIST=Tester", "-metadata", "ALBUMARTIST=Tester",
+        "-metadata", "TRACKNUMBER=1/1", "-metadata", "DISCNUMBER=1/1", "-metadata", "DATE=2026", "-metadata", "GENRE=Rock", replacementTrack);
+    await File.WriteAllTextAsync(Path.Combine(stagedAlbum, "conversion-report.json"), """
+    {
+      "album": "Replacement Album",
+      "edition": "Synthetic replacement test",
+      "workflow_mode": "flac_cue_split",
+      "genre": { "value": "Rock", "source_type": "inferred", "confidence": "high", "rationale": "test" },
+      "cover": { "file": "cover.jpg", "size": [64, 64], "source": "generated test fixture" },
+      "discs": [{ "disc": 1, "source": "source.flac", "tracks": [{ "disc": 1, "track": 1, "title": "Replacement", "file": "01 - Test.flac" }] }],
+      "verification": { "status": "pending", "sources_deleted": false, "errors": [] }
+    }
+    """);
+    var staged = new StagedJob(job, stagedAlbum, string.Empty, ffmpeg, ffprobe, Path.Combine(job, "host-manifest.json"), [], PreviousVerifiedOutput: plan);
+    var result = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>());
+    Assert(result.Tracks == 1 && File.Exists(priorTrack), "The report-proven root track was not replaced.");
+    var output = await RunToolOutputAsync(ffprobe, "-v", "error", "-show_format", "-of", "json", priorTrack);
+    using var document = System.Text.Json.JsonDocument.Parse(output);
+    var finalTitle = document.RootElement.GetProperty("format").GetProperty("tags").EnumerateObject()
+        .FirstOrDefault(property => property.Name.Equals("TITLE", StringComparison.OrdinalIgnoreCase)).Value.GetString();
+    Assert(finalTitle == "Replacement",
+        "The final root track did not contain the verified replacement output.");
+    using var report = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(result.ReportPath));
+    Assert(report.RootElement.GetProperty("commit").GetProperty("replaced_previous_outputs").GetArrayLength() == 2,
+        "The final report did not record replacement of the prior root track and cover.");
+}
+
+static async Task HostCommitsMultipleImagesAndRetainsSources(string root)
+{
+    const string installedSkill = @"C:\Users\gbolotin\.codex\skills\album-fixer\SKILL.md";
+    if (!File.Exists(installedSkill)) return;
+    var destination = Path.Combine(root, "multi-commit-destination"); Directory.CreateDirectory(destination);
+    var provisionalScan = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var preflight = await new PreflightService().CheckAsync(provisionalScan, installedSkill);
+    if (preflight.Tools["ffmpeg"] is not { } ffmpeg || preflight.Tools["ffprobe"] is not { } ffprobe) return;
+
+    for (var disc = 1; disc <= 2; disc++)
+    {
+        var source = Path.Combine(destination, $"disc{disc}.flac");
+        await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", $"sine=frequency={600 + disc * 100}:duration=0.25", "-c:a", "flac", source);
+        await File.WriteAllTextAsync(Path.Combine(destination, $"disc{disc}.cue"), $"""
+        REM GENRE Rock
+        REM DATE 2026
+        PERFORMER "Test Artist"
+        TITLE "Committed Multi Image Album"
+        FILE "disc{disc}.flac" WAVE
+          TRACK 01 AUDIO
+            TITLE "Committed Disc {disc}"
+            INDEX 01 00:00:00
+        """);
+    }
+    var scan = await new AlbumScanner().ScanAsync(destination);
+    var job = Path.Combine(Path.GetTempPath(), "album-fixer", $"multi-commit-test-{Guid.NewGuid():N}");
+    var stagedAlbum = Path.Combine(job, "album"); Directory.CreateDirectory(stagedAlbum);
+    foreach (var file in Directory.EnumerateFiles(destination)) File.Copy(file, Path.Combine(stagedAlbum, Path.GetFileName(file)));
+    var cover = Path.Combine(stagedAlbum, "cover.jpg");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=yellow:s=64x64", "-frames:v", "1", "-update", "1", cover);
+    var stagedSources = new List<StagedSource>();
+    foreach (var item in scan.Media.Where(item => item.Kind == "FLAC image"))
+        stagedSources.Add(new(item.RelativePath, item.Size, await HostStagingService.Sha256Async(item.Path)));
+    var staged = new StagedJob(job, stagedAlbum, string.Empty, ffmpeg, ffprobe, Path.Combine(job, "host-manifest.json"), stagedSources);
+
+    var local = await new LocalFlacProcessor().ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+    Assert(!local.Metadata.RequiresResearch, "The multi-image commit fixture should not require metadata research.");
+    var result = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>());
+
+    Assert(result.Tracks == 2 && !result.SourcesDeleted, "A multi-image commit must retain every original source.");
+    Assert(File.Exists(Path.Combine(destination, "CD1", "01 - Committed Disc 1.flac")) &&
+           File.Exists(Path.Combine(destination, "CD2", "01 - Committed Disc 2.flac")), "The CD<n> tracks were not committed to final paths.");
+    Assert(File.Exists(Path.Combine(destination, "disc1.flac")) && File.Exists(Path.Combine(destination, "disc2.flac")), "Multi-image originals must be retained without explicit deletion authorization.");
+    using var report = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(result.ReportPath));
+    Assert(report.RootElement.GetProperty("deletion").GetProperty("status").GetString() == "retained" &&
+           !report.RootElement.GetProperty("verification").GetProperty("sources_deleted").GetBoolean(), "The final report must record retained multi-image sources.");
 }
 
 static async Task HostCommitFailureRetainsSource(string root)
@@ -236,8 +585,7 @@ static async Task HostCommitFailureRetainsSource(string root)
     var stagedAlbum = Path.Combine(job, "album"); Directory.CreateDirectory(stagedAlbum);
     File.Copy(source, Path.Combine(stagedAlbum, "source.flac"));
     File.Copy(cue, Path.Combine(stagedAlbum, "source.cue"));
-    var trackDirectory = Path.Combine(stagedAlbum, "Tracks", "CD1"); Directory.CreateDirectory(trackDirectory);
-    var track = Path.Combine(trackDirectory, "01 - Invalid.flac");
+    var track = Path.Combine(stagedAlbum, "01 - Invalid.flac");
     await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-i", Path.Combine(stagedAlbum, "source.flac"), "-c:a", "copy", track);
     var cover = Path.Combine(stagedAlbum, "cover.jpg");
     await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=64x64", "-frames:v", "1", "-update", "1", cover);
@@ -247,7 +595,7 @@ static async Task HostCommitFailureRetainsSource(string root)
       "workflow_mode": "flac_cue_split",
       "genre": { "value": "Rock", "source_type": "inferred", "confidence": "high", "rationale": "test" },
       "cover": { "file": "cover.jpg" },
-      "discs": [{ "disc": 1, "source": "source.flac", "tracks": [{ "disc": 1, "track": 1, "title": "Invalid", "file": "Tracks/CD1/01 - Invalid.flac" }] }],
+      "discs": [{ "disc": 1, "source": "source.flac", "tracks": [{ "disc": 1, "track": 1, "title": "Invalid", "file": "01 - Invalid.flac" }] }],
       "verification": { "status": "pending", "sources_deleted": false, "errors": [] }
     }
     """);
@@ -261,7 +609,7 @@ static async Task HostCommitFailureRetainsSource(string root)
     Assert(failure is InvalidOperationException && failure.Message.Contains("cover", StringComparison.OrdinalIgnoreCase),
         "The invalid track must fail the quick embedded-cover check.");
     Assert(File.Exists(source), "A failed commit must retain the exact source FLAC.");
-    Assert(!Directory.Exists(Path.Combine(destination, "Tracks")), "A failed local check must not commit output tracks.");
+    Assert(!File.Exists(Path.Combine(destination, "01 - Invalid.flac")), "A failed local check must not commit the output track.");
 }
 
 static async Task RunToolAsync(string tool, params string[] arguments)
@@ -342,7 +690,8 @@ static void CommandContractIsSandboxed(string root)
     Assert(CodexRunner.RequiresLocalStaging(protectedRunner), "Protected WindowsApps runners must be staged locally.");
     Assert(!CodexRunner.RequiresLocalStaging(normalRunner), "Normal Codex executables must run in place.");
     var prompt = CodexContract.Prompt(options);
-    Assert(prompt.Contains("deletes the exact inventoried FLAC image", StringComparison.OrdinalIgnoreCase), "The single source-deletion policy is missing.");
+    Assert(prompt.Contains("deletes one exact inventoried FLAC image", StringComparison.OrdinalIgnoreCase) &&
+           prompt.Contains("retains every original", StringComparison.OrdinalIgnoreCase), "The source-disposition policy is missing.");
     Assert(prompt.Contains("do not fully decode", StringComparison.OrdinalIgnoreCase) && prompt.Contains("do not run verify-flac-split.ps1", StringComparison.OrdinalIgnoreCase), "Fast mode must prohibit full PCM/MD5 verification.");
     Assert(prompt.Contains("Do not probe, map, or access any UNC/network path", StringComparison.OrdinalIgnoreCase), "The local-only runner boundary is missing.");
     Assert(prompt.Contains("already", StringComparison.OrdinalIgnoreCase) && prompt.Contains("split every track locally", StringComparison.OrdinalIgnoreCase), "The metadata agent must receive already-split tracks.");
@@ -353,4 +702,34 @@ static void CommandContractIsSandboxed(string root)
 static void Assert(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+static async Task<int> ProcessSacdAlbum(string albumRoot)
+{
+    try
+    {
+        const string skill = @"C:\Users\gbolotin\.codex\skills\album-fixer\SKILL.md";
+        var scan = await new AlbumScanner().ScanAsync(albumRoot);
+        var preflight = await new PreflightService().CheckAsync(scan, skill);
+        foreach (var check in preflight.Checks)
+            Console.WriteLine($"[{check.State}] {check.Name}: {check.Detail}");
+        if (!preflight.CanStart)
+            throw new InvalidOperationException("The SACD album did not pass preflight.");
+
+        var jobDirectory = PreflightService.CreateJobDirectory(preflight.TempRoot);
+        var progress = new Progress<ProgressSnapshot>(snapshot =>
+            Console.WriteLine($"{snapshot.Percent,3}% {snapshot.Phase}: {snapshot.Detail}"));
+        var staged = await new HostStagingService().StageAsync(scan, preflight, skill, jobDirectory, progress);
+        var local = await new LocalDsdProcessor().ProcessAsync(scan, staged, progress);
+        if (local.Metadata.RequiresResearch)
+            throw new InvalidOperationException($"SACD metadata is incomplete: {string.Join(", ", local.Metadata.MissingFields)}");
+        var committed = await new HostCommitService().CommitAsync(scan, staged, progress);
+        Console.WriteLine($"SACD completed: {committed.Tracks} tracks; source deleted: {committed.SourcesDeleted}; report: {committed.ReportPath}");
+        return 0;
+    }
+    catch (Exception error)
+    {
+        Console.Error.WriteLine(error);
+        return 1;
+    }
 }

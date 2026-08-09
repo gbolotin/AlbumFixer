@@ -40,6 +40,22 @@ public sealed record PreflightResult(
 {
     public bool CanStart => Checks.All(item => !item.BlocksRun || item.State == CheckState.Passed);
 }
+public sealed record AlbumPreflightResult(int Index, ScanResult Scan, PreflightResult Preflight)
+{
+    public bool CanStart => Preflight.CanStart;
+    public IReadOnlyList<PreflightCheck> Blockers => Preflight.Checks
+        .Where(check => check.BlocksRun && check.State != CheckState.Passed)
+        .ToArray();
+    public string Detail
+    {
+        get
+        {
+            if (!CanStart) return string.Join("; ", Blockers.Select(check => $"{check.Name}: {check.Detail}"));
+            var cleanup = Preflight.Checks.FirstOrDefault(check => check.Name == "Previous run cleanup");
+            return cleanup is null ? Scan.WorkflowLabel : $"{Scan.WorkflowLabel}; {cleanup.Detail}";
+        }
+    }
+}
 
 public sealed record ProgressSnapshot(JobPhase Phase, int Percent, string Status, string Detail, DateTimeOffset UpdatedAt);
 public sealed record RunOptions(
@@ -71,6 +87,20 @@ public sealed partial class AlbumScanner
     public Task<ScanResult> ScanAsync(string folder, CancellationToken token = default) =>
         Task.Run(() => Scan(folder, token), token);
 
+    public Task<IReadOnlyList<ScanResult>> ScanAlbumsAsync(string folder, CancellationToken token = default) =>
+        Task.Run<IReadOnlyList<ScanResult>>(() => ScanAlbums(folder, token), token);
+
+    public IReadOnlyList<ScanResult> ScanAlbums(string folder, CancellationToken token = default)
+    {
+        var scan = Scan(folder, token);
+        if (scan.Mode != WorkflowMode.MultipleAlbums) return [scan];
+
+        var roots = AlbumRoots(scan.AlbumRoot, scan.Media.Where(IsAlbumRootInput));
+        if (roots.Count < 2)
+            throw new InvalidOperationException("The batch inventory did not resolve at least two disjoint album roots.");
+        return roots.Select(root => Scan(root, token)).ToArray();
+    }
+
     public ScanResult Scan(string folder, CancellationToken token = default)
     {
         if (string.IsNullOrWhiteSpace(folder)) throw new ArgumentException("Choose an album folder first.");
@@ -83,6 +113,22 @@ public sealed partial class AlbumScanner
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         { throw new IOException($"Could not inventory this album: {error.Message}", error); }
 
+        var previousPlans = files
+            .Where(path => Path.GetFileName(path).Equals("conversion-report.json", StringComparison.OrdinalIgnoreCase))
+            .Select(path => PreviousOutputCleanupService.Discover(Path.GetDirectoryName(path)!))
+            .Where(plan => plan is not null)
+            .Cast<PreviousOutputPlan>()
+            .ToArray();
+        var verifiedPreviousPlans = files
+            .Where(path => Path.GetFileName(path).Equals("conversion-report.json", StringComparison.OrdinalIgnoreCase))
+            .Select(path => PreviousOutputCleanupService.DiscoverVerified(Path.GetDirectoryName(path)!))
+            .Where(plan => plan is not null)
+            .Cast<VerifiedOutputPlan>()
+            .ToArray();
+        var previousOutputs = previousPlans.SelectMany(plan => plan.Files)
+            .Concat(verifiedPreviousPlans.SelectMany(plan => plan.Files))
+            .Select(file => file.FullPath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var cues = files.Where(path => Path.GetExtension(path).Equals(".cue", StringComparison.OrdinalIgnoreCase)).ToArray();
         var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var cue in cues)
@@ -111,6 +157,8 @@ public sealed partial class AlbumScanner
             {
                 ".cue" => ("CUE sheet", "Track boundaries and edition evidence"),
                 ".iso" => ("SACD / DSD image", "Signature must be probed before extraction"),
+                ".flac" when previousOutputs.Contains(path) => ("Previous Album Fixer output", "Report-proven output; root files are replaced only after new tracks verify"),
+                ".flac" when PreviousOutputCleanupService.IsInnerTracksFile(root, path) => ("Inner-folder FLAC", "Retained legacy inner-folder track; new tracks are written at the album root"),
                 ".flac" when referenced => ("FLAC image", "Referenced by CUE"),
                 ".flac" => ("Existing FLAC", "Individual track candidate"),
                 ".dsf" when referenced => ("DSF image", "Large DSD source referenced by CUE"),
@@ -131,18 +179,17 @@ public sealed partial class AlbumScanner
 
         foreach (var missing in references.Where(path => !File.Exists(path)))
             errors.Add($"CUE references a missing source: {Path.GetRelativePath(root, missing)}");
+        if (previousOutputs.Count > 0)
+            warnings.Add($"Found {previousOutputs.Count} report-proven output file{(previousOutputs.Count == 1 ? "" : "s")} from an earlier Album Fixer run. Root-level outputs are replaced only after new tracks verify; inner-folder tracks are retained.");
 
         var images = media.Where(item => item.Kind.Contains("image", StringComparison.OrdinalIgnoreCase) || item.Kind is "DST stream" or "Raw DSD").ToArray();
         var tracks = media.Where(item => item.Kind.StartsWith("Existing", StringComparison.OrdinalIgnoreCase)).ToArray();
-        var albumRoots = images.Concat(tracks)
-            .Select(item => AlbumScope(root, item.Path))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        var albumRoots = AlbumRoots(root, media.Where(IsAlbumRootInput));
         WorkflowMode mode;
-        if (albumRoots.Length > 1)
+        if (albumRoots.Count > 1)
         {
             mode = WorkflowMode.MultipleAlbums;
-            errors.Add($"This folder contains {albumRoots.Length} independent albums. Choose one album folder; batch mode is not available yet.");
+            warnings.Add($"This folder contains {albumRoots.Count} independent albums. Batch mode will use a hardware-aware bounded copy/process/write-back pipeline.");
         }
         else if (tracks.Length >= 2)
         {
@@ -162,13 +209,36 @@ public sealed partial class AlbumScanner
             media.Any(item => item.Kind.Contains("DS", StringComparison.OrdinalIgnoreCase) || item.Kind.Contains("SACD", StringComparison.OrdinalIgnoreCase)));
     }
 
+    private static IReadOnlyList<string> AlbumRoots(string root, IEnumerable<MediaItem> media) =>
+        media.Select(item => AlbumScope(root, item.Path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(path => Path.GetRelativePath(root, path), StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+    private static bool IsAlbumRootInput(MediaItem item) =>
+        item.Kind.Contains("image", StringComparison.OrdinalIgnoreCase) ||
+        item.Kind.StartsWith("Existing", StringComparison.OrdinalIgnoreCase) ||
+        item.Kind is "DST stream" or "Raw DSD";
+
     private static string AlbumScope(string root, string mediaPath)
     {
-        var relative = Path.GetRelativePath(root, mediaPath);
-        var separators = new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar };
-        var segments = relative.Split(separators, StringSplitOptions.RemoveEmptyEntries);
-        if (segments.Length < 2 || DiscOrAreaFolder().IsMatch(segments[0])) return root;
-        return Path.Combine(root, segments[0]);
+        var fullRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+        var directory = Path.GetDirectoryName(Path.GetFullPath(mediaPath))
+            ?? throw new InvalidOperationException($"Media file has no parent folder: {mediaPath}");
+        if (directory.Equals(fullRoot, StringComparison.OrdinalIgnoreCase)) return fullRoot;
+        if (DiscOrAreaFolder().IsMatch(Path.GetFileName(directory)))
+            directory = Directory.GetParent(directory)?.FullName ?? directory;
+        if (Path.GetFileName(directory).Equals("Tracks", StringComparison.OrdinalIgnoreCase))
+            directory = Directory.GetParent(directory)?.FullName ?? directory;
+        return IsWithin(fullRoot, directory) ? directory : fullRoot;
+    }
+
+    private static bool IsWithin(string root, string path)
+    {
+        var relative = Path.GetRelativePath(Path.GetFullPath(root), Path.GetFullPath(path));
+        return !Path.IsPathRooted(relative) &&
+               !relative.Equals("..", StringComparison.Ordinal) &&
+               !relative.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal);
     }
 
     [GeneratedRegex("^(?:(?:cd|disc|disk)\\s*[-_. ]*\\d+|stereo|multichannel)$", RegexOptions.IgnoreCase)]
@@ -180,6 +250,88 @@ public sealed partial class AlbumScanner
 
 public sealed class PreflightService
 {
+    public async Task<PreflightResult> CheckBatchAsync(
+        IReadOnlyList<ScanResult> scans,
+        string skillPath,
+        CancellationToken token = default)
+    {
+        var albums = await CheckAlbumsAsync(scans, skillPath, token);
+        return CombineBatch(albums);
+    }
+
+    public async Task<IReadOnlyList<AlbumPreflightResult>> CheckAlbumsAsync(
+        IReadOnlyList<ScanResult> scans,
+        string skillPath,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(scans);
+        if (scans.Count == 0) throw new ArgumentException("A batch must contain at least one album.", nameof(scans));
+        var albums = new List<AlbumPreflightResult>(scans.Count);
+        for (var index = 0; index < scans.Count; index++)
+        {
+            token.ThrowIfCancellationRequested();
+            albums.Add(new(index, scans[index], await CheckAsync(scans[index], skillPath, token)));
+        }
+        return albums;
+    }
+
+    public static PreflightResult CombineBatch(IReadOnlyList<AlbumPreflightResult> albums)
+    {
+        ArgumentNullException.ThrowIfNull(albums);
+        if (albums.Count == 0) throw new ArgumentException("A batch must contain at least one album.", nameof(albums));
+        var first = albums[0].Preflight;
+        var runnable = albums.Where(album => album.CanStart).ToArray();
+        var available = albums.Min(album => album.Preflight.AvailableBytes);
+        var pipeline = PipelineLimits(albums);
+        var required = runnable.Select(album => album.Preflight.RequiredBytes)
+            .OrderByDescending(bytes => bytes)
+            .Take(pipeline.MaxInFlight)
+            .Aggregate(0L, SaturatingAdd);
+        var checks = first.Checks
+            .Where(check => check.Name is not "Local staging capacity" and not "Album classification" and not "Inventory" and
+                            not "Verified write-back" and not "Previous run cleanup")
+            .Select(check => check with { BlocksRun = false })
+            .ToList();
+        checks.Add(new("Pipeline scheduler", runnable.Length > 0 ? CheckState.Passed : CheckState.Failed,
+            runnable.Length == 0
+                ? $"0 of {albums.Count} albums admitted."
+                : $"{runnable.Length} of {albums.Count} album{(albums.Count == 1 ? "" : "s")} admitted; {pipeline.Description}."));
+        checks.Add(available >= required
+            ? new("Concurrent staging capacity", CheckState.Passed,
+                $"{SizeText.Format(available)} available; {SizeText.Format(required)} estimated for admitted simultaneous jobs.")
+            : new("Concurrent staging capacity", CheckState.Failed,
+                $"{SizeText.Format(required)} estimated for simultaneous jobs; only {SizeText.Format(available)} available.", true));
+
+        foreach (var album in albums)
+        {
+            checks.Add(album.CanStart
+                ? new($"Album {album.Index + 1}: {album.Scan.AlbumName}", CheckState.Passed, album.Detail)
+                : new($"Album {album.Index + 1}: {album.Scan.AlbumName}", CheckState.Failed, album.Detail));
+        }
+        checks.Add(runnable.Length > 0
+            ? new("Runnable albums", CheckState.Passed, $"{runnable.Length} album{(runnable.Length == 1 ? "" : "s")} can start; blocked siblings will be skipped.", true)
+            : new("Runnable albums", CheckState.Failed, "No album passed all blocking preflight checks.", true));
+
+        return new(checks, first.TempRoot, required, available, first.Tools);
+    }
+
+    public static int WorkerLimit(IReadOnlyList<AlbumPreflightResult> albums)
+        => PipelineLimits(albums).MaxInFlight;
+
+    public static BatchPipelineLimits PipelineLimits(IReadOnlyList<AlbumPreflightResult> albums)
+    {
+        var runnable = albums.Where(album => album.CanStart).ToArray();
+        if (runnable.Length == 0) return BatchPipelineLimits.None;
+        var available = runnable.Min(album => album.Preflight.AvailableBytes);
+        var memory = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+        if (memory <= 0) memory = 8L * 1024 * 1024 * 1024;
+        return BatchPipelineLimits.Recommend(
+            runnable.Select(album => album.Preflight.RequiredBytes).ToArray(),
+            available,
+            Environment.ProcessorCount,
+            memory);
+    }
+
     public async Task<PreflightResult> CheckAsync(ScanResult scan, string skillPath, CancellationToken token = default)
     {
         var names = new[] { "ffmpeg", "ffprobe", "sacd_extract" };
@@ -200,8 +352,18 @@ public sealed class PreflightService
             Require(checks, "ffprobe", tools["ffprobe"], "stream, tag, and artwork verification");
         }
         else if (scan.HasDsd) Require(checks, "ffprobe", tools["ffprobe"], "DSD container verification");
-        if (scan.Media.Any(item => item.Kind == "SACD / DSD image"))
-            checks.Add(tools["sacd_extract"] is { } sacd ? new("sacd_extract", CheckState.Passed, sacd) : new("sacd_extract", CheckState.Warning, "Not found. SACD images will stop safely; Sony DSD Disc images may still be copied after probing."));
+        var sacdImages = scan.Media.Where(item => item.Kind == "SACD / DSD image").ToArray();
+        if (sacdImages.Length > 0)
+            Require(checks, "sacd_extract", tools["sacd_extract"], "SACD ISO layout inspection and DSF extraction");
+        var previousOutput = PreviousOutputCleanupService.Discover(scan.AlbumRoot);
+        if (previousOutput is not null)
+            checks.Add(new("Previous run cleanup", CheckState.Warning,
+                $"{previousOutput.Files.Count} report-proven legacy track{(previousOutput.Files.Count == 1 ? "" : "s")} will be deleted before staging; the old report will be archived."));
+        var verifiedPreviousOutput = PreviousOutputCleanupService.DiscoverVerified(scan.AlbumRoot);
+        var directVerifiedFiles = PreviousOutputCleanupService.DirectFiles(verifiedPreviousOutput);
+        if (directVerifiedFiles.Count > 0)
+            checks.Add(new("Previous run replacement", CheckState.Warning,
+                $"{directVerifiedFiles.Count} report-proven root output file{(directVerifiedFiles.Count == 1 ? "" : "s")} will be replaced only after the new tracks pass verification."));
 
         var tempRoot = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "album-fixer"));
         long available = 0;
@@ -221,8 +383,15 @@ public sealed class PreflightService
             WorkflowMode.NeedsInspection => new("Album classification", CheckState.Warning, "Codex must resolve the source type before processing; uncertainty retains the original."),
             _ => new("Album classification", CheckState.Passed, scan.WorkflowLabel)
         });
-        if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.MultipleAlbums and not WorkflowMode.Unsupported)
-            checks.Add(new("Verified write-back", CheckState.Failed, "Host-managed final placement is currently enabled for FLAC + CUE image splits. Other modes stop before changing files.", true));
+        if (scan.Mode == WorkflowMode.DsdExtraction)
+        {
+            var otherDsdSources = scan.Media.Count(item => item.Kind is "DSF image" or "DFF image" or "DST stream" or "Raw DSD");
+            checks.Add(sacdImages.Length == 1 && otherDsdSources == 0
+                ? new("Verified write-back", CheckState.Passed, "Host-managed SACD ISO extraction, DSD verification, and transactional final placement are enabled.")
+                : new("Verified write-back", CheckState.Failed, "This release supports one SACD ISO per album. Other DSD source types remain read-only.", true));
+        }
+        else if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.MultipleAlbums and not WorkflowMode.Unsupported)
+            checks.Add(new("Verified write-back", CheckState.Failed, "Host-managed final placement is enabled for FLAC + CUE and single SACD ISO workflows. Other modes stop before changing files.", true));
         checks.AddRange(scan.Errors.Select(error => new PreflightCheck("Inventory", CheckState.Failed, error, true)));
         return new(checks, tempRoot, required, available, tools);
     }
@@ -239,6 +408,9 @@ public sealed class PreflightService
 
     private static void Require(ICollection<PreflightCheck> checks, string name, string? path, string reason) =>
         checks.Add(path is not null ? new(name, CheckState.Passed, path) : new(name, CheckState.Failed, $"Required for {reason}.", true));
+
+    private static long SaturatingAdd(long left, long right) =>
+        left > long.MaxValue - right ? long.MaxValue : left + right;
 
     public static Task<string?> FindOptionalCodexAsync(CancellationToken token = default) => FindToolAsync("codex", token);
 
@@ -270,6 +442,21 @@ public sealed class PreflightService
                     .SelectMany(directory => Directory.EnumerateFiles(directory, exe, SearchOption.AllDirectories))
                     .FirstOrDefault();
                 if (packaged is not null) return Path.GetFullPath(packaged);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or DirectoryNotFoundException) { }
+        }
+
+        if (name.Equals("sacd_extract", StringComparison.OrdinalIgnoreCase))
+        {
+            var albumFixerTools = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AlbumFixer", "Tools", "sacd_extract");
+            try
+            {
+                var installed = Directory.EnumerateFiles(albumFixerTools, exe, SearchOption.AllDirectories)
+                    .OrderByDescending(path => path, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault();
+                if (installed is not null) return Path.GetFullPath(installed);
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or DirectoryNotFoundException) { }
         }
@@ -379,7 +566,7 @@ public static class CodexContract
 
     public static string Prompt(RunOptions options)
     {
-        const string deletion = "Source policy: after successful final quick checks, the desktop host deletes the exact inventoried FLAC image as explicitly requested, without decoded PCM equivalence.";
+        const string deletion = "Source policy: after successful final quick checks, the desktop host deletes one exact inventoried FLAC image when confirmed; when several FLAC images are present, it retains every original because multi-image deletion is not authorized.";
         return $"""
 Use the staged $album-fixer skill faithfully for this local album transaction.
 Local staged album root: {options.AlbumRoot}
@@ -389,7 +576,7 @@ Staged ffmpeg: {options.FfmpegPath}
 Staged ffprobe: {options.FfprobePath}
 {deletion}
 
-The deterministic desktop processor already copied and SHA-256-verified the source, parsed the CUE, and split every track locally in one FFmpeg process. The user explicitly requested fast verification and deletion without decoded-audio comparison. Do not run verify-flac-split.ps1, do not fully decode the source or output tracks for PCM byte-count or MD5 comparison, and do not claim signal equivalence. Do not delete the source yourself; the desktop host owns exact-path deletion after final quick checks.
+The deterministic desktop processor already copied and SHA-256-verified every source, parsed every CUE, and split every track locally. The user explicitly requested fast verification without decoded-audio comparison. Do not run verify-flac-split.ps1, do not fully decode the sources or output tracks for PCM byte-count or MD5 comparison, and do not claim signal equivalence. Do not delete sources yourself; the desktop host owns source disposition after final quick checks.
 
 Read {Path.Combine(options.JobDirectory, "metadata-gaps.json")}. This process was started only because missing_fields names one or more required metadata gaps. Research only those explicitly listed fields. Do not research, replace, or second-guess any nonempty value supplied by the local CUE, rip log, existing tags, folder name, booklet, scans, or library folder. Prefer local evidence; use web research only for a listed gap, and match the exact edition conservatively.
 

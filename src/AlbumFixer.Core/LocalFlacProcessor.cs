@@ -35,41 +35,80 @@ public sealed class LocalFlacProcessor
             throw new NotSupportedException("The deterministic local processor currently supports FLAC + CUE image splits only.");
 
         progress.Report(Snapshot(JobPhase.Processing, 19, "Reading the staged CUE locally. No Codex process is needed for splitting."));
-        var cuePaths = Directory.EnumerateFiles(staged.AlbumRoot, "*.cue", SearchOption.AllDirectories).ToArray();
-        if (cuePaths.Length != 1)
-            throw new InvalidOperationException($"The local splitter requires exactly one CUE sheet; found {cuePaths.Length}.");
+        var cuePaths = Directory.EnumerateFiles(staged.AlbumRoot, "*.cue", SearchOption.AllDirectories)
+            .OrderBy(path => CueSortKey(staged.AlbumRoot, path), StringComparer.OrdinalIgnoreCase)
+            .ThenBy(path => HostStagingService.SafeRelative(staged.AlbumRoot, path), StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (cuePaths.Length == 0)
+            throw new InvalidOperationException("The local splitter requires at least one CUE sheet.");
 
-        var cue = await ParseCueAsync(cuePaths[0], token);
-        var source = ResolveSource(staged.AlbumRoot, cuePaths[0], cue.SourceFiles);
-        var probe = await ProbeAudioAsync(staged.FfprobePath, source, token);
-        ValidateBoundaries(cue.Tracks, probe.SampleRate, probe.TotalSamples);
-
-        var metadata = ResolveMetadata(scan, cue);
         var cover = await PrepareCoverAsync(staged, token);
-        var missing = FindMissing(metadata, cue.Tracks, cover is not null);
-        var outputRoot = HostStagingService.SafeCombine(staged.AlbumRoot, Path.Combine("Tracks", "CD1"));
-        if (Directory.Exists(outputRoot) && Directory.EnumerateFileSystemEntries(outputRoot).Any())
-            throw new IOException("The local output folder is not empty. Album Fixer will not merge or overwrite an earlier result.");
-        Directory.CreateDirectory(outputRoot);
+        var inputs = new List<LocalInput>();
+        var sources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var index = 0; index < cuePaths.Length; index++)
+        {
+            token.ThrowIfCancellationRequested();
+            var cue = await ParseCueAsync(cuePaths[index], token);
+            var source = ResolveSource(staged.AlbumRoot, cuePaths[index], cue.SourceFiles);
+            if (!sources.Add(source))
+                throw new InvalidDataException($"More than one CUE sheet references the same FLAC image: {HostStagingService.SafeRelative(staged.AlbumRoot, source)}.");
+            var probe = await ProbeAudioAsync(staged.FfprobePath, source, token);
+            ValidateBoundaries(cue.Tracks, probe.SampleRate, probe.TotalSamples);
+            inputs.Add(new(cue, source, probe, ResolveMetadata(scan, cue)));
+        }
 
-        var outputs = BuildOutputs(cue.Tracks, outputRoot);
-        progress.Report(Snapshot(JobPhase.Processing, 21, $"Splitting {outputs.Count} tracks locally in one FFmpeg process."));
-        await SplitOnceAsync(staged.FfmpegPath, source, cover?.Path, probe.SampleRate, cue.Tracks, outputs, metadata, progress, token);
+        var sourceDirectories = inputs
+            .Select(input => Path.GetDirectoryName(input.Source)!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var useCdFolders = inputs.Count > 1 && sourceDirectories.Length == 1;
+        var discs = new List<LocalDisc>();
+        for (var index = 0; index < inputs.Count; index++)
+        {
+            token.ThrowIfCancellationRequested();
+            var input = inputs[index];
+            var discNumber = index + 1;
+            var sourceDirectory = Path.GetDirectoryName(input.Source)!;
+            var outputRoot = useCdFolders ? Path.Combine(sourceDirectory, $"CD{discNumber}") : sourceDirectory;
+            HostStagingService.SafeRelative(staged.AlbumRoot, outputRoot);
+            var outputs = BuildOutputs(input.Cue.Tracks, outputRoot);
+            EnsureOutputsAvailable(outputs, staged.AlbumRoot);
+            Directory.CreateDirectory(outputRoot);
+
+            progress.Report(Snapshot(JobPhase.Processing, 21,
+                inputs.Count == 1
+                    ? $"Splitting {outputs.Count} tracks into the album folder in one FFmpeg process."
+                    : useCdFolders
+                        ? $"Splitting CD{discNumber} of {inputs.Count} ({outputs.Count} tracks) in one FFmpeg process."
+                        : $"Splitting disc {discNumber} of {inputs.Count} beside its source ({outputs.Count} tracks)."));
+            await SplitOnceAsync(staged.FfmpegPath, input.Source, cover?.Path, input.Probe.SampleRate, input.Cue.Tracks, outputs,
+                input.Metadata, discNumber, inputs.Count, progress, token);
+            discs.Add(new(discNumber, input.Cue, input.Source, outputs, input.Metadata));
+        }
+
+        IReadOnlyList<string> missing = discs
+            .SelectMany(disc => FindMissing(disc.Metadata, disc.Cue.Tracks, cover is not null))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
         progress.Report(Snapshot(JobPhase.Tagging, 36, cover is null
             ? "Local tags were written. Required artwork is missing and was deferred."
             : "Local tags and front-cover artwork were written during the split."));
 
         var reportPath = Path.Combine(staged.AlbumRoot, "conversion-report.json");
-        await WriteReportAsync(scan, staged, cue, source, outputs, metadata, cover, missing, reportPath, token);
-        var evidence = LocalEvidence(scan, cuePaths[0], cover);
+        await WriteReportAsync(scan, staged, discs, cover, missing, reportPath, token);
+        var evidence = LocalEvidence(scan, cuePaths, cover);
         await WriteGapManifestAsync(staged.JobDirectory, missing, evidence, token);
         var gapResult = new MetadataGapResult(true, missing.Count > 0, missing, evidence);
 
         progress.Report(Snapshot(JobPhase.Tagging, missing.Count > 0 ? 40 : 44, missing.Count > 0
             ? $"Local split complete. Only these required fields need metadata fallback: {string.Join(", ", missing)}."
             : "Local split, tags, and artwork are complete. Metadata research was skipped."));
-        return new(outputs.Count, reportPath, gapResult);
+        return new(discs.Sum(disc => disc.Outputs.Count), reportPath, gapResult);
     }
+
+    private static string CueSortKey(string albumRoot, string path) =>
+        Regex.Replace(HostStagingService.SafeRelative(albumRoot, path), "\\d+",
+            match => match.Value.PadLeft(20, '0'));
 
     private static async Task<CueSheet> ParseCueAsync(string path, CancellationToken token)
     {
@@ -269,6 +308,15 @@ public sealed class LocalFlacProcessor
         }).ToArray();
     }
 
+    private static void EnsureOutputsAvailable(IEnumerable<TrackOutput> outputs, string albumRoot)
+    {
+        foreach (var output in outputs)
+        {
+            if (File.Exists(output.Path) || Directory.Exists(output.Path))
+                throw new IOException($"The final track path already exists and will not be overwritten: {HostStagingService.SafeRelative(albumRoot, output.Path)}");
+        }
+    }
+
     private static async Task SplitOnceAsync(
         string ffmpeg,
         string source,
@@ -277,6 +325,8 @@ public sealed class LocalFlacProcessor
         IReadOnlyList<CueTrack> tracks,
         IReadOnlyList<TrackOutput> outputs,
         ResolvedMetadata metadata,
+        int discNumber,
+        int discTotal,
         IProgress<ProgressSnapshot> progress,
         CancellationToken token)
     {
@@ -327,8 +377,8 @@ public sealed class LocalFlacProcessor
             AddMetadata(arguments, "ALBUMARTIST", metadata.AlbumArtist);
             AddMetadata(arguments, "TRACKNUMBER", $"{track.Number}/{tracks.Count}");
             AddMetadata(arguments, "TRACKTOTAL", tracks.Count.ToString(CultureInfo.InvariantCulture));
-            AddMetadata(arguments, "DISCNUMBER", "1/1");
-            AddMetadata(arguments, "DISCTOTAL", "1");
+            AddMetadata(arguments, "DISCNUMBER", $"{discNumber}/{discTotal}");
+            AddMetadata(arguments, "DISCTOTAL", discTotal.ToString(CultureInfo.InvariantCulture));
             AddMetadata(arguments, "DATE", metadata.Date);
             AddMetadata(arguments, "GENRE", metadata.Genre);
             AddMetadata(arguments, "COMPOSER", Nonempty(track.Composer) ?? metadata.Composer);
@@ -341,7 +391,9 @@ public sealed class LocalFlacProcessor
             if (!line.Equals("progress=continue", StringComparison.OrdinalIgnoreCase)) return;
             pulse++;
             var percent = Math.Min(34, 21 + pulse);
-            progress.Report(Snapshot(JobPhase.Processing, percent, $"FFmpeg is splitting {tracks.Count} tracks locally in one pass."));
+            progress.Report(Snapshot(JobPhase.Processing, percent, discTotal == 1
+                ? $"FFmpeg is splitting {tracks.Count} tracks locally in one pass."
+                : $"FFmpeg is splitting CD{discNumber} of {discTotal} locally in one pass."));
         }, token);
         foreach (var output in outputs)
             if (!File.Exists(output.Path) || new FileInfo(output.Path).Length == 0) throw new IOException($"FFmpeg did not create '{Path.GetFileName(output.Path)}'.");
@@ -370,13 +422,13 @@ public sealed class LocalFlacProcessor
         return missing.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
-    private static IReadOnlyList<string> LocalEvidence(ScanResult scan, string cuePath, LocalCover? cover)
+    private static IReadOnlyList<string> LocalEvidence(ScanResult scan, IReadOnlyList<string> cuePaths, LocalCover? cover)
     {
         var evidence = new List<string>
         {
-            $"CUE: {Path.GetFileName(cuePath)}",
             $"album folder: {scan.AlbumName}"
         };
+        evidence.InsertRange(0, cuePaths.Select(path => $"CUE: {Path.GetFileName(path)}"));
         if (cover is not null) evidence.Add(cover.Source);
         if (scan.Media.Any(item => item.Kind == "Provenance")) evidence.Add("local rip log, booklet, playlist, or sidecar");
         return evidence;
@@ -397,27 +449,36 @@ public sealed class LocalFlacProcessor
     private static async Task WriteReportAsync(
         ScanResult scan,
         StagedJob staged,
-        CueSheet cue,
-        string source,
-        IReadOnlyList<TrackOutput> outputs,
-        ResolvedMetadata metadata,
+        IReadOnlyList<LocalDisc> discs,
         LocalCover? cover,
         IReadOnlyList<string> missing,
         string reportPath,
         CancellationToken token)
     {
-        var tracks = new JsonArray();
-        for (var index = 0; index < outputs.Count; index++)
+        var discReports = new JsonArray();
+        foreach (var disc in discs)
         {
-            var cueTrack = outputs[index].Track;
-            tracks.Add(new JsonObject
+            var tracks = new JsonArray();
+            for (var index = 0; index < disc.Outputs.Count; index++)
             {
-                ["disc"] = 1,
-                ["track"] = cueTrack.Number,
-                ["title"] = cueTrack.Title ?? string.Empty,
-                ["file"] = JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, outputs[index].Path))
+                var cueTrack = disc.Outputs[index].Track;
+                tracks.Add(new JsonObject
+                {
+                    ["disc"] = disc.Number,
+                    ["track"] = cueTrack.Number,
+                    ["title"] = cueTrack.Title ?? string.Empty,
+                    ["file"] = JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, disc.Outputs[index].Path))
+                });
+            }
+            discReports.Add(new JsonObject
+            {
+                ["disc"] = disc.Number,
+                ["source"] = JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, disc.Source)),
+                ["tracks"] = tracks
             });
         }
+
+        var metadata = discs[0].Metadata;
 
         var report = new JsonObject
         {
@@ -430,12 +491,7 @@ public sealed class LocalFlacProcessor
             ["generated_by"] = "Album Fixer deterministic local processor",
             ["generated_at_utc"] = DateTimeOffset.UtcNow,
             ["metadata_sources"] = new JsonArray("local CUE, album folder, rip sidecars, and local artwork"),
-            ["discs"] = new JsonArray(new JsonObject
-            {
-                ["disc"] = 1,
-                ["source"] = JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, source)),
-                ["tracks"] = tracks
-            }),
+            ["discs"] = discReports,
             ["verification"] = new JsonObject
             {
                 ["status"] = missing.Count > 0 ? "awaiting_metadata" : "pending",
@@ -449,7 +505,7 @@ public sealed class LocalFlacProcessor
                 ["identifier"] = Path.GetFileName(staged.JobDirectory),
                 ["local_staging_used"] = true,
                 ["staging_path"] = staged.JobDirectory,
-                ["processor"] = "local_ffmpeg_single_process"
+                ["processor"] = discs.Count == 1 ? "local_ffmpeg_single_process" : "local_ffmpeg_sequential_disc_processes"
             }
         };
         if (metadata.Genre is not null)
@@ -559,4 +615,11 @@ public sealed class LocalFlacProcessor
     private sealed record ResolvedMetadata(string? Album, string? AlbumArtist, string? Date, string? Genre, string? Composer, bool GenreInferred);
     private sealed record LocalCover(string Path, string Source);
     private sealed record TrackOutput(CueTrack Track, string Path);
+    private sealed record LocalInput(CueSheet Cue, string Source, AudioProbe Probe, ResolvedMetadata Metadata);
+    private sealed record LocalDisc(
+        int Number,
+        CueSheet Cue,
+        string Source,
+        IReadOnlyList<TrackOutput> Outputs,
+        ResolvedMetadata Metadata);
 }

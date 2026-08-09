@@ -14,7 +14,12 @@ public sealed record StagedJob(
     string FfmpegPath,
     string FfprobePath,
     string ManifestPath,
-    IReadOnlyList<StagedSource> Sources);
+    IReadOnlyList<StagedSource> Sources,
+    PreviousOutputCleanupResult? PreviousOutputCleanup = null,
+    VerifiedOutputPlan? PreviousVerifiedOutput = null,
+    string SacdExtractPath = "",
+    BatchPipelineLimits? PipelineLimits = null,
+    BatchPipelineTelemetry? PipelineTelemetry = null);
 public sealed record HostCommitResult(string ReportPath, int Tracks, bool SourcesDeleted);
 
 public sealed class HostStagingService
@@ -37,6 +42,20 @@ public sealed class HostStagingService
         Directory.CreateDirectory(toolsRoot);
 
         progress.Report(Snapshot(JobPhase.Inventoried, 1, "Album inventory is complete. The original is unchanged."));
+        var previousOutputCleanup = await PreviousOutputCleanupService.CleanupAsync(scan.AlbumRoot, token);
+        if (previousOutputCleanup is not null)
+            progress.Report(Snapshot(JobPhase.Inventoried, 1,
+                $"Removed {previousOutputCleanup.DeletedFiles} report-proven track{(previousOutputCleanup.DeletedFiles == 1 ? "" : "s")} from an incomplete earlier run and archived its report."));
+        var previousVerifiedOutput = PreviousOutputCleanupService.DiscoverVerified(scan.AlbumRoot);
+        await PreviousOutputCleanupService.VerifyDirectFilesAsync(previousVerifiedOutput, token);
+        var directPreviousFiles = PreviousOutputCleanupService.DirectFiles(previousVerifiedOutput);
+        var directPreviousAudio = PreviousOutputCleanupService.DirectFiles(previousVerifiedOutput)
+            .Where(file => Path.GetExtension(file.RelativePath).Equals(".flac", StringComparison.OrdinalIgnoreCase))
+            .Select(file => file.FullPath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (directPreviousAudio.Count > 0)
+            progress.Report(Snapshot(JobPhase.Inventoried, 1,
+                $"Verified {directPreviousAudio.Count} prior root track{(directPreviousAudio.Count == 1 ? "" : "s")} for replacement after the new output passes."));
 
         var sourceFiles = scan.Media
             .Where(IsSource)
@@ -54,9 +73,11 @@ public sealed class HostStagingService
 
         var albumFiles = EnumerateTree(scan.AlbumRoot)
             .Where(path => !Path.GetRelativePath(scan.AlbumRoot, path).Equals("conversion-report.json", StringComparison.OrdinalIgnoreCase))
+            .Where(path => !directPreviousAudio.Contains(path))
             .ToArray();
         var totalBytes = Math.Max(1L, albumFiles.Sum(path => new FileInfo(path).Length));
         long copiedBytes = 0;
+        var lastCopyPercent = -1;
         progress.Report(Snapshot(JobPhase.CopyingIn, 2, "Copying the album to the local Windows Temp workspace."));
         foreach (var source in albumFiles)
         {
@@ -68,7 +89,11 @@ public sealed class HostStagingService
             {
                 copiedBytes += bytes;
                 var percent = 2 + (int)Math.Min(13, copiedBytes * 13 / totalBytes);
-                progress.Report(Snapshot(JobPhase.CopyingIn, percent, $"Copying locally: {relative}"));
+                if (percent != lastCopyPercent)
+                {
+                    lastCopyPercent = percent;
+                    progress.Report(Snapshot(JobPhase.CopyingIn, percent, $"Copying locally: {relative}"));
+                }
             }, token);
         }
 
@@ -87,12 +112,21 @@ public sealed class HostStagingService
         }
         progress.Report(Snapshot(JobPhase.SourceCopyVerified, 17, "The local source copy matches the original size and SHA-256."));
 
-        var ffmpeg = RequireTool(preflight, "ffmpeg");
         var ffprobe = RequireTool(preflight, "ffprobe");
-        var stagedFfmpeg = Path.Combine(toolsRoot, "ffmpeg.exe");
+        var ffmpeg = scan.HasFlac ? RequireTool(preflight, "ffmpeg") : string.Empty;
+        var sacdExtract = scan.Mode == WorkflowMode.DsdExtraction ? RequireTool(preflight, "sacd_extract") : string.Empty;
+        var stagedFfmpeg = ffmpeg.Length == 0 ? string.Empty : Path.Combine(toolsRoot, "ffmpeg.exe");
         var stagedFfprobe = Path.Combine(toolsRoot, "ffprobe.exe");
-        await CopyFileAsync(ffmpeg, stagedFfmpeg, null, token);
+        var stagedSacdExtract = sacdExtract.Length == 0 ? string.Empty : Path.Combine(toolsRoot, "sacd_extract.exe");
+        if (ffmpeg.Length > 0) await CopyFileAsync(ffmpeg, stagedFfmpeg, null, token);
         await CopyFileAsync(ffprobe, stagedFfprobe, null, token);
+        if (sacdExtract.Length > 0)
+        {
+            await CopyFileAsync(sacdExtract, stagedSacdExtract, null, token);
+            await File.WriteAllTextAsync(Path.Combine(toolsRoot, "sacd_extract.cfg"),
+                "artist=0\nperformer=0\npauses=0\nnopad=0\nconcatenate=0\nlogging=0\nid3tag=0\n",
+                new UTF8Encoding(false), token);
+        }
 
         var manifestPath = Path.Combine(jobDirectory, "host-manifest.json");
         var manifest = new
@@ -102,6 +136,18 @@ public sealed class HostStagingService
             original_album_root = scan.AlbumRoot,
             staged_album_root = albumRoot,
             created_at_utc = DateTimeOffset.UtcNow,
+            previous_output_cleanup = previousOutputCleanup is null ? null : new
+            {
+                deleted_files = previousOutputCleanup.DeletedRelativePaths,
+                archived_report = previousOutputCleanup.ArchivedReportPath,
+                status = "completed"
+            },
+            previous_output_replacement = previousVerifiedOutput is null ? null : new
+            {
+                retained_inner_files = previousVerifiedOutput.Files.Count - directPreviousFiles.Count,
+                replaceable_root_files = directPreviousAudio.Select(path => SafeRelative(scan.AlbumRoot, path)).OrderBy(path => path).ToArray(),
+                status = "pending_final_verification"
+            },
             sources = stagedSources.Select(source => new
             {
                 path = source.RelativePath,
@@ -113,7 +159,8 @@ public sealed class HostStagingService
         };
         await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false), token);
 
-        return new(jobDirectory, albumRoot, string.Empty, stagedFfmpeg, stagedFfprobe, manifestPath, stagedSources);
+        return new(jobDirectory, albumRoot, string.Empty, stagedFfmpeg, stagedFfprobe, manifestPath, stagedSources,
+            previousOutputCleanup, previousVerifiedOutput, stagedSacdExtract);
     }
 
     public async Task<string> StageSkillAsync(string skillPath, string jobDirectory, CancellationToken token = default)
@@ -224,34 +271,50 @@ public sealed class HostCommitService
         IProgress<ProgressSnapshot> progress,
         CancellationToken token = default)
     {
-        if (scan.Mode != WorkflowMode.FlacCueSplit)
-            throw new NotSupportedException("Verified host write-back is currently available for FLAC + CUE image splits only. Every original was retained.");
+        if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.DsdExtraction)
+            throw new NotSupportedException("Verified host write-back is available for FLAC + CUE and SACD ISO workflows only. Every original was retained.");
+        var isDsd = scan.Mode == WorkflowMode.DsdExtraction;
 
         var localReportPath = Path.Combine(staged.AlbumRoot, "conversion-report.json");
         if (!File.Exists(localReportPath)) throw new FileNotFoundException("The local processor did not create the required conversion report.", localReportPath);
 
         var report = JsonNode.Parse(await File.ReadAllTextAsync(localReportPath, token)) as JsonObject
             ?? throw new JsonException("The local conversion report is not a JSON object.");
-        var outputs = NormalizeAndCollectOutputs(report, staged.AlbumRoot);
+        var outputs = isDsd
+            ? NormalizeAndCollectDsdOutputs(report, staged.AlbumRoot)
+            : NormalizeAndCollectOutputs(report, staged.AlbumRoot);
         if (outputs.Count == 0) throw new InvalidOperationException("The conversion report contains no playback tracks to commit.");
-        await VerifyTrackHeadersAsync(outputs, staged.AlbumRoot, staged, token);
-        SetQuickVerification(report, "local staging");
+        await PreviousOutputCleanupService.VerifyDirectFilesAsync(staged.PreviousVerifiedOutput, token);
+        var replacementFiles = PreviousOutputCleanupService.DirectFiles(staged.PreviousVerifiedOutput);
+        var replacementPaths = replacementFiles
+            .Select(file => file.RelativePath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var outputPaths = outputs.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var unmatchedReplacements = replacementPaths.Where(path => !outputPaths.Contains(path)).ToArray();
+        if (unmatchedReplacements.Length > 0)
+            throw new IOException($"The new split no longer produces every report-proven root output: {string.Join(", ", unmatchedReplacements)}. The prior tracks were retained.");
+        await VerifyPlaybackFilesAsync(outputs, staged.AlbumRoot, staged, report, isDsd, token);
+        if (isDsd) ConfirmDsdVerification(report, "local staging", sourceDeletionRequested: true);
+        else SetQuickVerification(report, "local staging", staged.Sources.Count == 1);
         await AtomicWriteAsync(localReportPath, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
-        progress.Report(Snapshot(JobPhase.LocalVerificationPassed, 50, "Quick local FLAC, tag, and artwork checks passed. Full PCM comparison was skipped."));
+        progress.Report(Snapshot(JobPhase.LocalVerificationPassed, 50, isDsd
+            ? "Independent SACD extraction, DSF/DSD, tag, artwork, and payload checks passed locally."
+            : "Quick local FLAC, tag, and artwork checks passed. Full PCM comparison was skipped."));
         var jobId = Path.GetFileName(staged.JobDirectory.TrimEnd(Path.DirectorySeparatorChar));
         var networkStage = HostStagingService.SafeCombine(scan.AlbumRoot, $".album-fixer-stage-{jobId}");
         if (Directory.Exists(networkStage) || File.Exists(networkStage)) throw new IOException($"A destination staging path already exists: {networkStage}");
         Directory.CreateDirectory(networkStage);
 
         var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        progress.Report(Snapshot(JobPhase.CopyingBack, 58, "Copying verified tracks to a private destination-side staging folder."));
+        progress.Report(Snapshot(JobPhase.CopyingBack, 58, "Copying verified tracks and provenance to a private destination-side staging folder."));
         foreach (var relative in outputs)
         {
             token.ThrowIfCancellationRequested();
             var local = HostStagingService.SafeCombine(staged.AlbumRoot, relative);
             if (!File.Exists(local)) throw new FileNotFoundException($"A report-listed output is missing: {relative}", local);
             var final = HostStagingService.SafeCombine(scan.AlbumRoot, relative);
-            if (File.Exists(final) || Directory.Exists(final)) throw new IOException($"The final path already exists and will not be overwritten: {relative}");
+            if ((File.Exists(final) || Directory.Exists(final)) && !replacementPaths.Contains(relative))
+                throw new IOException($"The final path already exists and is not a report-proven prior output: {relative}");
             var network = HostStagingService.SafeCombine(networkStage, relative);
             Directory.CreateDirectory(Path.GetDirectoryName(network)!);
             File.Copy(local, network, overwrite: false);
@@ -267,12 +330,25 @@ public sealed class HostCommitService
         var previousReport = Path.Combine(networkStage, ".previous-conversion-report.json");
         if (File.Exists(existingReport)) File.Copy(existingReport, previousReport, overwrite: false);
 
-        progress.Report(Snapshot(JobPhase.FinalCommit, 76, "Committing verified files to previously unoccupied final paths."));
+        progress.Report(Snapshot(JobPhase.FinalCommit, 76, replacementPaths.Count == 0
+            ? "Committing verified files to previously unoccupied final paths."
+            : "Replacing report-proven prior root outputs through the rollback staging area."));
         var moved = new List<string>();
+        var rolledBack = new List<string>();
+        var rollbackRoot = HostStagingService.SafeCombine(networkStage, ".previous-output-rollback");
         JsonObject commit;
         JsonObject job;
         try
         {
+            foreach (var replacement in replacementFiles)
+            {
+                var final = HostStagingService.SafeCombine(scan.AlbumRoot, replacement.RelativePath);
+                if (!File.Exists(final)) continue;
+                var rollback = HostStagingService.SafeCombine(rollbackRoot, replacement.RelativePath);
+                Directory.CreateDirectory(Path.GetDirectoryName(rollback)!);
+                File.Move(final, rollback, overwrite: false);
+                rolledBack.Add(replacement.RelativePath);
+            }
             foreach (var relative in outputs)
             {
                 var network = HostStagingService.SafeCombine(networkStage, relative);
@@ -294,6 +370,8 @@ public sealed class HostCommitService
                 ["file"] = pair.Key,
                 ["sha256"] = pair.Value
             }).ToArray());
+            if (rolledBack.Count > 0)
+                commit["replaced_previous_outputs"] = new JsonArray(rolledBack.Select(path => JsonValue.Create(path)).ToArray());
             job = report["job"] as JsonObject ?? new JsonObject();
             report["job"] = job;
             job["identifier"] = jobId;
@@ -302,6 +380,29 @@ public sealed class HostCommitService
             job["host_copy_in_manifest"] = staged.ManifestPath;
             job["copy_in_status"] = "verified";
             job["copy_back_status"] = "verified";
+            if (staged.PipelineLimits is { } limits)
+            {
+                var telemetry = staged.PipelineTelemetry ?? new BatchPipelineTelemetry(0, 0, 0, 0);
+                report["pipeline"] = new JsonObject
+                {
+                    ["scheduler"] = "bounded_stage_aware",
+                    ["configured"] = new JsonObject
+                    {
+                        ["maximum_in_flight"] = limits.MaxInFlight,
+                        ["copy_in_workers"] = limits.CopyInWorkers,
+                        ["processing_workers"] = limits.ProcessingWorkers,
+                        ["sacd_processing_workers"] = limits.DsdProcessingWorkers,
+                        ["copy_back_workers"] = limits.CopyBackWorkers
+                    },
+                    ["observed_at_commit"] = new JsonObject
+                    {
+                        ["copy_in_workers"] = telemetry.MaximumCopyIn,
+                        ["processing_workers"] = telemetry.MaximumProcessing,
+                        ["sacd_processing_workers"] = telemetry.MaximumDsdProcessing,
+                        ["copy_back_workers"] = telemetry.MaximumCopyBack
+                    }
+                };
+            }
             await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
         }
         catch
@@ -316,6 +417,16 @@ public sealed class HostCommitService
                 }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
             }
+            foreach (var relative in rolledBack.AsEnumerable().Reverse())
+            {
+                try
+                {
+                    var final = HostStagingService.SafeCombine(scan.AlbumRoot, relative);
+                    var rollback = HostStagingService.SafeCombine(rollbackRoot, relative);
+                    if (!File.Exists(final) && File.Exists(rollback)) File.Move(rollback, final, overwrite: false);
+                }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+            }
             try
             {
                 if (File.Exists(previousReport)) File.Copy(previousReport, existingReport, overwrite: true);
@@ -326,53 +437,82 @@ public sealed class HostCommitService
         }
 
         token.ThrowIfCancellationRequested();
-        await VerifyTrackHeadersAsync(outputs, scan.AlbumRoot, staged, token);
-        SetQuickVerification(report, "final album path");
+        await VerifyPlaybackFilesAsync(outputs, scan.AlbumRoot, staged, report, isDsd, token);
+        var rollbackCleaned = rolledBack.Count == 0 || TryDeleteDirectory(rollbackRoot);
+        if (rolledBack.Count > 0)
+        {
+            commit["previous_output_rollback_cleaned"] = rollbackCleaned;
+            await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
+        }
+        var deletesSource = staged.Sources.Count == 1 && (!isDsd || DsdDeletionEligible(report));
+        if (isDsd) ConfirmDsdVerification(report, "final album path", deletesSource);
+        else SetQuickVerification(report, "final album path", deletesSource);
         token.ThrowIfCancellationRequested();
-        var deletionTargets = ResolveDeletionTargets(scan, staged);
+        var deletionTargets = deletesSource ? ResolveDeletionTargets(scan, staged, isDsd) : [];
         var deletion = new JsonObject
         {
-            ["status"] = "pending",
-            ["policy"] = "user_requested_without_pcm_equivalence",
-            ["authorized_after"] = "quick_final_path_checks",
-            ["files"] = new JsonArray(deletionTargets.Select(target => JsonValue.Create(target.RelativePath)).ToArray()),
+            ["status"] = deletesSource ? "pending" : "retained",
+            ["policy"] = deletesSource
+                ? isDsd ? "verified_sacd_independent_extraction_and_dsd_payload_equivalence" : "user_requested_without_pcm_equivalence"
+                : "source_retained_without_complete_deletion_authorization",
+            ["authorized_after"] = deletesSource ? isDsd ? "full_dsd_final_path_verification" : "quick_final_path_checks" : null,
+            ["files"] = new JsonArray(staged.Sources.Select(source => JsonValue.Create(source.RelativePath)).ToArray()),
             ["performed"] = false
         };
+        if (!deletesSource) deletion["reason"] = isDsd
+            ? "The SACD report did not prove every independent-extraction and DSD payload gate."
+            : "Automatic deletion confirmation covers one exact FLAC image only.";
         report["deletion"] = deletion;
         await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
-        progress.Report(Snapshot(JobPhase.FinalVerificationPassed, 90, "Quick final FLAC, tag, artwork, and copy-hash checks passed."));
+        progress.Report(Snapshot(JobPhase.FinalVerificationPassed, 90, isDsd
+            ? "Final DSF/DSD, tag, artwork, payload, report-path, and copy-hash checks passed."
+            : "Quick final FLAC, tag, artwork, and copy-hash checks passed."));
 
-        progress.Report(Snapshot(JobPhase.SourceDisposition, 94, "Deleting the exact inventoried FLAC image as requested; PCM/MD5 comparison was skipped."));
-        try
+        var deleted = false;
+        if (deletesSource)
         {
-            foreach (var target in deletionTargets) File.Delete(target.FullPath);
-            if (deletionTargets.Any(target => File.Exists(target.FullPath)))
-                throw new IOException("An inventoried source image still exists after deletion.");
+            progress.Report(Snapshot(JobPhase.SourceDisposition, 94, isDsd
+                ? "Deleting the exact inventoried SACD ISO after independent extraction and final DSD verification."
+                : "Deleting the exact inventoried FLAC image as requested; PCM/MD5 comparison was skipped."));
+            try
+            {
+                foreach (var target in deletionTargets) File.Delete(target.FullPath);
+                if (deletionTargets.Any(target => File.Exists(target.FullPath)))
+                    throw new IOException("The inventoried source image still exists after deletion.");
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                deletion["status"] = "failed";
+                deletion["performed"] = false;
+                deletion["error"] = error.Message;
+                var verification = report["verification"] as JsonObject ?? new JsonObject();
+                report["verification"] = verification;
+                verification["status"] = "failed";
+                verification["sources_deleted"] = false;
+                verification["errors"] = new JsonArray(JsonValue.Create($"Tracks passed quick checks, but source deletion failed: {error.Message}"));
+                try { await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None); }
+                catch (Exception reportError) when (reportError is IOException or UnauthorizedAccessException) { }
+                throw new IOException($"Tracks were committed, but the original {(isDsd ? "SACD ISO" : "FLAC image")} could not be deleted. Review the report and source path.", error);
+            }
+
+            deleted = true;
+            deletion["status"] = "completed";
+            deletion["performed"] = true;
+            deletion["completed_at_utc"] = DateTimeOffset.UtcNow;
+            var finalVerification = report["verification"] as JsonObject ?? new JsonObject();
+            report["verification"] = finalVerification;
+            finalVerification["sources_deleted"] = true;
+            progress.Report(Snapshot(JobPhase.SourceDisposition, 96, isDsd
+                ? "The exact inventoried SACD ISO was deleted after every DSD verification gate passed."
+                : "The exact inventoried FLAC image was deleted after quick final checks."));
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        else
         {
-            deletion["status"] = "failed";
-            deletion["performed"] = false;
-            deletion["error"] = error.Message;
-            var verification = report["verification"] as JsonObject ?? new JsonObject();
-            report["verification"] = verification;
-            verification["status"] = "failed";
-            verification["sources_deleted"] = false;
-            verification["errors"] = new JsonArray(JsonValue.Create($"Tracks passed quick checks, but source deletion failed: {error.Message}"));
-            try { await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None); }
-            catch (Exception reportError) when (reportError is IOException or UnauthorizedAccessException) { }
-            throw new IOException("Tracks were committed, but the original FLAC image could not be deleted. Review the report and source path.", error);
+            progress.Report(Snapshot(JobPhase.SourceDisposition, 96,
+                $"All {staged.Sources.Count} original source image{(staged.Sources.Count == 1 ? " was" : "s were")} retained; deletion was not authorized."));
         }
 
-        const bool deleted = true;
-        deletion["status"] = "completed";
-        deletion["performed"] = true;
-        deletion["completed_at_utc"] = DateTimeOffset.UtcNow;
-        var finalVerification = report["verification"] as JsonObject ?? new JsonObject();
-        report["verification"] = finalVerification;
-        finalVerification["sources_deleted"] = true;
         await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None);
-        progress.Report(Snapshot(JobPhase.SourceDisposition, 96, "The exact inventoried FLAC image was deleted after quick final checks."));
 
         var networkCleaned = TryDeleteDirectory(networkStage);
         HostStagingService.ValidateJobDirectory(staged.JobDirectory, Path.Combine(Path.GetTempPath(), "album-fixer"));
@@ -395,11 +535,14 @@ public sealed class HostCommitService
         {
             // Final report enrichment is best effort after the quick final checks pass.
         }
+        var disposition = deleted
+            ? $"the original {(isDsd ? "SACD ISO" : "FLAC image")} was deleted"
+            : $"all {staged.Sources.Count} original source image{(staged.Sources.Count == 1 ? " was" : "s were")} retained";
         var cleanupDetail = localCleaned && networkCleaned
-            ? "Conversion completed; final files and report passed quick checks, and the original FLAC image was deleted."
-            : "Conversion completed and the original FLAC image was deleted; a staging folder may require cleanup.";
+            ? $"Conversion completed; final files and report passed quick checks, and {disposition}."
+            : $"Conversion completed and {disposition}; a staging folder may require cleanup.";
         progress.Report(new(JobPhase.CleanupCompleted, 100, "passed", cleanupDetail, DateTimeOffset.UtcNow));
-        return new(existingReport, outputs.Count(path => Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase)), deleted);
+        return new(existingReport, outputs.Count(path => Path.GetExtension(path) is ".flac" or ".dsf"), deleted);
     }
 
     private static List<string> NormalizeAndCollectOutputs(JsonObject report, string stagedAlbumRoot)
@@ -443,6 +586,44 @@ public sealed class HostCommitService
         return outputs.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToList();
     }
 
+    private static List<string> NormalizeAndCollectDsdOutputs(JsonObject report, string stagedAlbumRoot)
+    {
+        var outputs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (report["areas"] is not JsonArray areas || areas.Count == 0)
+            throw new JsonException("The SACD conversion report must contain at least one areas entry.");
+        foreach (var areaNode in areas)
+        {
+            if (areaNode is not JsonObject area || area["tracks"] is not JsonArray tracks || tracks.Count == 0)
+                throw new JsonException("A SACD area contains no tracks.");
+            for (var index = 0; index < tracks.Count; index++)
+            {
+                if (tracks[index] is not JsonObject track) throw new JsonException("A SACD track entry is not an object.");
+                var relative = NormalizePathValue(track["file"], stagedAlbumRoot, "SACD track");
+                if (!Path.GetExtension(relative).Equals(".dsf", StringComparison.OrdinalIgnoreCase))
+                    throw new JsonException($"A SACD playback output is not DSF: {relative}");
+                track["file"] = relative;
+                outputs.Add(relative);
+            }
+        }
+        if (report["genre"] is not JsonObject genre || string.IsNullOrWhiteSpace(genre["value"]?.GetValue<string>()))
+            throw new JsonException("The SACD conversion report has no nonempty genre value or provenance.");
+        if (report["cover"] is not JsonObject cover || cover["file"] is null)
+            throw new JsonException("The SACD conversion report has no required cover.jpg file entry.");
+        var coverRelative = NormalizePathValue(cover["file"], stagedAlbumRoot, "cover");
+        cover["file"] = coverRelative;
+        outputs.Add(coverRelative);
+        if (report["artifacts"] is JsonArray artifacts)
+        {
+            for (var index = 0; index < artifacts.Count; index++)
+            {
+                var relative = NormalizePathValue(artifacts[index], stagedAlbumRoot, "SACD provenance artifact");
+                artifacts[index] = relative;
+                outputs.Add(relative);
+            }
+        }
+        return outputs.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
     private static string NormalizePathValue(JsonNode? node, string stagedAlbumRoot, string label)
     {
         var value = node?.GetValue<string>();
@@ -450,6 +631,40 @@ public sealed class HostCommitService
         var relative = Path.IsPathRooted(value) ? HostStagingService.SafeRelative(stagedAlbumRoot, value) : value;
         var full = HostStagingService.SafeCombine(stagedAlbumRoot, relative);
         return HostStagingService.SafeRelative(stagedAlbumRoot, full);
+    }
+
+    private static async Task VerifyPlaybackFilesAsync(
+        IEnumerable<string> outputs,
+        string albumRoot,
+        StagedJob staged,
+        JsonObject report,
+        bool isDsd,
+        CancellationToken token)
+    {
+        if (!isDsd)
+        {
+            await VerifyTrackHeadersAsync(outputs, albumRoot, staged, token);
+            return;
+        }
+
+        if (report["areas"] is not JsonArray areas) throw new JsonException("The SACD report has no areas array.");
+        foreach (var areaNode in areas)
+        {
+            if (areaNode is not JsonObject area || area["tracks"] is not JsonArray tracks)
+                throw new JsonException("A SACD area has no track array.");
+            foreach (var trackNode in tracks)
+            {
+                if (trackNode is not JsonObject track) throw new JsonException("A SACD track is not an object.");
+                var relative = track["file"]?.GetValue<string>() ?? throw new JsonException("A SACD track path is missing.");
+                var expectedPayload = track["dsd_payload_sha256_after_tags"]?.GetValue<string>()
+                    ?? throw new JsonException($"A SACD track has no tagged DSD payload hash: {relative}");
+                var path = HostStagingService.SafeCombine(albumRoot, relative);
+                await LocalDsdProcessor.VerifyCommittedDsfAsync(staged.FfprobePath, path, expectedPayload, token);
+            }
+        }
+        foreach (var relative in outputs.Where(path => !Path.GetExtension(path).Equals(".dsf", StringComparison.OrdinalIgnoreCase)))
+            if (!File.Exists(HostStagingService.SafeCombine(albumRoot, relative)))
+                throw new FileNotFoundException($"A SACD report artifact is missing: {relative}");
     }
 
     private static async Task VerifyTrackHeadersAsync(IEnumerable<string> outputs, string albumRoot, StagedJob staged, CancellationToken token)
@@ -519,18 +734,20 @@ public sealed class HostCommitService
     private static string? Text(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
-    private static IReadOnlyList<DeletionTarget> ResolveDeletionTargets(ScanResult scan, StagedJob staged)
+    private static IReadOnlyList<DeletionTarget> ResolveDeletionTargets(ScanResult scan, StagedJob staged, bool isDsd)
     {
         if (staged.Sources.Count != 1)
-            throw new InvalidOperationException($"Automatic source deletion requires exactly one inventoried FLAC image; found {staged.Sources.Count}.");
+            throw new InvalidOperationException($"Automatic source deletion requires exactly one inventoried image; found {staged.Sources.Count}.");
 
         var source = staged.Sources[0];
-        if (!Path.GetExtension(source.RelativePath).Equals(".flac", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("Automatic source deletion is limited to an inventoried .flac image.");
+        var requiredExtension = isDsd ? ".iso" : ".flac";
+        var requiredKind = isDsd ? "SACD / DSD image" : "FLAC image";
+        if (!Path.GetExtension(source.RelativePath).Equals(requiredExtension, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Automatic source deletion is limited to an inventoried {requiredExtension} image for this workflow.");
         if (!scan.Media.Any(item =>
-                item.Kind.Equals("FLAC image", StringComparison.OrdinalIgnoreCase) &&
+                item.Kind.Equals(requiredKind, StringComparison.OrdinalIgnoreCase) &&
                 item.RelativePath.Equals(source.RelativePath, StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException("The deletion target is not the FLAC image identified by the read-only inventory.");
+            throw new InvalidOperationException("The deletion target is not the source image identified by the read-only inventory.");
 
         var fullPath = HostStagingService.SafeCombine(scan.AlbumRoot, source.RelativePath);
         if (!File.Exists(fullPath)) throw new FileNotFoundException("The inventoried original FLAC image is already missing.", fullPath);
@@ -543,7 +760,7 @@ public sealed class HostCommitService
     }
 
     private sealed record DeletionTarget(string RelativePath, string FullPath);
-    private static void SetQuickVerification(JsonObject report, string stage)
+    private static void SetQuickVerification(JsonObject report, string stage, bool sourceDeletionRequested)
     {
         var verification = report["verification"] as JsonObject ?? new JsonObject();
         report["verification"] = verification;
@@ -552,7 +769,24 @@ public sealed class HostCommitService
         verification["pcm_equivalence"] = "skipped_by_user";
         verification["verified_stage"] = stage;
         verification["verified_at_utc"] = DateTimeOffset.UtcNow;
-        verification["source_deletion_requested"] = true;
+        verification["source_deletion_requested"] = sourceDeletionRequested;
+        verification["sources_deleted"] = false;
+        verification["errors"] = new JsonArray();
+    }
+    private static bool DsdDeletionEligible(JsonObject report) =>
+        report["verification"] is JsonObject verification &&
+        verification["status"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true &&
+        verification["independent_extraction"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true &&
+        verification["tag_payload_verification"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true &&
+        verification["source_deletion_eligible"]?.GetValue<bool>() == true;
+    private static void ConfirmDsdVerification(JsonObject report, string stage, bool sourceDeletionRequested)
+    {
+        if (!DsdDeletionEligible(report))
+            throw new InvalidDataException("The SACD report does not prove independent extraction and unchanged tagged DSD payloads.");
+        var verification = (JsonObject)report["verification"]!;
+        verification["verified_stage"] = stage;
+        verification["verified_at_utc"] = DateTimeOffset.UtcNow;
+        verification["source_deletion_requested"] = sourceDeletionRequested;
         verification["sources_deleted"] = false;
         verification["errors"] = new JsonArray();
     }
