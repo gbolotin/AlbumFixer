@@ -295,12 +295,15 @@ public sealed class HostCommitService
             throw new IOException($"The new split no longer produces every report-proven root output: {string.Join(", ", unmatchedReplacements)}. The prior tracks were retained.");
         var localPlayback = await VerifyPlaybackFilesAsync(outputs, staged.AlbumRoot, staged, report, isDsd, token);
         var localArtworkIssues = isDsd ? [] : ArtworkIssues(report, staged.AlbumRoot, localPlayback.ArtworkIssues);
-        var incomplete = localArtworkIssues.Count > 0;
+        var localIncompleteIssues = IncompleteIssues(report, localArtworkIssues);
+        var incomplete = localIncompleteIssues.Count > 0;
         if (isDsd) ConfirmDsdVerification(report, "local staging", sourceDeletionRequested: true);
-        else SetQuickVerification(report, "local staging", staged.Sources.Count == 1 && !incomplete, localArtworkIssues);
+        else SetQuickVerification(report, "local staging", staged.Sources.Count == 1 && !incomplete, localIncompleteIssues);
         await AtomicWriteAsync(localReportPath, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
         progress.Report(new(JobPhase.LocalVerificationPassed, 50, incomplete ? "incomplete" : "running", isDsd
-            ? "Independent SACD extraction, DSF/DSD, tag, artwork, and payload checks passed locally."
+            ? incomplete
+                ? "Independent SACD extraction and DSD payload checks passed locally; unresolved metadata will be delivered as incomplete work."
+                : "Independent SACD extraction, DSF/DSD, tag, artwork, and payload checks passed locally."
             : incomplete
                 ? "Local FLAC and tag checks passed; front-cover artwork is deferred and the original source will be retained."
                 : "Quick local FLAC, tag, and artwork checks passed. Full PCM comparison was skipped.", DateTimeOffset.UtcNow));
@@ -443,7 +446,8 @@ public sealed class HostCommitService
         token.ThrowIfCancellationRequested();
         var finalPlayback = await VerifyPlaybackFilesAsync(outputs, scan.AlbumRoot, staged, report, isDsd, token);
         var finalArtworkIssues = isDsd ? [] : ArtworkIssues(report, scan.AlbumRoot, finalPlayback.ArtworkIssues);
-        incomplete = finalArtworkIssues.Count > 0;
+        var finalIncompleteIssues = IncompleteIssues(report, finalArtworkIssues);
+        incomplete = finalIncompleteIssues.Count > 0;
         var rollbackCleaned = rolledBack.Count == 0 || TryDeleteDirectory(rollbackRoot);
         if (rolledBack.Count > 0)
         {
@@ -452,7 +456,7 @@ public sealed class HostCommitService
         }
         var deletesSource = !incomplete && staged.Sources.Count == 1 && (!isDsd || DsdDeletionEligible(report));
         if (isDsd) ConfirmDsdVerification(report, "final album path", deletesSource);
-        else SetQuickVerification(report, "final album path", deletesSource, finalArtworkIssues);
+        else SetQuickVerification(report, "final album path", deletesSource, finalIncompleteIssues);
         token.ThrowIfCancellationRequested();
         var deletionTargets = deletesSource ? ResolveDeletionTargets(scan, staged, isDsd) : [];
         var deletion = new JsonObject
@@ -466,14 +470,18 @@ public sealed class HostCommitService
             ["performed"] = false
         };
         if (!deletesSource) deletion["reason"] = isDsd
-            ? "The SACD report did not prove every independent-extraction and DSD payload gate."
+            ? incomplete
+                ? "The DSF tracks passed extraction and payload verification, but metadata remains incomplete; the original SACD ISO was retained."
+                : "The SACD report did not prove every independent-extraction and DSD payload gate."
             : incomplete
                 ? "Artwork is incomplete; the original FLAC image was retained for later repair."
                 : "Automatic deletion confirmation covers one exact FLAC image only.";
         report["deletion"] = deletion;
         await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
         progress.Report(new(JobPhase.FinalVerificationPassed, 90, incomplete ? "incomplete" : "running", isDsd
-            ? "Final DSF/DSD, tag, artwork, payload, report-path, and copy-hash checks passed."
+            ? incomplete
+                ? "Final DSF/DSD payload, report-path, and copy-hash checks passed; unresolved metadata remains marked incomplete."
+                : "Final DSF/DSD, tag, artwork, payload, report-path, and copy-hash checks passed."
             : incomplete
                 ? "Final FLAC, tag, and copy-hash checks passed; artwork remains deferred."
                 : "Quick final FLAC, tag, artwork, and copy-hash checks passed.", DateTimeOffset.UtcNow));
@@ -532,7 +540,7 @@ public sealed class HostCommitService
             commit = report["commit"] as JsonObject ?? new JsonObject();
             report["commit"] = commit;
             commit["status"] = incomplete ? "completed_incomplete" : "completed";
-            commit["final_path_verification"] = incomplete ? "passed_with_artwork_warning" : "passed";
+            commit["final_path_verification"] = incomplete ? "passed_with_incomplete_metadata_or_artwork" : "passed";
             commit["completed_at_utc"] = DateTimeOffset.UtcNow;
             commit["network_side_staging"] = networkCleaned ? null : networkStage;
             job = report["job"] as JsonObject ?? new JsonObject();
@@ -549,7 +557,7 @@ public sealed class HostCommitService
             ? $"the original {(isDsd ? "SACD ISO" : "FLAC image")} was deleted"
             : $"all {staged.Sources.Count} original source image{(staged.Sources.Count == 1 ? " was" : "s were")} retained";
         var cleanupDetail = incomplete
-            ? $"Tracks were delivered as incomplete work; audio, tags, and copy hashes passed, artwork is deferred, and {disposition}."
+            ? $"Tracks were delivered as incomplete work; audio and copy hashes passed, unresolved metadata or artwork is deferred, and {disposition}."
             : localCleaned && networkCleaned
                 ? $"Conversion completed; final files and report passed quick checks, and {disposition}."
                 : $"Conversion completed and {disposition}; a staging folder may require cleanup.";
@@ -806,14 +814,32 @@ public sealed class HostCommitService
         return issues.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
-    private static void SetQuickVerification(JsonObject report, string stage, bool sourceDeletionRequested, IReadOnlyList<string> artworkIssues)
+    private static IReadOnlyList<string> IncompleteIssues(JsonObject report, IReadOnlyList<string> artworkIssues)
     {
-        var incomplete = artworkIssues.Count > 0;
+        var issues = artworkIssues.ToList();
+        if (report["verification"] is JsonObject verification && verification["missing_metadata"] is JsonArray missing)
+        {
+            issues.AddRange(missing
+                .Select(value => value?.GetValue<string>())
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Select(value => $"Metadata field remains unresolved: {value}."));
+        }
+        if (report["genre"] is not JsonObject genre ||
+            string.IsNullOrWhiteSpace(genre["value"]?.GetValue<string>()) ||
+            genre["value"]?.GetValue<string>().Equals("Unknown", StringComparison.OrdinalIgnoreCase) == true ||
+            genre["source_type"]?.GetValue<string>().Equals("unresolved_placeholder", StringComparison.OrdinalIgnoreCase) == true)
+            issues.Add("Metadata field remains unresolved: GENRE.");
+        return issues.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static void SetQuickVerification(JsonObject report, string stage, bool sourceDeletionRequested, IReadOnlyList<string> incompleteIssues)
+    {
+        var incomplete = incompleteIssues.Count > 0;
         var verification = report["verification"] as JsonObject ?? new JsonObject();
         report["verification"] = verification;
         verification["status"] = incomplete ? "incomplete" : "passed";
         verification["method"] = incomplete
-            ? "Quick ffprobe FLAC/header/tag checks plus SHA-256 copy integrity passed; front-cover artwork is deferred and decoded PCM byte-count/MD5 comparison was skipped by user."
+            ? "Quick ffprobe FLAC/header/tag checks plus SHA-256 copy integrity passed; unresolved metadata or artwork is deferred and decoded PCM byte-count/MD5 comparison was skipped by user."
             : "Quick ffprobe FLAC/header/tag/artwork checks plus SHA-256 copy integrity; decoded PCM byte-count and MD5 comparison skipped by user.";
         verification["pcm_equivalence"] = "skipped_by_user";
         verification["audio_and_tags"] = "passed";
@@ -824,35 +850,56 @@ public sealed class HostCommitService
         verification["source_deletion_eligible"] = sourceDeletionRequested && !incomplete;
         verification["sources_deleted"] = false;
         verification["errors"] = new JsonArray();
-        verification["warnings"] = new JsonArray(artworkIssues.Select(issue => JsonValue.Create(issue)).ToArray());
+        verification["warnings"] = new JsonArray(incompleteIssues.Select(issue => JsonValue.Create(issue)).ToArray());
         report["work_status"] = incomplete ? "incomplete" : "complete";
         if (incomplete)
         {
             report["incomplete_work"] = new JsonObject
             {
-                ["reason"] = "Front-cover artwork is missing or could not be embedded safely.",
+                ["reason"] = "Metadata or front-cover artwork remains unresolved after best-effort lookup.",
                 ["repairable_without_source_image"] = true,
-                ["issues"] = new JsonArray(artworkIssues.Select(issue => JsonValue.Create(issue)).ToArray())
+                ["issues"] = new JsonArray(incompleteIssues.Select(issue => JsonValue.Create(issue)).ToArray())
             };
         }
         else report.Remove("incomplete_work");
     }
-    private static bool DsdDeletionEligible(JsonObject report) =>
+    private static bool DsdAudioVerificationPassed(JsonObject report) =>
         report["verification"] is JsonObject verification &&
-        verification["status"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true &&
+        (verification["status"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true ||
+         verification["status"]?.GetValue<string>().Equals("incomplete", StringComparison.OrdinalIgnoreCase) == true) &&
         verification["independent_extraction"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true &&
-        verification["tag_payload_verification"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true &&
+        verification["tag_payload_verification"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true;
+    private static bool DsdDeletionEligible(JsonObject report) =>
+        DsdAudioVerificationPassed(report) &&
+        IncompleteIssues(report, []).Count == 0 &&
+        report["verification"] is JsonObject verification &&
         verification["source_deletion_eligible"]?.GetValue<bool>() == true;
     private static void ConfirmDsdVerification(JsonObject report, string stage, bool sourceDeletionRequested)
     {
-        if (!DsdDeletionEligible(report))
+        if (!DsdAudioVerificationPassed(report))
             throw new InvalidDataException("The SACD report does not prove independent extraction and unchanged tagged DSD payloads.");
         var verification = (JsonObject)report["verification"]!;
+        var issues = IncompleteIssues(report, []);
+        var incomplete = issues.Count > 0;
+        verification["status"] = incomplete ? "incomplete" : "passed";
         verification["verified_stage"] = stage;
         verification["verified_at_utc"] = DateTimeOffset.UtcNow;
-        verification["source_deletion_requested"] = sourceDeletionRequested;
+        verification["source_deletion_requested"] = sourceDeletionRequested && !incomplete;
+        verification["source_deletion_eligible"] = sourceDeletionRequested && !incomplete;
         verification["sources_deleted"] = false;
         verification["errors"] = new JsonArray();
+        verification["warnings"] = new JsonArray(issues.Select(issue => JsonValue.Create(issue)).ToArray());
+        report["work_status"] = incomplete ? "incomplete" : "complete";
+        if (incomplete)
+        {
+            report["incomplete_work"] = new JsonObject
+            {
+                ["reason"] = "External and local metadata sources did not resolve every desired field. Verified DSF tracks remain usable.",
+                ["repairable_without_source_image"] = true,
+                ["issues"] = new JsonArray(issues.Select(issue => JsonValue.Create(issue)).ToArray())
+            };
+        }
+        else report.Remove("incomplete_work");
     }
     private static bool TryDeleteDirectory(string path)
     {

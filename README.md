@@ -1,6 +1,6 @@
 # Album Fixer
 
-Album Fixer is a native Windows app that locally splits FLAC+CUE images and extracts SACD ISOs into tagged tracks, shows the 12-stage transaction, and produces a readable conversion report.
+Album Fixer is a native Windows app that locally splits FLAC+CUE images and extracts SACD ISOs into tagged tracks, shows per-album progress, and produces a readable conversion report.
 
 ## What it does
 
@@ -14,8 +14,9 @@ Album Fixer is a native Windows app that locally splits FLAC+CUE images and extr
 - Copies the selected album and required audio tools into a unique Windows Temp job and verifies source size and SHA-256 before processing.
 - Parses each CUE and splits its tracks in one local FFmpeg process, writing locally available tags and embedding local artwork without starting Codex.
 - Reads every area reported by a SACD ISO and extracts each area sequentially to `Stereo` or `Multichannel`. It repeats every extraction independently, requires exact untagged track hashes, embeds tags and cover art, and proves that tagging did not alter the native DSD payload.
+- Before SACD extraction, searches MusicBrainz, MusicBrainz-linked public Discogs records, Apple Music, and authenticated Discogs search when `DISCOGS_TOKEN` is configured. Exact-edition fields require conservative artist/title/format/year/track-count matching; every used source and lookup warning is recorded.
 - Places tracks directly beside the source for a single FLAC+CUE image. When several FLAC+CUE images share the selected album folder, places their tracks in deterministic `CD1`, `CD2`, … subfolders.
-- After every track exists, reads the metadata-gap handoff. Complete local metadata skips Codex entirely; only named missing required fields trigger Codex discovery, skill staging, and one metadata-only process.
+- After every track exists, reads the metadata-gap handoff. Complete local/external metadata skips Codex entirely; only named missing fields trigger Codex discovery, skill staging, and one metadata-only process. Failed or unavailable external research never discards a successful SACD extraction: tracks are delivered as incomplete work and the original ISO is retained.
 - Uses quick ffprobe container, required-tag, and embedded-artwork checks; writes through destination-side staging and compares SHA-256 copy hashes. Decoded PCM/MD5 comparison is skipped; a confirmed single source is deleted, while multiple sources are retained.
 - Shows phase progress, live activity, inventory, final verification status, output counts, source disposition, and formatted report JSON.
 - Source policy: a successful one-image FLAC+CUE run deletes the exact confirmed image after final quick checks. A successful single-SACD run deletes the exact ISO only after both extractions and final DSF/DSD, payload, tag, artwork, report-path, and copy-hash verification pass. Multi-image runs retain every original.
@@ -38,6 +39,7 @@ The packaged app is self-contained for 64-bit Windows and does not require a sep
 ## Required tools
 
 - Optional: Codex CLI and the installed album-fixer skill, used only when required metadata or cover art is missing after the local split.
+- Optional: a Discogs personal access token in the `DISCOGS_TOKEN` environment variable for direct Discogs database search. MusicBrainz, Apple Music, and public Discogs records linked by MusicBrainz do not require this token.
 - `ffmpeg` and `ffprobe` for FLAC workflows.
 - `ffprobe` and TagLibSharp-backed DSF tagging for the verified SACD workflow.
 - `sacd_extract` for SACD ISO layout inspection and DSF extraction. Album Fixer stages an `id3tag=0` configuration so hashes compare the untagged extraction payloads.

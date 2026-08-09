@@ -29,11 +29,14 @@ try
     await HostCommitFailureRetainsSource(root);
     await FailureReportIsAlwaysWritten(root);
     await MetadataHandoffIsConditional(root);
+    await ExternalMetadataResolvesExactSacdRelease();
+    await ExternalMetadataUsesAppleGenreFallback();
+    await ExternalMetadataFailuresAreNonblocking();
     ProgressContractParses();
     DiagnosticContractClassifies();
     await ReportSummaryLoads(root);
     CommandContractIsSandboxed(root);
-    Console.WriteLine("AlbumFixer.Core smoke tests passed (25/25).");
+    Console.WriteLine("AlbumFixer.Core smoke tests passed (28/28).");
     return 0;
 }
 catch (Exception error)
@@ -775,6 +778,54 @@ static async Task ReportSummaryLoads(string root)
     Assert(summary.Status == "passed" && summary.Tracks == 2 && summary.Sections == 1 && summary.Deleted, "Report summary is wrong.");
 }
 
+static async Task ExternalMetadataResolvesExactSacdRelease()
+{
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("/ws/2/release/?", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""
+            {"releases":[{"id":"release-1","score":100,"title":"Brothers in Arms","artist-credit":[{"name":"Dire Straits"}],"release-group":{"id":"group-1"},"date":"2014-04-23","country":"JP","barcode":"4988005811783","track-count":9,"media":[{"format":"SHM-SACD","track-count":9}],"label-info":[{"catalog-number":"UIGY-9547","label":{"name":"Vertigo"}}]}]}
+            """);
+        if (uri.Contains("/ws/2/release-group/group-1", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"genres":[{"name":"rock","count":20},{"name":"pop rock","count":8}],"tags":[],"relations":[{"type":"discogs","url":{"resource":"https://www.discogs.com/master/23684"}}]}""");
+        if (uri.Contains("api.discogs.com/masters/23684", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"title":"Brothers In Arms","artists":[{"name":"Dire Straits"}],"genres":["Rock"],"styles":["Blues Rock"]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[{"artistName":"Dire Straits","collectionName":"Brothers In Arms","primaryGenreName":"Rock","releaseDate":"1985-05-17T07:00:00Z","trackCount":9,"collectionViewUrl":"https://music.apple.com/album/1"}]}""");
+        throw new InvalidOperationException($"Unexpected metadata request: {uri}");
+    }));
+    var service = new ExternalMetadataService(client, musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var result = await service.ResolveAsync(new("Brothers In Arms", "Dire Straits", 9, 1985, 2014));
+    Assert(result.Genre == "Rock" && result.GenreSourceType == "discogs_linked_from_musicbrainz" && result.Label == "Vertigo" && result.CatalogNumber == "UIGY-9547", "Exact MusicBrainz/Discogs SACD metadata was not selected.");
+    Assert(result.Barcode == "4988005811783" && result.ReleaseCountry == "JP" && result.ReleaseDate == "2014-04-23", "Exact SACD edition fields were not retained.");
+    Assert(result.OriginalDate?.StartsWith("1985", StringComparison.Ordinal) == true && result.Sources.Count >= 3, "Corroborating Discogs/Apple Music metadata or source provenance is missing.");
+}
+
+static async Task ExternalMetadataUsesAppleGenreFallback()
+{
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("musicbrainz.org", StringComparison.Ordinal)) return StubHttpHandler.Json("""{"releases":[]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[{"artistName":"Dire Straits","collectionName":"Communiqué","primaryGenreName":"Rock","releaseDate":"1979-06-15T07:00:00Z","trackCount":9,"collectionViewUrl":"https://music.apple.com/album/2"}]}""");
+        throw new InvalidOperationException($"Unexpected metadata request: {uri}");
+    }));
+    var service = new ExternalMetadataService(client, musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var result = await service.ResolveAsync(new("Communique'", "Dire Straits", 9, 1979, 2012));
+    Assert(result.Genre == "Rock" && result.GenreSourceType == "apple_music_catalog", "Apple Music should provide a broad fallback genre when MusicBrainz has no match.");
+}
+
+static async Task ExternalMetadataFailuresAreNonblocking()
+{
+    using var client = new HttpClient(new StubHttpHandler((_, _) => throw new HttpRequestException("offline")));
+    var service = new ExternalMetadataService(client, musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromMilliseconds(100));
+    var result = await service.ResolveAsync(new("Offline Album", "Offline Artist", 10, 1980, 2010));
+    Assert(!result.HasMatch && result.Genre is null, "A failed external lookup must not invent a metadata match.");
+    Assert(result.Warnings.Any(value => value.Contains("continue", StringComparison.OrdinalIgnoreCase)), "A failed external lookup must be recorded as a nonblocking warning.");
+}
+
 static void CommandContractIsSandboxed(string root)
 {
     var options = new RunOptions("codex.exe", root, Path.Combine(root, "job"), "SKILL.md", Path.Combine(root, "ffmpeg.exe"), Path.Combine(root, "ffprobe.exe"), CodexWorkKind.MetadataEnrichment);
@@ -793,6 +844,8 @@ static void CommandContractIsSandboxed(string root)
     Assert(prompt.Contains("Do not probe, map, or access any UNC/network path", StringComparison.OrdinalIgnoreCase), "The local-only runner boundary is missing.");
     Assert(prompt.Contains("already", StringComparison.OrdinalIgnoreCase) && prompt.Contains("split every track locally", StringComparison.OrdinalIgnoreCase), "The metadata agent must receive already-split tracks.");
     Assert(prompt.Contains("Research only those explicitly listed fields", StringComparison.OrdinalIgnoreCase) && prompt.Contains("Never split, extract, or re-encode", StringComparison.OrdinalIgnoreCase), "Codex must be metadata-only and limited to named gaps.");
+    Assert(prompt.Contains("Discogs", StringComparison.OrdinalIgnoreCase) && prompt.Contains("MusicBrainz", StringComparison.OrdinalIgnoreCase) &&
+           prompt.Contains("must never turn a successful extraction into a failed job", StringComparison.OrdinalIgnoreCase), "External metadata research must be explicit and nonblocking.");
     Assert(!prompt.Contains("split-first local worker", StringComparison.OrdinalIgnoreCase), "The obsolete Codex split worker is still present.");
     Assert(CodexContract.WorkerStem(options) == "metadata-agent", "Codex may only run as the optional metadata agent.");
 }
@@ -819,7 +872,7 @@ static async Task<int> ProcessSacdAlbum(string albumRoot)
         var staged = await new HostStagingService().StageAsync(scan, preflight, skill, jobDirectory, progress);
         var local = await new LocalDsdProcessor().ProcessAsync(scan, staged, progress);
         if (local.Metadata.RequiresResearch)
-            throw new InvalidOperationException($"SACD metadata is incomplete: {string.Join(", ", local.Metadata.MissingFields)}");
+            Console.WriteLine($"SACD metadata remains incomplete ({string.Join(", ", local.Metadata.MissingFields)}); committing verified tracks and retaining the source ISO.");
         var committed = await new HostCommitService().CommitAsync(scan, staged, progress);
         Console.WriteLine($"SACD completed: {committed.Tracks} tracks; source deleted: {committed.SourcesDeleted}; report: {committed.ReportPath}");
         return 0;
@@ -829,4 +882,15 @@ static async Task<int> ProcessSacdAlbum(string albumRoot)
         Console.Error.WriteLine(error);
         return 1;
     }
+}
+
+sealed class StubHttpHandler(Func<HttpRequestMessage, CancellationToken, HttpResponseMessage> responder) : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+        Task.FromResult(responder(request, cancellationToken));
+
+    public static HttpResponseMessage Json(string json) => new(System.Net.HttpStatusCode.OK)
+    {
+        Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
+    };
 }

@@ -12,6 +12,15 @@ namespace AlbumFixer.Core;
 
 public sealed partial class LocalDsdProcessor
 {
+    private readonly ExternalMetadataService _externalMetadata;
+
+    public LocalDsdProcessor() : this(new ExternalMetadataService()) { }
+
+    public LocalDsdProcessor(ExternalMetadataService externalMetadata)
+    {
+        _externalMetadata = externalMetadata ?? throw new ArgumentNullException(nameof(externalMetadata));
+    }
+
     private static readonly HashSet<string> ReservedNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
@@ -48,9 +57,16 @@ public sealed partial class LocalDsdProcessor
         var layout = ParseLayout(layoutOutput);
         if (layout.Areas.Count == 0) throw new InvalidDataException("sacd_extract reported no playable SACD areas.");
 
-        var year = ResolveYear(scan.AlbumName, layout.CreationDate);
-        var genre = InferGenreFromFolders(scan.AlbumRoot)
-            ?? throw new InvalidDataException("A conservative genre could not be inferred from the library folders.");
+        var years = ResolveYears(scan.AlbumName, layout.CreationDate);
+        progress.Report(Snapshot(JobPhase.Processing, 20, "Searching Discogs, MusicBrainz, and Apple Music for missing SACD metadata; lookup failures will not stop extraction."));
+        var external = await _externalMetadata.ResolveAsync(new(
+            layout.AlbumTitle,
+            layout.AlbumArtist,
+            layout.Areas.Max(area => area.Tracks.Count),
+            years.Original,
+            years.Edition,
+            layout.CatalogNumber), token);
+        var metadata = ResolveMetadata(scan.AlbumRoot, layout, years, external);
         var cover = await PrepareCoverAsync(staged.AlbumRoot, token);
         var reportAreas = new JsonArray();
         var allTrackReports = new List<JsonObject>();
@@ -110,12 +126,12 @@ public sealed partial class LocalDsdProcessor
                 var finalTrack = Path.Combine(finalAreaRoot, outputName);
                 File.Move(primary, finalTrack, overwrite: false);
                 var payloadBefore = await DsfPayloadSha256Async(finalTrack, token);
-                await WriteTagsAsync(finalTrack, cover.Path, layout, area, track, year, genre, token);
+                await WriteTagsAsync(finalTrack, cover.Path, layout, area, track, metadata, token);
                 var payloadAfter = await DsfPayloadSha256Async(finalTrack, token);
                 if (!payloadBefore.Equals(payloadAfter, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException($"DSD audio payload changed while tagging {areaFolderName}/{outputName}.");
 
-                var probe = await VerifyDsfAsync(staged.FfprobePath, finalTrack, layout, area, track, year, genre, cover.Path, token);
+                var probe = await VerifyDsfAsync(staged.FfprobePath, finalTrack, layout, area, track, metadata, cover.Path, token);
                 var relative = JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, finalTrack));
                 var trackReport = new JsonObject
                 {
@@ -162,7 +178,7 @@ public sealed partial class LocalDsdProcessor
             ["schema_version"] = "1.0",
             ["album"] = layout.AlbumTitle,
             ["artist"] = layout.AlbumArtist,
-            ["edition"] = string.Join(", ", new[] { layout.CatalogNumber, "SACD", scan.AlbumName }.Where(value => !string.IsNullOrWhiteSpace(value))),
+            ["edition"] = string.Join(", ", new[] { metadata.CatalogNumber, "SACD", scan.AlbumName }.Where(value => !string.IsNullOrWhiteSpace(value))),
             ["format"] = "dsf",
             ["source_type"] = "sacd_iso",
             ["workflow_mode"] = "sacd_iso_extract",
@@ -178,7 +194,24 @@ public sealed partial class LocalDsdProcessor
             ["extraction_tool_sha256"] = toolHash,
             ["disc_layout_command"] = layoutCommand,
             ["disc_layout_file"] = "sacd_extract-layout.txt",
-            ["metadata_sources"] = new JsonArray("SACD disc text and track table", "album folder", cover.Source),
+            ["metadata_sources"] = new JsonArray(new[] { "SACD disc text and track table", "album folder", cover.Source }
+                .Concat(metadata.Sources).Select(value => JsonValue.Create(value)).ToArray()),
+            ["release_metadata"] = new JsonObject
+            {
+                ["original_date"] = metadata.OriginalDate,
+                ["release_date"] = metadata.ReleaseDate,
+                ["label"] = metadata.Label,
+                ["catalog_number"] = metadata.CatalogNumber,
+                ["barcode"] = metadata.Barcode,
+                ["release_country"] = metadata.ReleaseCountry
+            },
+            ["metadata_lookup"] = new JsonObject
+            {
+                ["status"] = metadata.MissingFields.Count == 0 ? "complete" : metadata.Sources.Count > 0 ? "partial" : "unresolved",
+                ["nonblocking"] = true,
+                ["sources"] = new JsonArray(metadata.Sources.Select(value => JsonValue.Create(value)).ToArray()),
+                ["warnings"] = new JsonArray(metadata.Warnings.Select(value => JsonValue.Create(value)).ToArray())
+            },
             ["cover"] = new JsonObject
             {
                 ["file"] = "cover.jpg",
@@ -186,23 +219,26 @@ public sealed partial class LocalDsdProcessor
             },
             ["genre"] = new JsonObject
             {
-                ["value"] = genre,
-                ["source_type"] = "inferred_from_library_folder",
-                ["confidence"] = "high",
-                ["rationale"] = "Album is stored beneath the matching library genre folder."
+                ["value"] = metadata.Genre,
+                ["source_type"] = metadata.GenreSourceType,
+                ["confidence"] = metadata.GenreConfidence,
+                ["rationale"] = metadata.GenreRationale
             },
             ["areas"] = reportAreas,
             ["artifacts"] = new JsonArray(Directory.EnumerateFiles(staged.AlbumRoot, "sacd_extract-*", SearchOption.TopDirectoryOnly)
                 .Select(path => (JsonNode)JsonValue.Create(JsonPath(Path.GetFileName(path)))!).ToArray()),
             ["verification"] = new JsonObject
             {
-                ["status"] = "passed",
+                ["status"] = metadata.MissingFields.Count == 0 ? "passed" : "incomplete",
                 ["method"] = "Two deterministic untagged extractions per reported area; exact per-track size/SHA-256 equality; DSF/DSD probe and signal checks; unchanged DSD payload through ID3/artwork tagging.",
                 ["independent_extraction"] = "passed",
                 ["tag_payload_verification"] = "passed",
-                ["source_deletion_eligible"] = true,
+                ["audio_and_tags"] = "passed",
+                ["source_deletion_eligible"] = metadata.MissingFields.Count == 0,
                 ["sources_deleted"] = false,
-                ["errors"] = new JsonArray()
+                ["errors"] = new JsonArray(),
+                ["warnings"] = new JsonArray(metadata.Warnings.Select(value => JsonValue.Create(value)).ToArray()),
+                ["missing_metadata"] = new JsonArray(metadata.MissingFields.Select(value => JsonValue.Create(value)).ToArray())
             },
             ["job"] = new JsonObject
             {
@@ -212,10 +248,21 @@ public sealed partial class LocalDsdProcessor
                 ["processor"] = "local_sacd_extract_sequential_areas"
             }
         };
+        report["work_status"] = metadata.MissingFields.Count == 0 ? "complete" : "incomplete";
+        if (metadata.MissingFields.Count > 0)
+        {
+            report["incomplete_work"] = new JsonObject
+            {
+                ["reason"] = "External and local metadata sources did not resolve every desired field. Verified DSF tracks remain usable.",
+                ["repairable_without_source_image"] = true,
+                ["issues"] = new JsonArray(metadata.MissingFields.Select(value => JsonValue.Create($"Missing metadata: {value}")).ToArray())
+            };
+        }
         await AtomicWriteAsync(reportPath, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
+        var evidence = new[] { "SACD disc text and track table", $"local artwork: {cover.Source}" }.Concat(metadata.Sources).ToArray();
+        await WriteGapManifestAsync(staged.JobDirectory, metadata.MissingFields, evidence, token);
         progress.Report(Snapshot(JobPhase.Tagging, 48, $"SACD extraction and deletion-grade local verification completed for {totalTracks} tracks."));
-        return new(totalTracks, reportPath, new MetadataGapResult(true, false, [],
-            ["SACD disc text and track table", $"local artwork: {cover.Source}", $"library genre folder: {genre}"]));
+        return new(totalTracks, reportPath, new MetadataGapResult(true, metadata.MissingFields.Count > 0, metadata.MissingFields, evidence));
     }
 
     internal static async Task<string> DsfPayloadSha256Async(string path, CancellationToken token = default)
@@ -243,7 +290,7 @@ public sealed partial class LocalDsdProcessor
     }
 
     private static async Task WriteTagsAsync(
-        string path, string coverPath, SacdLayout layout, SacdArea area, SacdTrack track, uint year, string genre, CancellationToken token)
+        string path, string coverPath, SacdLayout layout, SacdArea area, SacdTrack track, ResolvedDsdMetadata metadata, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         using var file = TagFile.Create(path);
@@ -255,8 +302,8 @@ public sealed partial class LocalDsdProcessor
         file.Tag.TrackCount = (uint)area.Tracks.Count;
         file.Tag.Disc = 1;
         file.Tag.DiscCount = 1;
-        file.Tag.Year = year;
-        file.Tag.Genres = [genre];
+        file.Tag.Year = (uint)metadata.OriginalYear;
+        file.Tag.Genres = [metadata.Genre];
         file.Tag.Comment = $"MIX={area.DisplayName}";
         file.Tag.Pictures =
         [
@@ -267,12 +314,22 @@ public sealed partial class LocalDsdProcessor
                 MimeType = "image/jpeg"
             }
         ];
+        if (file.GetTag(TagLib.TagTypes.Id3v2, true) is TagLib.Id3v2.Tag id3)
+        {
+            SetUserText(id3, "MIX", area.DisplayName);
+            SetUserText(id3, "LABEL", metadata.Label);
+            SetUserText(id3, "CATALOGNUMBER", metadata.CatalogNumber);
+            SetUserText(id3, "BARCODE", metadata.Barcode);
+            SetUserText(id3, "RELEASECOUNTRY", metadata.ReleaseCountry);
+            SetUserText(id3, "ORIGINALDATE", metadata.OriginalDate);
+            SetUserText(id3, "RELEASEDATE", metadata.ReleaseDate);
+        }
         file.Save();
         await Task.CompletedTask;
     }
 
     internal static async Task<DsfProbe> VerifyDsfAsync(
-        string ffprobe, string path, SacdLayout layout, SacdArea area, SacdTrack track, uint year, string genre, string coverPath,
+        string ffprobe, string path, SacdLayout layout, SacdArea area, SacdTrack track, ResolvedDsdMetadata metadata, string coverPath,
         CancellationToken token = default)
     {
         var output = await RunProcessAsync(ffprobe,
@@ -306,9 +363,18 @@ public sealed partial class LocalDsdProcessor
         };
         var missing = required.Where(pair => string.IsNullOrWhiteSpace(pair.Value)).Select(pair => pair.Key).ToArray();
         if (missing.Length > 0 || tagged.Tag.Track != track.Number || tagged.Tag.TrackCount != area.Tracks.Count ||
-            tagged.Tag.Disc != 1 || tagged.Tag.DiscCount != 1 || tagged.Tag.Year != year ||
-            !tagged.Tag.FirstGenre.Equals(genre, StringComparison.OrdinalIgnoreCase) || tagged.Tag.Pictures.Length == 0)
+            tagged.Tag.Disc != 1 || tagged.Tag.DiscCount != 1 || tagged.Tag.Year != (uint)metadata.OriginalYear ||
+            !tagged.Tag.FirstGenre.Equals(metadata.Genre, StringComparison.OrdinalIgnoreCase) || tagged.Tag.Pictures.Length == 0)
             throw new InvalidDataException($"Required DSF metadata or artwork did not read back correctly from {path}: {string.Join(", ", missing)}");
+        if (tagged.GetTag(TagLib.TagTypes.Id3v2) is not TagLib.Id3v2.Tag id3 ||
+            !UserTextEquals(id3, "MIX", area.DisplayName) ||
+            !UserTextEquals(id3, "LABEL", metadata.Label) ||
+            !UserTextEquals(id3, "CATALOGNUMBER", metadata.CatalogNumber) ||
+            !UserTextEquals(id3, "BARCODE", metadata.Barcode) ||
+            !UserTextEquals(id3, "RELEASECOUNTRY", metadata.ReleaseCountry) ||
+            !UserTextEquals(id3, "ORIGINALDATE", metadata.OriginalDate) ||
+            !UserTextEquals(id3, "RELEASEDATE", metadata.ReleaseDate))
+            throw new InvalidDataException($"Extended DSF release metadata did not read back correctly from {path}.");
         if (!File.Exists(coverPath)) throw new FileNotFoundException("The album cover is missing after DSF tagging.", coverPath);
         return new(sampleRate, channels, Text(audio, "channel_layout") ?? (channels == 2 ? "stereo" : $"{channels} channels"), duration);
     }
@@ -411,13 +477,48 @@ public sealed partial class LocalDsdProcessor
         .OrderBy(path => NumericSortKey(Path.GetFileName(path)), StringComparer.OrdinalIgnoreCase).ThenBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
 
     private static string NumericSortKey(string value) => NumberAtStart().Replace(value, match => match.Value.PadLeft(8, '0'));
-    private static uint ResolveYear(string albumName, string? creationDate)
+    private static ResolvedYears ResolveYears(string albumName, string? creationDate)
     {
-        var match = Year().Match(albumName);
-        if (!match.Success && creationDate is not null) match = Year().Match(creationDate);
-        if (!match.Success || !uint.TryParse(match.Value, CultureInfo.InvariantCulture, out var year))
+        var values = Year().Matches(albumName).Select(match => match.Value).ToList();
+        if (values.Count == 0 && creationDate is not null) values.AddRange(Year().Matches(creationDate).Select(match => match.Value));
+        var years = values.Select(value => int.TryParse(value, CultureInfo.InvariantCulture, out var year) ? year : 0).Where(year => year > 0).ToArray();
+        if (years.Length == 0)
             throw new InvalidDataException("The album year is missing from the folder and SACD disc text.");
-        return year;
+        return new(years[0], years.Length > 1 && years[^1] != years[0] ? years[^1] : null);
+    }
+
+    private static ResolvedDsdMetadata ResolveMetadata(string albumRoot, SacdLayout layout, ResolvedYears years, ExternalAlbumMetadata external)
+    {
+        var folderGenre = InferGenreFromFolders(albumRoot);
+        var genre = folderGenre ?? external.Genre ?? "Unknown";
+        var catalogNumber = Nonempty(layout.CatalogNumber) ?? Nonempty(external.CatalogNumber);
+        var originalDate = Nonempty(external.OriginalDate) ?? years.Original.ToString(CultureInfo.InvariantCulture);
+        var releaseDate = Nonempty(external.ReleaseDate) ?? (years.Edition ?? years.Original).ToString(CultureInfo.InvariantCulture);
+        var missing = new List<string>();
+        if (genre.Equals("Unknown", StringComparison.OrdinalIgnoreCase)) missing.Add("GENRE");
+        if (Nonempty(external.Label) is null) missing.Add("LABEL");
+        if (catalogNumber is null) missing.Add("CATALOGNUMBER");
+        if (Nonempty(external.Barcode) is null) missing.Add("BARCODE");
+        if (Nonempty(external.ReleaseCountry) is null) missing.Add("RELEASECOUNTRY");
+
+        var warnings = external.Warnings.ToList();
+        if (genre.Equals("Unknown", StringComparison.OrdinalIgnoreCase))
+            warnings.Add("Genre remained unresolved after local-folder, Discogs, MusicBrainz, and Apple Music lookup; an explicit Unknown placeholder was written so extraction could continue.");
+        return new(
+            years.Original,
+            genre,
+            folderGenre is not null ? "inferred_from_library_folder" : external.GenreSourceType ?? "unresolved_placeholder",
+            folderGenre is not null ? "high" : external.GenreConfidence ?? "none",
+            folderGenre is not null ? "Album is stored beneath the matching library genre folder." : external.GenreRationale ?? "No sufficiently exact metadata source supplied a conservative genre.",
+            originalDate,
+            releaseDate,
+            Nonempty(external.Label),
+            catalogNumber,
+            Nonempty(external.Barcode),
+            Nonempty(external.ReleaseCountry),
+            external.Sources,
+            warnings.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
+            missing.Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
     }
 
     private static string? InferGenreFromFolders(string albumRoot)
@@ -433,6 +534,32 @@ public sealed partial class LocalDsdProcessor
             foreach (var mapping in mappings)
                 if (directory.Name.Contains(mapping.Needle, StringComparison.OrdinalIgnoreCase)) return mapping.Genre;
         return null;
+    }
+
+    private static void SetUserText(TagLib.Id3v2.Tag tag, string name, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return;
+        var frame = TagLib.Id3v2.UserTextInformationFrame.Get(tag, name, true);
+        frame.Text = [value.Trim()];
+    }
+
+    private static bool UserTextEquals(TagLib.Id3v2.Tag tag, string name, string? expected)
+    {
+        if (string.IsNullOrWhiteSpace(expected)) return true;
+        var actual = TagLib.Id3v2.UserTextInformationFrame.Get(tag, name, false)?.Text?.FirstOrDefault();
+        return actual?.Equals(expected.Trim(), StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    private static async Task WriteGapManifestAsync(string jobDirectory, IReadOnlyList<string> missing, IReadOnlyList<string> evidence, CancellationToken token)
+    {
+        var root = new JsonObject
+        {
+            ["split_completed"] = true,
+            ["requires_research"] = missing.Count > 0,
+            ["missing_fields"] = new JsonArray(missing.Select(value => JsonValue.Create(value)).ToArray()),
+            ["local_evidence"] = new JsonArray(evidence.Select(value => JsonValue.Create(value)).ToArray())
+        };
+        await AtomicWriteAsync(MetadataGapService.GetPath(jobDirectory), root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
     }
 
     private static string SafeFileName(string value)
@@ -527,6 +654,7 @@ public sealed partial class LocalDsdProcessor
         string.Join(" ", new[] { Quote(executable) }.Concat(arguments.Select(Quote)));
     private static string Quote(string value) => value.Any(char.IsWhiteSpace) ? $"\"{value.Replace("\"", "\\\"")}\"" : value;
     private static string JsonPath(string path) => path.Replace(Path.DirectorySeparatorChar, '/');
+    private static string? Nonempty(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
     private static string? Text(JsonElement element, string name) => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
     private static int ParseInt(JsonElement element, string name) => element.TryGetProperty(name, out var value) && int.TryParse(value.ToString(), CultureInfo.InvariantCulture, out var result) ? result : 0;
     private static TimeSpan ParseDuration(JsonElement root, JsonElement audio)
@@ -551,6 +679,22 @@ public sealed partial class LocalDsdProcessor
         public string DisplayName => IsStereo ? "Stereo" : "Multichannel";
     }
     internal sealed record SacdLayout(string AlbumTitle, string AlbumArtist, string? CatalogNumber, string? CreationDate, IReadOnlyList<SacdArea> Areas);
+    private sealed record ResolvedYears(int Original, int? Edition);
+    internal sealed record ResolvedDsdMetadata(
+        int OriginalYear,
+        string Genre,
+        string GenreSourceType,
+        string GenreConfidence,
+        string GenreRationale,
+        string OriginalDate,
+        string ReleaseDate,
+        string? Label,
+        string? CatalogNumber,
+        string? Barcode,
+        string? ReleaseCountry,
+        IReadOnlyList<string> Sources,
+        IReadOnlyList<string> Warnings,
+        IReadOnlyList<string> MissingFields);
     private sealed record LocalCover(string Path, string Source);
 
     [GeneratedRegex("^\\s*Area Information \\[\\d+\\]:", RegexOptions.Multiline | RegexOptions.IgnoreCase)]

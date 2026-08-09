@@ -475,18 +475,19 @@ public sealed class MainViewModel : NotifyBase, IDisposable
                 var fields = string.Join(", ", gaps.MissingFields);
                 var artworkOnly = gaps.MissingFields.Count > 0 &&
                                   gaps.MissingFields.All(field => field.Equals("COVER", StringComparison.OrdinalIgnoreCase));
+                var permitsIncompleteMetadata = scan.Mode == WorkflowMode.DsdExtraction || artworkOnly;
                 var codexPath = await PreflightService.FindOptionalCodexAsync(token);
                 if (codexPath is null || !File.Exists(codexPath))
                 {
-                    if (!artworkOnly)
-                        throw new InvalidOperationException($"Required metadata is missing ({fields}) and the optional Codex metadata agent is unavailable. Local results are preserved at {staged.AlbumRoot}.");
-                    uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "ARTWORK", Message: "Front-cover artwork is unavailable. The verified tracks will still be delivered as incomplete work and the source image will be retained."));
+                    if (!permitsIncompleteMetadata)
+                        throw new InvalidOperationException($"Required FLAC metadata is missing ({fields}) and the optional metadata agent is unavailable. Local results are preserved at {staged.AlbumRoot}.");
+                    uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: $"Optional metadata lookup is unavailable for {fields}. Verified tracks will still be delivered as incomplete work and the source image will be retained."));
                 }
                 if (!File.Exists(SkillPath))
                 {
-                    if (!artworkOnly)
-                        throw new InvalidOperationException($"Required metadata is missing ({fields}) and the Album Fixer skill is unavailable. Local results are preserved at {staged.AlbumRoot}.");
-                    uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "ARTWORK", Message: "The artwork helper is unavailable. The verified tracks will still be delivered as incomplete work."));
+                    if (!permitsIncompleteMetadata)
+                        throw new InvalidOperationException($"Required FLAC metadata is missing ({fields}) and the Album Fixer skill is unavailable. Local results are preserved at {staged.AlbumRoot}.");
+                    uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: $"The metadata helper is unavailable for {fields}. Verified tracks will still be delivered as incomplete work."));
                 }
 
                 if (codexPath is not null && File.Exists(codexPath) && File.Exists(SkillPath))
@@ -510,9 +511,9 @@ public sealed class MainViewModel : NotifyBase, IDisposable
                         if (metadataResult.LastProgress is not null) Report(metadataResult.LastProgress);
                         await EnsureWorkerSucceededAsync(metadataResult, "Metadata agent");
                     }
-                    catch (Exception error) when (artworkOnly && error is not OperationCanceledException)
+                    catch (Exception error) when (permitsIncompleteMetadata && error is not OperationCanceledException)
                     {
-                        uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "ARTWORK", Message: $"Artwork lookup did not complete ({error.Message}). Delivering the verified tracks as incomplete work."));
+                        uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: $"Metadata lookup did not complete ({error.Message}). Delivering the verified tracks as incomplete work and retaining the source image."));
                     }
                 }
             }
