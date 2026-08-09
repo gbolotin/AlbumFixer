@@ -13,6 +13,7 @@ try
     await ScannerPlansMultipleAlbums(root);
     await ScannerAcceptsMultipleImagesInOneAlbumFolder(root);
     await ScannerRecognizesAndCleansIncompletePreviousOutput(root);
+    await ScannerSkipsCompletedAlbumsWithDeletedSources(root);
     BatchPreflightSkipsBlockedAlbums();
     await BoundedBatchRunsConcurrentlyAndIsolatesFailures();
     PipelineLimitsScaleWithHardwareAndCapacity();
@@ -36,7 +37,7 @@ try
     DiagnosticContractClassifies();
     await ReportSummaryLoads(root);
     CommandContractIsSandboxed(root);
-    Console.WriteLine("AlbumFixer.Core smoke tests passed (28/28).");
+    Console.WriteLine("AlbumFixer.Core smoke tests passed (29/29).");
     return 0;
 }
 catch (Exception error)
@@ -172,6 +173,83 @@ static async Task ScannerRecognizesAndCleansIncompletePreviousOutput(string root
     Assert(PreviousOutputCleanupService.Discover(traversal) is null && File.Exists(protectedFile), "A report path that escapes the legacy Tracks directory must never become a deletion target.");
 }
 
+static async Task ScannerSkipsCompletedAlbumsWithDeletedSources(string root)
+{
+    var batch = Path.Combine(root, "completed-album-batch");
+    var completed = Path.Combine(batch, "Completed Album");
+    var pending = Path.Combine(batch, "Pending Album");
+    Directory.CreateDirectory(completed);
+    Directory.CreateDirectory(pending);
+
+    await File.WriteAllBytesAsync(Path.Combine(completed, "01.flac"), [1, 2, 3]);
+    await File.WriteAllBytesAsync(Path.Combine(completed, "02.flac"), [4, 5, 6]);
+    await File.WriteAllTextAsync(Path.Combine(completed, "album.cue"), "FILE \"album.flac\" WAVE");
+    await File.WriteAllTextAsync(Path.Combine(completed, "conversion-report.json"), """
+    {
+      "workflow_mode": "flac_cue_split",
+      "discs": [{ "tracks": [{ "file": "01.flac" }, { "file": "02.flac" }] }],
+      "verification": { "status": "passed", "sources_deleted": true },
+      "commit": { "status": "completed" },
+      "deletion": { "status": "completed", "performed": true }
+    }
+    """);
+
+    await File.WriteAllBytesAsync(Path.Combine(pending, "album.flac"), [7, 8, 9]);
+    await File.WriteAllTextAsync(Path.Combine(pending, "album.cue"), "FILE \"album.flac\" WAVE");
+
+    var completedScan = await new AlbumScanner().ScanAsync(completed);
+    Assert(completedScan.Mode == WorkflowMode.Completed && !completedScan.RequiresProcessing,
+        "A verified album whose source was intentionally deleted must be recognized as already completed.");
+    Assert(completedScan.Errors.Count == 0,
+        "A preserved CUE must not report its intentionally deleted source as missing after successful completion.");
+
+    var completedSacd = Path.Combine(batch, "Completed SACD");
+    var completedSacdStereo = Path.Combine(completedSacd, "Stereo");
+    Directory.CreateDirectory(completedSacdStereo);
+    await File.WriteAllBytesAsync(Path.Combine(completedSacdStereo, "01.dsf"), [12, 13]);
+    await File.WriteAllBytesAsync(Path.Combine(completedSacdStereo, "02.dsf"), [14, 15]);
+    await File.WriteAllBytesAsync(Path.Combine(completedSacd, "cover.jpg"), [16]);
+    await File.WriteAllTextAsync(Path.Combine(completedSacd, "conversion-report.json"), """
+    {
+      "workflow_mode": "sacd_iso_extract",
+      "areas": [{ "area": "stereo", "tracks": [{ "file": "Stereo/01.dsf" }, { "file": "Stereo/02.dsf" }] }],
+      "cover": { "file": "cover.jpg" },
+      "verification": { "status": "passed", "sources_deleted": true },
+      "commit": { "status": "completed" },
+      "deletion": { "status": "completed", "performed": true }
+    }
+    """);
+    var completedSacdScan = await new AlbumScanner().ScanAsync(completedSacd);
+    Assert(completedSacdScan.Mode == WorkflowMode.Completed && !completedSacdScan.RequiresProcessing,
+        "A verified SACD extraction whose ISO was intentionally deleted must be recognized as already completed.");
+    Assert(completedSacdScan.Media.Count(item => item.Kind == "Previous Album Fixer output") == 2 && completedSacdScan.TrackCount == 0,
+        "Report-proven DSF outputs must not be misclassified as an existing-track repair job.");
+
+    var batchScan = await new AlbumScanner().ScanAsync(batch);
+    Assert(batchScan.Mode == WorkflowMode.MultipleAlbums,
+        "A completed album and a pending sibling must remain independently discoverable.");
+    var discovered = await new AlbumScanner().ScanAlbumsAsync(batch);
+    var pendingScans = discovered.Where(scan => scan.RequiresProcessing).ToArray();
+    Assert(discovered.Count == 3 && pendingScans.Length == 1 && pendingScans[0].AlbumRoot == pending,
+        "Completed albums must be omitted from the pending set before preflight.");
+
+    var unsafeCompleted = Path.Combine(root, "completed-report-with-unexpected-missing-source");
+    Directory.CreateDirectory(unsafeCompleted);
+    await File.WriteAllBytesAsync(Path.Combine(unsafeCompleted, "01.flac"), [10]);
+    await File.WriteAllBytesAsync(Path.Combine(unsafeCompleted, "02.flac"), [11]);
+    await File.WriteAllTextAsync(Path.Combine(unsafeCompleted, "album.cue"), "FILE \"album.flac\" WAVE");
+    await File.WriteAllTextAsync(Path.Combine(unsafeCompleted, "conversion-report.json"), """
+    {
+      "workflow_mode": "flac_cue_split",
+      "discs": [{ "tracks": [{ "file": "01.flac" }, { "file": "02.flac" }] }],
+      "verification": { "status": "passed", "sources_deleted": false }
+    }
+    """);
+    var unsafeScan = await new AlbumScanner().ScanAsync(unsafeCompleted);
+    Assert(unsafeScan.Mode != WorkflowMode.Completed && unsafeScan.Errors.Any(error => error.Contains("missing source", StringComparison.OrdinalIgnoreCase)),
+        "A missing source must remain a blocker unless the completed report confirms intentional deletion.");
+}
+
 static void BatchPreflightSkipsBlockedAlbums()
 {
     var readyScan = new ScanResult("C:\\Ready", "Ready", WorkflowMode.FlacCueSplit, [], [], [], 1, 1, 0, 1, true, false);
@@ -275,10 +353,20 @@ static async Task HostStagesAndVerifiesSource(string root)
     var preflight = new PreflightResult([], tempRoot, 0, long.MaxValue, tools);
     var staged = await new HostStagingService().StageAsync(scan, preflight, skill, job, new Progress<ProgressSnapshot>());
     var stagedSource = Path.Combine(staged.AlbumRoot, "album.flac");
-    Assert(File.Exists(stagedSource) && File.Exists(Path.Combine(staged.AlbumRoot, "album.cue")), "The album and CUE were not copied into local staging.");
-    Assert(staged.Sources.Count == 1 && staged.Sources[0].Sha256 == await HostStagingService.Sha256Async(stagedSource), "The staged source SHA-256 was not verified.");
+    var originalSource = Path.Combine(album, "album.flac");
+    Assert(!staged.SourceCacheUsed && staged.InputAlbumRoot == scan.AlbumRoot,
+        "A fixed local album must be read in place without a Windows Temp source cache.");
+    Assert(!File.Exists(stagedSource) && !File.Exists(Path.Combine(staged.AlbumRoot, "album.cue")),
+        "Local source media and sidecars must not be copied into the Windows Temp output workspace.");
+    Assert(staged.Sources.Count == 1 && staged.Sources[0].Sha256 == await HostStagingService.Sha256Async(originalSource),
+        "The in-place local source SHA-256 was not recorded.");
+    Assert(HostStagingService.RequiresSourceCache(@"\\server\share\album"), "A UNC album must use the verified Temp source cache.");
     Assert(File.Exists(staged.FfmpegPath) && File.Exists(staged.FfprobePath), "Required local audio tools were not staged.");
     Assert(string.IsNullOrEmpty(staged.SkillPath) && !Directory.Exists(Path.Combine(job, "skill")), "A complete local run must not stage the optional Codex skill.");
+    using var manifest = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(staged.ManifestPath));
+    Assert(!manifest.RootElement.GetProperty("source_cache_used").GetBoolean() &&
+           manifest.RootElement.GetProperty("sources")[0].GetProperty("copy_in_status").GetString() == "not_required_local_fixed_disk",
+        "The host manifest must record that local fixed-disk source caching was skipped.");
 }
 static async Task LocalSplitterRunsWithoutCodex(string root)
 {
@@ -314,16 +402,15 @@ static async Task LocalSplitterRunsWithoutCodex(string root)
     var job = Path.Combine(root, "local-split-job");
     var stagedAlbum = Path.Combine(job, "album");
     Directory.CreateDirectory(stagedAlbum);
-    File.Copy(source, Path.Combine(stagedAlbum, "album.flac"));
-    File.Copy(cue, Path.Combine(stagedAlbum, "album.cue"));
-    File.Copy(cover, Path.Combine(stagedAlbum, "front.jpg"));
-    var staged = new StagedJob(job, stagedAlbum, string.Empty, ffmpeg, ffprobe, Path.Combine(job, "host-manifest.json"), []);
+    var staged = new StagedJob(job, stagedAlbum, string.Empty, ffmpeg, ffprobe, Path.Combine(job, "host-manifest.json"), [],
+        SourceAlbumRoot: album, SourceCacheUsed: false);
     var result = await new LocalFlacProcessor().ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
 
     Assert(result.Tracks == 2 && !result.Metadata.RequiresResearch, "Complete local CUE metadata and artwork must split without Codex.");
     Assert(File.Exists(Path.Combine(stagedAlbum, "01 - First.flac")) &&
            File.Exists(Path.Combine(stagedAlbum, "02 - Second.flac")), "A single image must create both CUE tracks directly in the album folder.");
     Assert(File.Exists(Path.Combine(stagedAlbum, "cover.jpg")) && File.Exists(result.ReportPath), "The local cover or conversion report is missing.");
+    Assert(File.Exists(source) && File.Exists(cue) && File.Exists(cover), "In-place local inputs must remain untouched during processing.");
     var normalizedCover = await RunToolOutputAsync(ffprobe, "-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", Path.Combine(stagedAlbum, "cover.jpg"));
     Assert(normalizedCover.Trim() == "600x600" && new FileInfo(Path.Combine(stagedAlbum, "cover.jpg")).Length <= 1024 * 1024,
         "A large explicit front cover must be square and normalized to at most 600x600 and 1 MB.");

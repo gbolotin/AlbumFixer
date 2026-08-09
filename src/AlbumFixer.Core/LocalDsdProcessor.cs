@@ -41,7 +41,7 @@ public sealed partial class LocalDsdProcessor
             throw new InvalidOperationException("Verified SACD processing requires exactly one inventoried ISO source.");
 
         var source = staged.Sources[0];
-        var iso = HostStagingService.SafeCombine(staged.AlbumRoot, source.RelativePath);
+        var iso = HostStagingService.SafeCombine(staged.InputAlbumRoot, source.RelativePath);
         var workingDirectory = Path.GetDirectoryName(staged.SacdExtractPath)!;
         var toolHash = await HostStagingService.Sha256Async(staged.SacdExtractPath, token);
         var versionOutput = await RunProcessAsync(staged.SacdExtractPath, ["-v"], workingDirectory, null, token, allowNonzero: false);
@@ -49,7 +49,9 @@ public sealed partial class LocalDsdProcessor
             .FirstOrDefault(line => line.Contains("sacd_extract client", StringComparison.OrdinalIgnoreCase))?.Trim()
             ?? "sacd_extract version not reported";
 
-        progress.Report(Snapshot(JobPhase.Processing, 19, "Reading the verified local SACD layout."));
+        progress.Report(Snapshot(JobPhase.Processing, 19, staged.SourceCacheUsed
+            ? "Reading the verified Temp-cached SACD layout."
+            : "Reading the fixed-disk SACD ISO in place without a source-cache copy."));
         var layoutCommand = CommandText(staged.SacdExtractPath, ["-P", "-i", iso]);
         var layoutOutput = await RunProcessAsync(staged.SacdExtractPath, ["-P", "-i", iso], workingDirectory, null, token);
         var layoutPath = Path.Combine(staged.AlbumRoot, "sacd_extract-layout.txt");
@@ -67,7 +69,7 @@ public sealed partial class LocalDsdProcessor
             years.Edition,
             layout.CatalogNumber), token);
         var metadata = ResolveMetadata(scan.AlbumRoot, layout, years, external);
-        var cover = await PrepareCoverAsync(staged.AlbumRoot, token);
+        var cover = await PrepareCoverAsync(staged.InputAlbumRoot, staged.AlbumRoot, token);
         var reportAreas = new JsonArray();
         var allTrackReports = new List<JsonObject>();
         var totalTracks = 0;
@@ -244,6 +246,8 @@ public sealed partial class LocalDsdProcessor
             {
                 ["identifier"] = Path.GetFileName(staged.JobDirectory),
                 ["local_staging_used"] = true,
+                ["source_cache_used"] = staged.SourceCacheUsed,
+                ["source_input_mode"] = staged.SourceCacheUsed ? "verified_temp_cache" : "local_fixed_disk_in_place",
                 ["staging_path"] = staged.JobDirectory,
                 ["processor"] = "local_sacd_extract_sequential_areas"
             }
@@ -451,17 +455,17 @@ public sealed partial class LocalDsdProcessor
         return new(albumTitle, albumArtist, catalog?.Trim(), creationDate, areas);
     }
 
-    private static async Task<LocalCover> PrepareCoverAsync(string albumRoot, CancellationToken token)
+    private static async Task<LocalCover> PrepareCoverAsync(string sourceAlbumRoot, string outputAlbumRoot, CancellationToken token)
     {
-        var candidates = Directory.EnumerateFiles(albumRoot, "*", SearchOption.AllDirectories)
+        var candidates = Directory.EnumerateFiles(sourceAlbumRoot, "*", SearchOption.AllDirectories)
             .Where(path => new[] { ".jpg", ".jpeg" }.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase))
-            .OrderBy(path => CoverRank(albumRoot, path)).ThenBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
+            .OrderBy(path => CoverRank(sourceAlbumRoot, path)).ThenBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
         if (candidates.Length == 0) throw new InvalidDataException("SACD extraction requires local JPEG cover artwork.");
         var source = candidates[0];
-        var target = Path.Combine(albumRoot, "cover.jpg");
+        var target = Path.Combine(outputAlbumRoot, "cover.jpg");
         if (!source.Equals(target, StringComparison.OrdinalIgnoreCase)) File.Copy(source, target, overwrite: false);
         await Task.CompletedTask;
-        return new(target, $"local file: {JsonPath(HostStagingService.SafeRelative(albumRoot, source))}");
+        return new(target, $"local file: {JsonPath(HostStagingService.SafeRelative(sourceAlbumRoot, source))}");
     }
 
     private static int CoverRank(string root, string path)

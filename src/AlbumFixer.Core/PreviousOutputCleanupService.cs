@@ -16,6 +16,11 @@ public sealed record VerifiedOutputPlan(
     string AlbumRoot,
     string ReportPath,
     IReadOnlyList<PreviousOutputFile> Files);
+public sealed record CompletedOutputPlan(
+    string AlbumRoot,
+    string ReportPath,
+    string WorkflowMode,
+    IReadOnlyList<PreviousOutputFile> Files);
 
 public static class PreviousOutputCleanupService
 {
@@ -98,6 +103,57 @@ public static class PreviousOutputCleanupService
                 .OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             return files.Length == 0 ? null : new(root, reportPath, files);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+        catch (Exception error) when (error is InvalidOperationException or ArgumentException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    public static CompletedOutputPlan? DiscoverCompleted(string albumRoot)
+    {
+        var root = Path.GetFullPath(albumRoot);
+        var reportPath = Path.Combine(root, "conversion-report.json");
+        if (!File.Exists(reportPath)) return null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(reportPath));
+            var report = document.RootElement;
+            var workflow = Text(report, "workflow_mode");
+            if (workflow is null ||
+                !workflow.Equals("flac_cue_split", StringComparison.OrdinalIgnoreCase) &&
+                !workflow.Equals("sacd_iso_extract", StringComparison.OrdinalIgnoreCase)) return null;
+            var verification = Property(report, "verification", out var value) ? value : default;
+            if (verification.ValueKind != JsonValueKind.Object ||
+                !string.Equals(Text(verification, "status"), "passed", StringComparison.OrdinalIgnoreCase)) return null;
+            var sourcesDeleted = Flag(verification, "sources_deleted");
+            if (Property(report, "deletion", out var deletion) && deletion.ValueKind == JsonValueKind.Object)
+                sourcesDeleted = sourcesDeleted || Flag(deletion, "performed") ||
+                    string.Equals(Text(deletion, "status"), "completed", StringComparison.OrdinalIgnoreCase);
+            if (!sourcesDeleted) return null;
+
+            var hashes = CommitHashes(report);
+            var reportedPaths = EnumerateReportedOutputs(report)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (reportedPaths.Length == 0) return null;
+            var files = reportedPaths.Select(relative =>
+                {
+                    var normalized = NormalizeRelative(relative);
+                    var fullPath = HostStagingService.SafeCombine(root, normalized);
+                    hashes.TryGetValue(normalized, out var sha256);
+                    return new PreviousOutputFile(normalized, fullPath, sha256);
+                })
+                .OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            return files.All(file => File.Exists(file.FullPath))
+                ? new(root, reportPath, workflow, files)
+                : null;
         }
         catch (JsonException)
         {
@@ -223,6 +279,21 @@ public static class PreviousOutputCleanupService
             }
         }
 
+        if (Property(report, "areas", out var areas) && areas.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var area in areas.EnumerateArray())
+            {
+                if (!Property(area, "tracks", out var tracks) || tracks.ValueKind != JsonValueKind.Array) continue;
+                foreach (var track in tracks.EnumerateArray())
+                {
+                    var file = track.ValueKind == JsonValueKind.String
+                        ? track.GetString()
+                        : Text(track, "file");
+                    if (IsOutputPath(file)) yield return file!;
+                }
+            }
+        }
+
         if (Property(report, "cover", out var cover) && cover.ValueKind == JsonValueKind.Object)
         {
             var file = Text(cover, "file");
@@ -284,6 +355,13 @@ public static class PreviousOutputCleanupService
         Property(element, name, out var value)
             ? value.ValueKind == JsonValueKind.String ? value.GetString() : value.ToString()
             : null;
+
+    private static bool Flag(JsonElement element, string name)
+    {
+        if (!Property(element, name, out var value)) return false;
+        return value.ValueKind == JsonValueKind.True ||
+               value.ValueKind == JsonValueKind.String && bool.TryParse(value.GetString(), out var parsed) && parsed;
+    }
 
     private static bool Property(JsonElement element, string name, out JsonElement value)
     {

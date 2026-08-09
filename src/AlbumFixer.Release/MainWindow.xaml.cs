@@ -24,6 +24,11 @@ public partial class MainWindow : Window
         if (picker.ShowDialog(this) == true) await _viewModel.AddSourceFoldersAsync([picker.FolderName]);
     }
 
+    private async void RemoveSourceFolder_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: string folder }) await _viewModel.RemoveSourceFolderAsync(folder);
+    }
+
     private void SourceFolders_DragOver(object sender, DragEventArgs e)
     {
         var paths = e.Data.GetData(DataFormats.FileDrop) as string[];
@@ -56,14 +61,13 @@ public partial class MainWindow : Window
 
     private bool ConfirmStart()
     {
+        if (_viewModel.IsBatch || !_viewModel.IsSingleSacd && _viewModel.DeletesSourceAfterSuccess)
+            return true;
+
         var cleanup = _viewModel.PreviousOutputFileCount > 0
             ? $"\n\n{_viewModel.PreviousOutputFileCount} report-proven track file(s) from an incomplete earlier run will be deleted before staging; the prior report will be archived."
             : "";
-        var message = _viewModel.IsBatch ? $"""
-Album Fixer will move {_viewModel.RunnableAlbumCount} admitted albums through a hardware-aware bounded pipeline: {_viewModel.BatchPipelineDescription}. {_viewModel.AlbumCount - _viewModel.RunnableAlbumCount} blocked album(s) will be skipped. Every admitted album uses unique local and destination staging. SACD areas are extracted sequentially and verified independently; failed, canceled, blocked, or artwork-incomplete albums retain their originals.{cleanup}
-
-Start this {_viewModel.AlbumCount}-album batch?
-""" : _viewModel.IsSingleSacd ? $"""
+        var message = _viewModel.IsSingleSacd ? $"""
 Album Fixer will copy and SHA-256 verify the SACD ISO in local staging, extract every reported area to DSF, repeat each extraction independently, verify native DSD signal properties and unchanged audio payloads through tagging, then reverify the committed network paths. Only after every gate passes will it permanently delete the exact inventoried ISO.
 {cleanup}
 
@@ -79,7 +83,7 @@ Album Fixer found multiple FLAC images. It will create CD<n> folders, run quick 
 
 Start this run?
 """;
-        var title = _viewModel.IsBatch ? "Confirm parallel album batch" : _viewModel.IsSingleSacd ? "Confirm verified SACD extraction" : _viewModel.DeletesSourceAfterSuccess ? "Confirm source deletion" : "Confirm multi-image split";
+        var title = _viewModel.IsSingleSacd ? "Confirm verified SACD extraction" : _viewModel.DeletesSourceAfterSuccess ? "Confirm source deletion" : "Confirm multi-image split";
         return MessageBox.Show(this, message, title, MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes;
     }
 

@@ -19,7 +19,12 @@ public sealed record StagedJob(
     VerifiedOutputPlan? PreviousVerifiedOutput = null,
     string SacdExtractPath = "",
     BatchPipelineLimits? PipelineLimits = null,
-    BatchPipelineTelemetry? PipelineTelemetry = null);
+    BatchPipelineTelemetry? PipelineTelemetry = null,
+    string? SourceAlbumRoot = null,
+    bool SourceCacheUsed = true)
+{
+    public string InputAlbumRoot => SourceAlbumRoot ?? AlbumRoot;
+}
 public sealed record HostCommitResult(string ReportPath, int Tracks, bool SourcesDeleted, bool Incomplete = false);
 
 public sealed class HostStagingService
@@ -38,6 +43,8 @@ public sealed class HostStagingService
         var albumRoot = Path.Combine(jobDirectory, "album");
         var toolsRoot = Path.Combine(jobDirectory, "tools");
         var skillRoot = Path.Combine(jobDirectory, "skill");
+        var sourceCacheUsed = RequiresSourceCache(scan.AlbumRoot);
+        var inputAlbumRoot = sourceCacheUsed ? albumRoot : scan.AlbumRoot;
         Directory.CreateDirectory(albumRoot);
         Directory.CreateDirectory(toolsRoot);
 
@@ -71,30 +78,38 @@ public sealed class HostStagingService
             sourceHashes[source] = await Sha256Async(source, token);
         }
 
-        var albumFiles = EnumerateTree(scan.AlbumRoot)
-            .Where(path => !Path.GetRelativePath(scan.AlbumRoot, path).Equals("conversion-report.json", StringComparison.OrdinalIgnoreCase))
-            .Where(path => !directPreviousAudio.Contains(path))
-            .ToArray();
-        var totalBytes = Math.Max(1L, albumFiles.Sum(path => new FileInfo(path).Length));
-        long copiedBytes = 0;
-        var lastCopyPercent = -1;
-        progress.Report(Snapshot(JobPhase.CopyingIn, 2, "Copying the album to the local Windows Temp workspace."));
-        foreach (var source in albumFiles)
+        if (sourceCacheUsed)
         {
-            token.ThrowIfCancellationRequested();
-            var relative = SafeRelative(scan.AlbumRoot, source);
-            var destination = SafeCombine(albumRoot, relative);
-            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-            await CopyFileAsync(source, destination, bytes =>
+            var albumFiles = EnumerateTree(scan.AlbumRoot)
+                .Where(path => !Path.GetRelativePath(scan.AlbumRoot, path).Equals("conversion-report.json", StringComparison.OrdinalIgnoreCase))
+                .Where(path => !directPreviousAudio.Contains(path))
+                .ToArray();
+            var totalBytes = Math.Max(1L, albumFiles.Sum(path => new FileInfo(path).Length));
+            long copiedBytes = 0;
+            var lastCopyPercent = -1;
+            progress.Report(Snapshot(JobPhase.CopyingIn, 2, "Copying the network album into the Windows Temp source cache."));
+            foreach (var source in albumFiles)
             {
-                copiedBytes += bytes;
-                var percent = 2 + (int)Math.Min(13, copiedBytes * 13 / totalBytes);
-                if (percent != lastCopyPercent)
+                token.ThrowIfCancellationRequested();
+                var relative = SafeRelative(scan.AlbumRoot, source);
+                var destination = SafeCombine(albumRoot, relative);
+                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                await CopyFileAsync(source, destination, bytes =>
                 {
-                    lastCopyPercent = percent;
-                    progress.Report(Snapshot(JobPhase.CopyingIn, percent, $"Copying locally: {relative}"));
-                }
-            }, token);
+                    copiedBytes += bytes;
+                    var percent = 2 + (int)Math.Min(13, copiedBytes * 13 / totalBytes);
+                    if (percent != lastCopyPercent)
+                    {
+                        lastCopyPercent = percent;
+                        progress.Report(Snapshot(JobPhase.CopyingIn, percent, $"Caching locally: {relative}"));
+                    }
+                }, token);
+            }
+        }
+        else
+        {
+            progress.Report(Snapshot(JobPhase.CopyingIn, 15,
+                "The source is on a fixed local disk; no source files were copied into the Windows Temp cache."));
         }
 
         var stagedSources = new List<StagedSource>();
@@ -102,15 +117,20 @@ public sealed class HostStagingService
         {
             token.ThrowIfCancellationRequested();
             var relative = SafeRelative(scan.AlbumRoot, source);
-            var localPath = SafeCombine(albumRoot, relative);
-            var localHash = await Sha256Async(localPath, token);
             var originalHash = sourceHashes[source];
             var size = new FileInfo(source).Length;
-            if (new FileInfo(localPath).Length != size || !localHash.Equals(originalHash, StringComparison.OrdinalIgnoreCase))
-                throw new IOException($"The local copy of '{relative}' does not match the original SHA-256. The original was retained.");
+            if (sourceCacheUsed)
+            {
+                var localPath = SafeCombine(albumRoot, relative);
+                var localHash = await Sha256Async(localPath, token);
+                if (new FileInfo(localPath).Length != size || !localHash.Equals(originalHash, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException($"The local copy of '{relative}' does not match the original SHA-256. The original was retained.");
+            }
             stagedSources.Add(new(relative, size, originalHash));
         }
-        progress.Report(Snapshot(JobPhase.SourceCopyVerified, 17, "The local source copy matches the original size and SHA-256."));
+        progress.Report(Snapshot(JobPhase.SourceCopyVerified, 17, sourceCacheUsed
+            ? "The Windows Temp source cache matches the original size and SHA-256."
+            : "The fixed-disk source will be read in place; its original size and SHA-256 were recorded."));
 
         var ffprobe = RequireTool(preflight, "ffprobe");
         var ffmpeg = scan.HasFlac ? RequireTool(preflight, "ffmpeg") : string.Empty;
@@ -135,6 +155,8 @@ public sealed class HostStagingService
             job_id = Path.GetFileName(jobDirectory),
             original_album_root = scan.AlbumRoot,
             staged_album_root = albumRoot,
+            source_album_root = inputAlbumRoot,
+            source_cache_used = sourceCacheUsed,
             created_at_utc = DateTimeOffset.UtcNow,
             previous_output_cleanup = previousOutputCleanup is null ? null : new
             {
@@ -153,14 +175,30 @@ public sealed class HostStagingService
                 path = source.RelativePath,
                 size = source.Size,
                 original_sha256 = source.Sha256,
-                staged_sha256 = source.Sha256,
-                copy_in_status = "verified"
+                staged_sha256 = sourceCacheUsed ? source.Sha256 : null,
+                copy_in_status = sourceCacheUsed ? "verified" : "not_required_local_fixed_disk"
             })
         };
         await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false), token);
 
         return new(jobDirectory, albumRoot, string.Empty, stagedFfmpeg, stagedFfprobe, manifestPath, stagedSources,
-            previousOutputCleanup, previousVerifiedOutput, stagedSacdExtract);
+            previousOutputCleanup, previousVerifiedOutput, stagedSacdExtract,
+            SourceAlbumRoot: inputAlbumRoot, SourceCacheUsed: sourceCacheUsed);
+    }
+
+    public static bool RequiresSourceCache(string albumRoot)
+    {
+        try
+        {
+            var fullPath = Path.GetFullPath(albumRoot);
+            if (fullPath.StartsWith(@"\\", StringComparison.OrdinalIgnoreCase)) return true;
+            var root = Path.GetPathRoot(fullPath);
+            return string.IsNullOrWhiteSpace(root) || new DriveInfo(root).DriveType != DriveType.Fixed;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return true;
+        }
     }
 
     public async Task<string> StageSkillAsync(string skillPath, string jobDirectory, CancellationToken token = default)
@@ -274,6 +312,8 @@ public sealed class HostCommitService
         if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.DsdExtraction)
             throw new NotSupportedException("Verified host write-back is available for FLAC + CUE and SACD ISO workflows only. Every original was retained.");
         var isDsd = scan.Mode == WorkflowMode.DsdExtraction;
+        if (!staged.SourceCacheUsed)
+            await VerifyOriginalSourcesUnchangedAsync(scan, staged, token);
 
         var localReportPath = Path.Combine(staged.AlbumRoot, "conversion-report.json");
         if (!File.Exists(localReportPath)) throw new FileNotFoundException("The local processor did not create the required conversion report.", localReportPath);
@@ -385,7 +425,9 @@ public sealed class HostCommitService
             job["original_album_root"] = scan.AlbumRoot;
             job["local_staging_path"] = staged.JobDirectory;
             job["host_copy_in_manifest"] = staged.ManifestPath;
-            job["copy_in_status"] = "verified";
+            job["source_cache_used"] = staged.SourceCacheUsed;
+            job["source_input_mode"] = staged.SourceCacheUsed ? "verified_temp_cache" : "local_fixed_disk_in_place";
+            job["copy_in_status"] = staged.SourceCacheUsed ? "verified" : "not_required_local_fixed_disk";
             job["copy_back_status"] = "verified";
             if (staged.PipelineLimits is { } limits)
             {
@@ -458,7 +500,9 @@ public sealed class HostCommitService
         if (isDsd) ConfirmDsdVerification(report, "final album path", deletesSource);
         else SetQuickVerification(report, "final album path", deletesSource, finalIncompleteIssues);
         token.ThrowIfCancellationRequested();
-        var deletionTargets = deletesSource ? ResolveDeletionTargets(scan, staged, isDsd) : [];
+        IReadOnlyList<DeletionTarget> deletionTargets = deletesSource
+            ? await ResolveDeletionTargetsAsync(scan, staged, isDsd, token)
+            : [];
         var deletion = new JsonObject
         {
             ["status"] = deletesSource ? "pending" : "retained",
@@ -765,7 +809,31 @@ public sealed class HostCommitService
     private static string? Text(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
-    private static IReadOnlyList<DeletionTarget> ResolveDeletionTargets(ScanResult scan, StagedJob staged, bool isDsd)
+    private static async Task VerifyOriginalSourcesUnchangedAsync(
+        ScanResult scan,
+        StagedJob staged,
+        CancellationToken token)
+    {
+        foreach (var source in staged.Sources)
+        {
+            token.ThrowIfCancellationRequested();
+            var fullPath = HostStagingService.SafeCombine(scan.AlbumRoot, source.RelativePath);
+            if (!File.Exists(fullPath))
+                throw new FileNotFoundException("An inventoried source disappeared during the run.", fullPath);
+            var info = new FileInfo(fullPath);
+            if (info.Length != source.Size)
+                throw new IOException($"The original source size changed during the run: {source.RelativePath}. It was retained.");
+            var hash = await HostStagingService.Sha256Async(fullPath, token);
+            if (!hash.Equals(source.Sha256, StringComparison.OrdinalIgnoreCase))
+                throw new IOException($"The original source SHA-256 changed during the run: {source.RelativePath}. It was retained.");
+        }
+    }
+
+    private static async Task<IReadOnlyList<DeletionTarget>> ResolveDeletionTargetsAsync(
+        ScanResult scan,
+        StagedJob staged,
+        bool isDsd,
+        CancellationToken token)
     {
         if (staged.Sources.Count != 1)
             throw new InvalidOperationException($"Automatic source deletion requires exactly one inventoried image; found {staged.Sources.Count}.");
@@ -780,13 +848,11 @@ public sealed class HostCommitService
                 item.RelativePath.Equals(source.RelativePath, StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException("The deletion target is not the source image identified by the read-only inventory.");
 
+        await VerifyOriginalSourcesUnchangedAsync(scan, staged, token);
         var fullPath = HostStagingService.SafeCombine(scan.AlbumRoot, source.RelativePath);
-        if (!File.Exists(fullPath)) throw new FileNotFoundException("The inventoried original FLAC image is already missing.", fullPath);
         var info = new FileInfo(fullPath);
         if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
             throw new IOException("Album Fixer will not delete a reparse-point source.");
-        if (info.Length != source.Size)
-            throw new IOException("The original FLAC image size changed during the run; it was not deleted.");
         return [new(source.RelativePath, fullPath)];
     }
 

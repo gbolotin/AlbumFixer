@@ -25,6 +25,7 @@ public static class HostReportWriter
     {
         var normalizedStatus = status.Equals("canceled", StringComparison.OrdinalIgnoreCase) ? "canceled" : "failed";
         var now = DateTimeOffset.UtcNow;
+        var sourceCacheUsed = HostStagingService.RequiresSourceCache(scan.AlbumRoot);
         var report = new
         {
             schema_version = "1.0",
@@ -51,6 +52,9 @@ public static class HostReportWriter
                 identifier = Path.GetFileName(jobDirectory.TrimEnd(Path.DirectorySeparatorChar)),
                 owner = scan.AlbumRoot,
                 local_staging_used = true,
+                source_cache_used = sourceCacheUsed,
+                source_input_mode = sourceCacheUsed ? "verified_temp_cache" : "local_fixed_disk_in_place",
+                copy_in_status = sourceCacheUsed ? "incomplete_or_unverified" : "not_required_local_fixed_disk",
                 staging_path = jobDirectory,
                 thread_id = threadId,
                 codex_exit_code = exitCode,
@@ -132,6 +136,7 @@ public static class HostReportWriter
         WorkflowMode.ExistingTrackRepair => "existing_track_repair",
         WorkflowMode.MultipleAlbums => "multiple_albums",
         WorkflowMode.NeedsInspection => "needs_inspection",
+        WorkflowMode.Completed => "completed",
         _ => "unsupported"
     };
 }

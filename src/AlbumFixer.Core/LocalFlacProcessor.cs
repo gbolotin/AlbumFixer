@@ -36,10 +36,13 @@ public sealed class LocalFlacProcessor
         if (scan.Mode != WorkflowMode.FlacCueSplit)
             throw new NotSupportedException("The deterministic local processor currently supports FLAC + CUE image splits only.");
 
-        progress.Report(Snapshot(JobPhase.Processing, 19, "Reading the staged CUE locally. No Codex process is needed for splitting."));
-        var cuePaths = Directory.EnumerateFiles(staged.AlbumRoot, "*.cue", SearchOption.AllDirectories)
-            .OrderBy(path => CueSortKey(staged.AlbumRoot, path), StringComparer.OrdinalIgnoreCase)
-            .ThenBy(path => HostStagingService.SafeRelative(staged.AlbumRoot, path), StringComparer.OrdinalIgnoreCase)
+        var inputAlbumRoot = staged.InputAlbumRoot;
+        progress.Report(Snapshot(JobPhase.Processing, 19, staged.SourceCacheUsed
+            ? "Reading the verified Temp-cached CUE locally. No Codex process is needed for splitting."
+            : "Reading the fixed-disk CUE in place. No source-cache copy or Codex process is needed for splitting."));
+        var cuePaths = Directory.EnumerateFiles(inputAlbumRoot, "*.cue", SearchOption.AllDirectories)
+            .OrderBy(path => CueSortKey(inputAlbumRoot, path), StringComparer.OrdinalIgnoreCase)
+            .ThenBy(path => HostStagingService.SafeRelative(inputAlbumRoot, path), StringComparer.OrdinalIgnoreCase)
             .ToArray();
         if (cuePaths.Length == 0)
             throw new InvalidOperationException("The local splitter requires at least one CUE sheet.");
@@ -52,9 +55,9 @@ public sealed class LocalFlacProcessor
         {
             token.ThrowIfCancellationRequested();
             var cue = await ParseCueAsync(cuePaths[index], token);
-            var source = ResolveSource(staged.AlbumRoot, cuePaths[index], cue.SourceFiles);
+            var source = ResolveSource(inputAlbumRoot, cuePaths[index], cue.SourceFiles);
             if (!sources.Add(source))
-                throw new InvalidDataException($"More than one CUE sheet references the same FLAC image: {HostStagingService.SafeRelative(staged.AlbumRoot, source)}.");
+                throw new InvalidDataException($"More than one CUE sheet references the same FLAC image: {HostStagingService.SafeRelative(inputAlbumRoot, source)}.");
             var probe = await ProbeAudioAsync(staged.FfprobePath, source, token);
             ValidateBoundaries(cue.Tracks, probe.SampleRate, probe.TotalSamples);
             inputs.Add(new(cue, source, probe, ResolveMetadata(scan, cue)));
@@ -72,7 +75,11 @@ public sealed class LocalFlacProcessor
             var input = inputs[index];
             var discNumber = index + 1;
             var sourceDirectory = Path.GetDirectoryName(input.Source)!;
-            var outputRoot = useCdFolders ? Path.Combine(sourceDirectory, $"CD{discNumber}") : sourceDirectory;
+            var sourceDirectoryRelative = HostStagingService.SafeRelative(inputAlbumRoot, sourceDirectory);
+            var stagedSourceDirectory = sourceDirectoryRelative.Equals(".", StringComparison.Ordinal)
+                ? staged.AlbumRoot
+                : HostStagingService.SafeCombine(staged.AlbumRoot, sourceDirectoryRelative);
+            var outputRoot = useCdFolders ? Path.Combine(stagedSourceDirectory, $"CD{discNumber}") : stagedSourceDirectory;
             HostStagingService.SafeRelative(staged.AlbumRoot, outputRoot);
             var outputs = BuildOutputs(input.Cue.Tracks, outputRoot);
             EnsureOutputsAvailable(outputs, staged.AlbumRoot);
@@ -192,7 +199,7 @@ public sealed class LocalFlacProcessor
     {
         var candidate = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(cuePath)!, sourceFiles[0]));
         HostStagingService.SafeRelative(albumRoot, candidate);
-        if (!File.Exists(candidate)) throw new FileNotFoundException("The staged CUE source does not exist.", candidate);
+        if (!File.Exists(candidate)) throw new FileNotFoundException("The CUE source does not exist.", candidate);
         if (!Path.GetExtension(candidate).Equals(".flac", StringComparison.OrdinalIgnoreCase))
             throw new NotSupportedException("The deterministic local CUE splitter currently accepts FLAC sources only.");
         return candidate;
@@ -270,9 +277,10 @@ public sealed class LocalFlacProcessor
 
     private static async Task<CoverPreparation> PrepareCoverAsync(StagedJob staged, CancellationToken token)
     {
-        var candidates = Directory.EnumerateFiles(staged.AlbumRoot, "*", SearchOption.AllDirectories)
+        var inputAlbumRoot = staged.InputAlbumRoot;
+        var candidates = Directory.EnumerateFiles(inputAlbumRoot, "*", SearchOption.AllDirectories)
             .Where(path => new[] { ".jpg", ".jpeg", ".png" }.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase))
-            .Where(path => !HostStagingService.SafeRelative(staged.AlbumRoot, path).StartsWith($"Tracks{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+            .Where(path => !HostStagingService.SafeRelative(inputAlbumRoot, path).StartsWith($"Tracks{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
             .OrderBy(CoverRank)
             .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -294,7 +302,7 @@ public sealed class LocalFlacProcessor
             if (derivesBookletPanel)
             {
                 if (sourceSize.Width < sourceSize.Height * 3 / 2)
-                    return new(null, $"The first booklet scan is not a recognizable landscape cover spread: {JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, source))}.");
+                    return new(null, $"The first booklet scan is not a recognizable landscape cover spread: {JsonPath(HostStagingService.SafeRelative(inputAlbumRoot, source))}.");
                 var crop = Math.Min(sourceSize.Height, sourceSize.Width / 2);
                 var output = Math.Min(crop, MaximumPreparedCoverDimension);
                 filter = $"crop={crop}:{crop}:{sourceSize.Width - crop}:0,scale={output}:{output}";
@@ -319,7 +327,7 @@ public sealed class LocalFlacProcessor
 
             File.Move(temporary, target, overwrite: true);
             var preparedSize = await ProbeImageAsync(staged.FfprobePath, target, token);
-            var relative = JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, source));
+            var relative = JsonPath(HostStagingService.SafeRelative(inputAlbumRoot, source));
             var sourceDescription = derivesBookletPanel
                 ? $"local file: {relative} (right-side front-panel crop; normalized JPEG)"
                 : $"local file: {relative} (normalized JPEG)";
@@ -546,7 +554,7 @@ public sealed class LocalFlacProcessor
             discReports.Add(new JsonObject
             {
                 ["disc"] = disc.Number,
-                ["source"] = JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, disc.Source)),
+                ["source"] = JsonPath(HostStagingService.SafeRelative(staged.InputAlbumRoot, disc.Source)),
                 ["tracks"] = tracks
             });
         }
@@ -577,6 +585,8 @@ public sealed class LocalFlacProcessor
             {
                 ["identifier"] = Path.GetFileName(staged.JobDirectory),
                 ["local_staging_used"] = true,
+                ["source_cache_used"] = staged.SourceCacheUsed,
+                ["source_input_mode"] = staged.SourceCacheUsed ? "verified_temp_cache" : "local_fixed_disk_in_place",
                 ["staging_path"] = staged.JobDirectory,
                 ["processor"] = discs.Count == 1 ? "local_ffmpeg_single_process" : "local_ffmpeg_sequential_disc_processes"
             }
