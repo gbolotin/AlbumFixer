@@ -8,66 +8,124 @@
   <Grid Background="{StaticResource Bg}"><Grid.RowDefinitions><RowDefinition Height="68"/><RowDefinition/></Grid.RowDefinitions>
     <Border Background="#0E151D" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1"><Grid Margin="24,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><StackPanel Orientation="Horizontal" VerticalAlignment="Center"><Border Width="40" Height="40" CornerRadius="10" Background="{StaticResource MintDark}" Margin="0,0,13,0"><TextBlock Text="♫" Foreground="{StaticResource Mint}" FontSize="23" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><StackPanel VerticalAlignment="Center"><TextBlock Text="Album Fixer" FontWeight="SemiBold" FontSize="20"/><TextBlock Text="Verified library repair · every album is a transaction" Foreground="{StaticResource Muted}" FontSize="12"/></StackPanel></StackPanel><Border Grid.Column="1" Background="#17242D" CornerRadius="12" Padding="10,5" VerticalAlignment="Center"><TextBlock Text="ALBUM-FIXER SKILL" Foreground="{StaticResource Mint}" FontSize="10" FontWeight="Bold"/></Border></Grid></Border>
     <Grid Grid.Row="1" Margin="20"><Grid.ColumnDefinitions><ColumnDefinition Width="360"/><ColumnDefinition Width="16"/><ColumnDefinition/></Grid.ColumnDefinitions>
-      <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel>
-        <Border Style="{StaticResource CardStyle}" Margin="0,0,0,13">
-          <StackPanel>
-            <TextBlock Text="SOURCE FOLDERS" Foreground="{StaticResource Muted}" FontSize="10" FontWeight="Bold" Margin="0,0,0,9"/>
-            <Border Background="#0E161F" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6" Padding="9" MinHeight="74"
-                    AllowDrop="True" IsEnabled="{Binding CanBrowse}" DragOver="SourceFolders_DragOver" Drop="SourceFolders_Drop">
-              <Grid>
-                <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-                <ScrollViewer MaxHeight="126" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                  <ItemsControl ItemsSource="{Binding SourceFolders}">
-                    <ItemsControl.ItemTemplate>
-                      <DataTemplate>
-                        <Border BorderBrush="#253644" BorderThickness="0,0,0,1" Padding="0,4">
-                          <Grid>
-                            <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                            <TextBlock Text="{Binding}" ToolTip="{Binding}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                            <Button Grid.Column="1" Tag="{Binding}" Click="RemoveSourceFolder_Click" Width="24" Height="24" Padding="4"
-                                    ToolTip="Remove source folder" AutomationProperties.Name="Remove source folder" Focusable="False">
-                              <Button.Style>
-                                <Style TargetType="Button">
-                                  <Setter Property="Background" Value="Transparent"/>
-                                  <Setter Property="BorderThickness" Value="0"/>
-                                  <Setter Property="Cursor" Value="Hand"/>
-                                  <Style.Triggers>
-                                    <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#3A1D22"/></Trigger>
-                                  </Style.Triggers>
-                                </Style>
-                              </Button.Style>
-                              <Image Source="Assets/Remove.png" Width="16" Height="16" Stretch="Uniform" SnapsToDevicePixels="True"/>
-                            </Button>
-                          </Grid>
-                        </Border>
-                      </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                  </ItemsControl>
-                </ScrollViewer>
-                <TextBlock Grid.Row="1" Text="Browse or drag album / parent folders here. Each is scanned recursively."
-                           Foreground="{StaticResource Muted}" FontSize="10" Margin="0,7,0,0" TextWrapping="Wrap"/>
-              </Grid>
-            </Border>
-            <Grid Margin="0,9,0,0">
-              <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-              <Button Content="+ Add" Click="Browse_Click" IsEnabled="{Binding CanBrowse}" Style="{StaticResource ButtonStyle}" Padding="11,8"/>
-              <Button Grid.Column="1" Content="Clear" Command="{Binding ClearSourceFoldersCommand}" Style="{StaticResource ButtonStyle}" Margin="7,0,0,0" Padding="11,8"/>
+      <Border Style="{StaticResource CardStyle}">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <TextBlock Text="SOURCE FOLDERS" Foreground="{StaticResource Muted}" FontSize="10" FontWeight="Bold" Margin="0,0,0,9"/>
+          <Border Grid.Row="1" Background="#0E161F" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6" Padding="9" MinHeight="74"
+                  AllowDrop="True" IsEnabled="{Binding CanBrowse}" DragOver="SourceFolders_DragOver" Drop="SourceFolders_Drop">
+            <Grid>
+              <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+              <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <ItemsControl ItemsSource="{Binding SourceFolders}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                      <Border BorderBrush="#253644" BorderThickness="0,0,0,1" Padding="0,4">
+                        <Grid>
+                          <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                          <TextBlock Text="{Binding}" ToolTip="{Binding}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                          <Button Grid.Column="1" Tag="{Binding}" Click="RemoveSourceFolder_Click" Width="24" Height="24" Padding="4"
+                                  ToolTip="Remove source folder" AutomationProperties.Name="Remove source folder" Focusable="False">
+                            <Button.Style>
+                              <Style TargetType="Button">
+                                <Setter Property="Background" Value="Transparent"/>
+                                <Setter Property="BorderThickness" Value="0"/>
+                                <Setter Property="Cursor" Value="Hand"/>
+                                <Style.Triggers>
+                                  <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#3A1D22"/></Trigger>
+                                </Style.Triggers>
+                              </Style>
+                            </Button.Style>
+                            <Image Source="Assets/Remove.png" Width="16" Height="16" Stretch="Uniform" SnapsToDevicePixels="True"/>
+                          </Button>
+                        </Grid>
+                      </Border>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </ScrollViewer>
+              <TextBlock Grid.Row="1" Text="Browse or drag album / parent folders here. Each is scanned recursively."
+                         Foreground="{StaticResource Muted}" FontSize="10" Margin="0,7,0,0" TextWrapping="Wrap"/>
             </Grid>
-            <Button Content="Scan albums" Command="{Binding ScanCommand}" Style="{StaticResource ButtonStyle}" Margin="0,9,0,0"/>
-            <Border BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Margin="0,15,0,0" Padding="0,13,0,0">
-              <StackPanel>
-                <TextBlock Text="{Binding AlbumName}" FontSize="16" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-                <TextBlock Text="{Binding Workflow}" Foreground="{StaticResource Mint}" Margin="0,3,0,0"/>
-                <TextBlock Text="{Binding Inventory}" Foreground="{StaticResource Muted}" Margin="0,7,0,0"/>
-                <TextBlock Text="{Binding SourceSize, StringFormat=Source material: {0}}" Foreground="{StaticResource Muted}"/>
+          </Border>
+          <Grid Grid.Row="2" Margin="0,9,0,0">
+            <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <Button Content="+ Add" Click="Browse_Click" IsEnabled="{Binding CanBrowse}" Style="{StaticResource ButtonStyle}" Padding="11,8"/>
+            <Button Grid.Column="1" Content="Clear" Command="{Binding ClearSourceFoldersCommand}" Style="{StaticResource ButtonStyle}" Margin="7,0,0,0" Padding="11,8"/>
+          </Grid>
+          <Button Grid.Row="3" Content="Scan albums" Command="{Binding ScanCommand}" Style="{StaticResource ButtonStyle}" Margin="0,9,0,0"/>
+          <Border Grid.Row="4" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Margin="0,15,0,0" Padding="0,13,0,0">
+            <StackPanel>
+              <TextBlock Text="{Binding AlbumName}" FontSize="16" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+              <TextBlock Text="{Binding Workflow}" Foreground="{StaticResource Mint}" Margin="0,3,0,0"/>
+              <TextBlock Text="{Binding Inventory}" Foreground="{StaticResource Muted}" Margin="0,7,0,0"/>
+              <TextBlock Text="{Binding SourceSize, StringFormat=Source material: {0}}" Foreground="{StaticResource Muted}"/>
+            </StackPanel>
+          </Border>
+        </Grid>
+      </Border>
+      <Grid Grid.Column="2"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="13"/><RowDefinition/></Grid.RowDefinitions>
+        <Border Style="{StaticResource CardStyle}" Padding="22">
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="96"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <Border Width="76" Height="76" CornerRadius="38" Background="{StaticResource MintDark}">
+              <StackPanel VerticalAlignment="Center">
+                <TextBlock Text="{Binding Progress, Mode=OneWay, StringFormat={}{0:0}%}" Foreground="{StaticResource Mint}" FontSize="21" FontWeight="Bold" HorizontalAlignment="Center"/>
+                <TextBlock Text="PROGRESS" Foreground="{StaticResource Muted}" FontSize="8" HorizontalAlignment="Center"/>
               </StackPanel>
             </Border>
-          </StackPanel>
+            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+              <TextBlock Text="{Binding StatusTitle}" FontSize="21" FontWeight="SemiBold"/>
+              <TextBlock Text="{Binding StatusDetail}" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,4,0,12" MaxHeight="44"/>
+              <ProgressBar Value="{Binding Progress, Mode=OneWay}" Maximum="100" Height="7"/>
+            </StackPanel>
+            <Button Grid.Column="2" MinWidth="96" Margin="22,0,0,0" VerticalAlignment="Center">
+              <Button.Resources>
+                <DataTemplate x:Key="StartButtonContentTemplate">
+                  <StackPanel Orientation="Horizontal">
+                    <Path Data="M 2,1 L 13,7.5 L 2,14 Z" Width="14" Height="14" Stretch="Uniform" Margin="0,0,8,0"
+                          Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+                    <TextBlock Text="{Binding}" VerticalAlignment="Center"
+                               Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+                  </StackPanel>
+                </DataTemplate>
+                <DataTemplate x:Key="CancelButtonContentTemplate">
+                  <StackPanel Orientation="Horizontal">
+                    <Path Data="M 2,2 L 13,13 M 13,2 L 2,13" Width="14" Height="14" Stretch="Uniform" Margin="0,0,8,0"
+                          Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2.25"
+                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                    <TextBlock Text="{Binding}" VerticalAlignment="Center"
+                               Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+                  </StackPanel>
+                </DataTemplate>
+              </Button.Resources>
+              <Button.Style>
+                <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                  <Setter Property="Content" Value="Start"/>
+                  <Setter Property="ContentTemplate" Value="{StaticResource StartButtonContentTemplate}"/>
+                  <Setter Property="Command" Value="{Binding StartCommand}"/>
+                  <Setter Property="AutomationProperties.Name" Value="Start"/>
+                  <Style.Triggers>
+                    <DataTrigger Binding="{Binding IsRunActive}" Value="True">
+                      <Setter Property="Content" Value="Cancel"/>
+                      <Setter Property="ContentTemplate" Value="{StaticResource CancelButtonContentTemplate}"/>
+                      <Setter Property="Command" Value="{Binding CancelCommand}"/>
+                      <Setter Property="AutomationProperties.Name" Value="Cancel"/>
+                      <Setter Property="Background" Value="{StaticResource Red}"/>
+                      <Setter Property="Foreground" Value="#2A0808"/>
+                    </DataTrigger>
+                  </Style.Triggers>
+                </Style>
+              </Button.Style>
+            </Button>
+          </Grid>
         </Border>
-        <Border Style="{StaticResource CardStyle}"><StackPanel><TextBlock Text="SOURCE ACTION" Foreground="{StaticResource Muted}" FontSize="10" FontWeight="Bold" Margin="0,0,0,10"/><TextBlock Text="{Binding SourceActionTitle}" Foreground="{StaticResource Text}" FontWeight="SemiBold"/><TextBlock Text="{Binding SourceActionDetail}" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,7,0,13"/><Button Content="{Binding StartActionLabel}" Command="{Binding StartCommand}" Style="{StaticResource PrimaryButton}"/><Button Content="Cancel run" Command="{Binding CancelCommand}" Style="{StaticResource ButtonStyle}" Margin="0,7,0,0"/></StackPanel></Border>
-      </StackPanel></ScrollViewer>
-      <Grid Grid.Column="2"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="13"/><RowDefinition/></Grid.RowDefinitions>
-        <Border Style="{StaticResource CardStyle}" Padding="22"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="96"/><ColumnDefinition/></Grid.ColumnDefinitions><Border Width="76" Height="76" CornerRadius="38" Background="{StaticResource MintDark}"><StackPanel VerticalAlignment="Center"><TextBlock Text="{Binding Progress, Mode=OneWay, StringFormat={}{0:0}%}" Foreground="{StaticResource Mint}" FontSize="21" FontWeight="Bold" HorizontalAlignment="Center"/><TextBlock Text="PROGRESS" Foreground="{StaticResource Muted}" FontSize="8" HorizontalAlignment="Center"/></StackPanel></Border><StackPanel Grid.Column="1" VerticalAlignment="Center"><TextBlock Text="{Binding StatusTitle}" FontSize="21" FontWeight="SemiBold"/><TextBlock Text="{Binding StatusDetail}" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,4,0,12" MaxHeight="44"/><ProgressBar Value="{Binding Progress, Mode=OneWay}" Maximum="100" Height="7"/></StackPanel></Grid></Border>
         <Border Grid.Row="2" Style="{StaticResource CardStyle}" Padding="0"><TabControl Background="Transparent" BorderThickness="0">
           <TabControl.Resources>
             <DataTemplate x:Key="StatusRowTemplate">
