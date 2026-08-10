@@ -17,9 +17,9 @@ Album Fixer is a native Windows app that locally splits FLAC+CUE images and extr
 - Before SACD extraction, searches MusicBrainz, MusicBrainz-linked public Discogs records, Apple Music, and authenticated Discogs search when `DISCOGS_TOKEN` is configured. Exact-edition fields require conservative artist/title/format/year/track-count matching; every used source and lookup warning is recorded.
 - Places tracks directly beside the source for a single FLAC+CUE image. When several FLAC+CUE images share the selected album folder, places their tracks in deterministic `CD1`, `CD2`, … subfolders.
 - After every track exists, reads the metadata-gap handoff. Complete local/external metadata skips Codex entirely; only named missing fields trigger Codex discovery, skill staging, and one metadata-only process. Failed or unavailable external research never discards a successful SACD extraction: tracks are delivered as incomplete work and the original ISO is retained.
-- Uses quick ffprobe container, required-tag, and embedded-artwork checks; writes through destination-side staging and compares SHA-256 copy hashes. Decoded PCM/MD5 comparison is skipped; a confirmed single source is deleted, while multiple sources are retained.
-- Shows phase progress, live activity, inventory, final verification status, output counts, source disposition, and formatted report JSON.
-- Source policy: a successful one-image FLAC+CUE run deletes the exact confirmed image after final quick checks. A successful single-SACD run deletes the exact ISO only after both extractions and final DSF/DSD, payload, tag, artwork, report-path, and copy-hash verification pass. Multi-image runs retain every original.
+- Uses quick ffprobe container, required-tag, and embedded-artwork checks; writes through destination-side staging and compares SHA-256 copy hashes. Decoded PCM/MD5 comparison is skipped; when **Delete originals** is selected, a confirmed single source is deleted, while multiple sources are retained. Clearing the option retains every original.
+- Shows phase progress with elapsed time, prioritizes currently active albums in the live album list, and includes live activity, inventory, final verification status, output counts, source disposition, and formatted report JSON.
+- Source policy: with **Delete originals** selected, a successful one-image FLAC+CUE run deletes the exact confirmed image after final quick checks. A successful single-SACD run deletes the exact ISO only after both extractions and final DSF/DSD, payload, tag, artwork, report-path, and copy-hash verification pass. Clearing the option, or processing a multi-image album, retains every original.
 - Retains sources whenever a job is failed, incomplete, canceled, uncertain, or missing required proof.
 
 ## Run
@@ -32,7 +32,7 @@ The packaged app is self-contained for 64-bit Windows and does not require a sep
 
 1. Add one or more album folders or parent folders. Each listed source is scanned recursively; duplicate or nested source selections are ignored.
 2. Select **Scan albums**. Review which albums are ready and which will be skipped; a blocked album does not block ready siblings.
-3. Review the source policy: each successful one-image FLAC album deletes only its exact original after quick checks; a SACD ISO requires two matching extractions and full DSD verification. Multi-image, failed, and canceled albums retain their originals.
+3. Choose whether **Delete originals** should remain selected, then review the source policy: each eligible one-image FLAC album deletes only its exact original after quick checks; a SACD ISO requires two matching extractions and full DSD verification. Clearing the option, or running a multi-image, failed, or canceled album, retains its originals.
 4. Select the start button. Album Fixer displays the hardware- and capacity-aware pipeline limits before starting; additional albums wait in bounded queues.
 5. Review global readiness in **Preflight**, follow each album's phase and percent in **Albums**, then review the timeline and **Report** tab.
 

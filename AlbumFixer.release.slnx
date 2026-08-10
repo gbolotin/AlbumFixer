@@ -1,1 +1,1 @@
-<Solution><Project Path="src/AlbumFixer.Core/AlbumFixer.Core.csproj"/><Project Path="src/AlbumFixer.Release/AlbumFixer.Release.csproj"/><Project Path="tests/AlbumFixer.Core.SmokeTests/AlbumFixer.Core.SmokeTests.csproj"/></Solution>
+<Solution><Project Path="src/AlbumFixer.App/AlbumFixer.App.csproj"/><Project Path="src/AlbumFixer.Core/AlbumFixer.Core.csproj"/><Project Path="tests/AlbumFixer.Core.SmokeTests/AlbumFixer.Core.SmokeTests.csproj"/></Solution>

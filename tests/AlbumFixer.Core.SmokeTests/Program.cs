@@ -23,7 +23,8 @@ try
     await LocalSplitterRunsWithoutCodex(root);
     await LocalSplitterCropsAndNormalizesBookletFront(root);
     await LocalSplitterCreatesCdFoldersForMultipleImages(root);
-    await HostCommitsVerifiedFlac(root);
+    await HostCommitsVerifiedFlac(root, deleteOriginals: true);
+    await HostCommitsVerifiedFlac(root, deleteOriginals: false);
     await HostReplacesVerifiedRootOutput(root);
     await HostCommitsMultipleImagesAndRetainsSources(root);
     await HostCommitsIncompleteFlacWithoutArtwork(root);
@@ -37,7 +38,7 @@ try
     DiagnosticContractClassifies();
     await ReportSummaryLoads(root);
     CommandContractIsSandboxed(root);
-    Console.WriteLine("AlbumFixer.Core smoke tests passed (29/29).");
+    Console.WriteLine("AlbumFixer.Core smoke tests passed (30/30).");
     return 0;
 }
 catch (Exception error)
@@ -533,11 +534,11 @@ static async Task<string> RunToolOutputAsync(string tool, params string[] argume
     if (process.ExitCode != 0) throw new InvalidOperationException($"{tool} failed: {error}");
     return output;
 }
-static async Task HostCommitsVerifiedFlac(string root)
+static async Task HostCommitsVerifiedFlac(string root, bool deleteOriginals)
 {
     const string installedSkill = @"C:\Users\gbolotin\.codex\skills\album-fixer\SKILL.md";
     if (!File.Exists(installedSkill)) return;
-    var destination = Path.Combine(root, "commit-destination"); Directory.CreateDirectory(destination);
+    var destination = Path.Combine(root, deleteOriginals ? "commit-destination" : "commit-retain-original"); Directory.CreateDirectory(destination);
     var source = Path.Combine(destination, "source.flac");
     var cue = Path.Combine(destination, "source.cue");
     await File.WriteAllTextAsync(cue, "FILE \"source.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00");
@@ -577,13 +578,21 @@ static async Task HostCommitsVerifiedFlac(string root)
     var stagedSource = new StagedSource("source.flac", new FileInfo(source).Length, await HostStagingService.Sha256Async(source));
     var staged = new StagedJob(job, stagedAlbum, Path.Combine(stagedSkill, "SKILL.md"), ffmpeg, ffprobe, manifest, [stagedSource],
         PipelineLimits: new(6, 2, 4, 2, 2), PipelineTelemetry: new(2, 4, 1, 2));
-    var result = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>());
-    Assert(result.Tracks == 1 && result.SourcesDeleted, "The exact source must be deleted after final quick checks.");
+    var result = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>(), deleteOriginals);
+    Assert(result.Tracks == 1 && result.SourcesDeleted == deleteOriginals,
+        deleteOriginals ? "The exact source must be deleted after final quick checks." : "The source must be retained when deletion is not requested.");
     Assert(File.Exists(Path.Combine(destination, "01 - Test.flac")) && File.Exists(Path.Combine(destination, "cover.jpg")), "Verified outputs were not committed to the album folder.");
-    Assert(!File.Exists(source) && File.Exists(cue) && File.Exists(result.ReportPath), "Only the source FLAC should be deleted; the CUE and final report must remain.");
+    Assert(File.Exists(source) != deleteOriginals && File.Exists(cue) && File.Exists(result.ReportPath),
+        "The source disposition did not match the requested delete-originals option; the CUE and final report must remain.");
     var summary = await ReportReader.LoadAsync(result.ReportPath);
-    Assert(summary.Status == "passed" && summary.Tracks == 1 && summary.Deleted, "The final report did not record quick-check source deletion.");
+    Assert(summary.Status == "passed" && summary.Tracks == 1 && summary.Deleted == deleteOriginals,
+        "The final report did not record the requested source disposition.");
     using var finalReport = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(result.ReportPath));
+    var deletion = finalReport.RootElement.GetProperty("deletion");
+    Assert(deleteOriginals || deletion.GetProperty("policy").GetString() == "source_retained_by_user_request",
+        "The final report did not record that the user chose to retain originals.");
+    Assert(deleteOriginals || !finalReport.RootElement.GetProperty("verification").GetProperty("source_deletion_requested").GetBoolean(),
+        "The final verification must record that source deletion was not requested.");
     var pipeline = finalReport.RootElement.GetProperty("pipeline");
     Assert(pipeline.GetProperty("configured").GetProperty("processing_workers").GetInt32() == 4 &&
            pipeline.GetProperty("observed_at_commit").GetProperty("copy_back_workers").GetInt32() == 2,

@@ -16,6 +16,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
           <TextBlock Text="SOURCE FOLDERS" Foreground="{StaticResource Muted}" FontSize="10" FontWeight="Bold" Margin="0,0,0,9"/>
           <Border Grid.Row="1" Background="#0E161F" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6" Padding="9" MinHeight="74"
@@ -68,6 +69,9 @@
               <TextBlock Text="{Binding SourceSize, StringFormat=Source material: {0}}" Foreground="{StaticResource Muted}"/>
             </StackPanel>
           </Border>
+          <CheckBox Grid.Row="5" Content="Delete originals" IsChecked="{Binding DeleteOriginals, Mode=TwoWay}" IsEnabled="{Binding CanBrowse}"
+                    Margin="0,15,0,0" Foreground="{StaticResource Text}" FontWeight="SemiBold"
+                    ToolTip="When selected, eligible single-image originals are deleted only after final verification. Clear this option to retain every original."/>
         </Grid>
       </Border>
       <Grid Grid.Column="2"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="13"/><RowDefinition/></Grid.RowDefinitions>
@@ -82,7 +86,8 @@
             </Border>
             <StackPanel Grid.Column="1" VerticalAlignment="Center">
               <TextBlock Text="{Binding StatusTitle}" FontSize="21" FontWeight="SemiBold"/>
-              <TextBlock Text="{Binding StatusDetail}" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,4,0,12" MaxHeight="44"/>
+              <TextBlock Text="{Binding StatusDetail}" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,4,0,5" MaxHeight="44"/>
+              <TextBlock Text="{Binding ProgressTime}" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,0,0,7"/>
               <ProgressBar Value="{Binding Progress, Mode=OneWay}" Maximum="100" Height="7"/>
             </StackPanel>
             <Button Grid.Column="2" MinWidth="96" Margin="22,0,0,0" VerticalAlignment="Center">

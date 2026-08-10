@@ -303,10 +303,17 @@ public sealed class HostStagingService
 
 public sealed class HostCommitService
 {
+    public Task<HostCommitResult> CommitAsync(
+        ScanResult scan,
+        StagedJob staged,
+        IProgress<ProgressSnapshot> progress,
+        CancellationToken token = default) => CommitAsync(scan, staged, progress, deleteOriginals: true, token);
+
     public async Task<HostCommitResult> CommitAsync(
         ScanResult scan,
         StagedJob staged,
         IProgress<ProgressSnapshot> progress,
+        bool deleteOriginals,
         CancellationToken token = default)
     {
         if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.DsdExtraction)
@@ -496,7 +503,7 @@ public sealed class HostCommitService
             commit["previous_output_rollback_cleaned"] = rollbackCleaned;
             await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
         }
-        var deletesSource = !incomplete && staged.Sources.Count == 1 && (!isDsd || DsdDeletionEligible(report));
+        var deletesSource = deleteOriginals && !incomplete && staged.Sources.Count == 1 && (!isDsd || DsdDeletionEligible(report));
         if (isDsd) ConfirmDsdVerification(report, "final album path", deletesSource);
         else SetQuickVerification(report, "final album path", deletesSource, finalIncompleteIssues);
         token.ThrowIfCancellationRequested();
@@ -508,12 +515,14 @@ public sealed class HostCommitService
             ["status"] = deletesSource ? "pending" : "retained",
             ["policy"] = deletesSource
                 ? isDsd ? "verified_sacd_independent_extraction_and_dsd_payload_equivalence" : "user_requested_without_pcm_equivalence"
-                : "source_retained_without_complete_deletion_authorization",
+                : deleteOriginals ? "source_retained_without_complete_deletion_authorization" : "source_retained_by_user_request",
             ["authorized_after"] = deletesSource ? isDsd ? "full_dsd_final_path_verification" : "quick_final_path_checks" : null,
             ["files"] = new JsonArray(staged.Sources.Select(source => JsonValue.Create(source.RelativePath)).ToArray()),
             ["performed"] = false
         };
-        if (!deletesSource) deletion["reason"] = isDsd
+        if (!deletesSource) deletion["reason"] = !deleteOriginals
+            ? "The user chose to retain original sources."
+            : isDsd
             ? incomplete
                 ? "The DSF tracks passed extraction and payload verification, but metadata remains incomplete; the original SACD ISO was retained."
                 : "The SACD report did not prove every independent-extraction and DSD payload gate."
@@ -571,7 +580,9 @@ public sealed class HostCommitService
         else
         {
             progress.Report(Snapshot(JobPhase.SourceDisposition, 96,
-                $"All {staged.Sources.Count} original source image{(staged.Sources.Count == 1 ? " was" : "s were")} retained; deletion was not authorized."));
+                !deleteOriginals
+                    ? $"All {staged.Sources.Count} original source image{(staged.Sources.Count == 1 ? " was" : "s were")} retained as requested."
+                    : $"All {staged.Sources.Count} original source image{(staged.Sources.Count == 1 ? " was" : "s were")} retained; deletion was not authorized."));
         }
 
         await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None);

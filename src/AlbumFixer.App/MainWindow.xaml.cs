@@ -61,6 +61,7 @@ public partial class MainWindow : Window
 
     private bool ConfirmStart()
     {
+        if (!_viewModel.DeleteOriginals) return true;
         if (_viewModel.IsBatch || !_viewModel.IsSingleSacd && _viewModel.DeletesSourceAfterSuccess)
             return true;
 
