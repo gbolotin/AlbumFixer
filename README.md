@@ -34,7 +34,7 @@ The packaged app is self-contained for 64-bit Windows and does not require a sep
 2. Select **Scan albums**. Review which albums are ready and which will be skipped; a blocked album does not block ready siblings.
 3. Review the source policy: each successful one-image FLAC album deletes only its exact original after quick checks; a SACD ISO requires two matching extractions and full DSD verification. Multi-image, failed, and canceled albums retain their originals.
 4. Select the start button. Album Fixer displays the hardware- and capacity-aware pipeline limits before starting; additional albums wait in bounded queues.
-5. Follow each album's phase and percent in the preflight list, then review the timeline and **Report** tab.
+5. Review global readiness in **Preflight**, follow each album's phase and percent in **Albums**, then review the timeline and **Report** tab.
 
 ## Required tools
 

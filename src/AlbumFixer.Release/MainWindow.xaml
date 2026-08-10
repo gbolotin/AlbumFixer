@@ -69,62 +69,70 @@
       <Grid Grid.Column="2"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="13"/><RowDefinition/></Grid.RowDefinitions>
         <Border Style="{StaticResource CardStyle}" Padding="22"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="96"/><ColumnDefinition/></Grid.ColumnDefinitions><Border Width="76" Height="76" CornerRadius="38" Background="{StaticResource MintDark}"><StackPanel VerticalAlignment="Center"><TextBlock Text="{Binding Progress, Mode=OneWay, StringFormat={}{0:0}%}" Foreground="{StaticResource Mint}" FontSize="21" FontWeight="Bold" HorizontalAlignment="Center"/><TextBlock Text="PROGRESS" Foreground="{StaticResource Muted}" FontSize="8" HorizontalAlignment="Center"/></StackPanel></Border><StackPanel Grid.Column="1" VerticalAlignment="Center"><TextBlock Text="{Binding StatusTitle}" FontSize="21" FontWeight="SemiBold"/><TextBlock Text="{Binding StatusDetail}" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,4,0,12" MaxHeight="44"/><ProgressBar Value="{Binding Progress, Mode=OneWay}" Maximum="100" Height="7"/></StackPanel></Grid></Border>
         <Border Grid.Row="2" Style="{StaticResource CardStyle}" Padding="0"><TabControl Background="Transparent" BorderThickness="0">
+          <TabControl.Resources>
+            <DataTemplate x:Key="StatusRowTemplate">
+              <Grid Margin="0,0,0,10">
+                <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel>
+                  <Grid>
+                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Visibility="{Binding AlbumNameTextVisibility}"/>
+                    <Button x:Name="AlbumNameLink" Content="{Binding Name}" Tag="{Binding AlbumFolderPath}" Click="Album_Click" Visibility="{Binding AlbumNameLinkVisibility}" HorizontalAlignment="Left" ToolTip="Open album folder in File Explorer">
+                      <Button.Style>
+                        <Style TargetType="Button">
+                          <Setter Property="Background" Value="Transparent"/>
+                          <Setter Property="Foreground" Value="{StaticResource Mint}"/>
+                          <Setter Property="BorderThickness" Value="0"/>
+                          <Setter Property="Padding" Value="0"/>
+                          <Setter Property="FontWeight" Value="SemiBold"/>
+                          <Setter Property="Cursor" Value="Hand"/>
+                          <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><ContentPresenter/></ControlTemplate></Setter.Value></Setter>
+                          <Style.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter Property="TextBlock.TextDecorations" Value="Underline"/></Trigger></Style.Triggers>
+                        </Style>
+                      </Button.Style>
+                    </Button>
+                  </Grid>
+                  <TextBlock Text="{Binding Detail}" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,2,10,0"/>
+                </StackPanel>
+                <Border Grid.Column="1" CornerRadius="8" Padding="8,3" VerticalAlignment="Top">
+                  <Border.Style>
+                    <Style TargetType="Border">
+                      <Setter Property="Background" Value="#0F1A21"/>
+                      <Style.Triggers>
+                        <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Warning}"><Setter Property="Background" Value="#3A2B16"/></DataTrigger>
+                        <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Failed}"><Setter Property="Background" Value="#3A1D22"/></DataTrigger>
+                      </Style.Triggers>
+                    </Style>
+                  </Border.Style>
+                  <TextBlock Text="{Binding State}" FontSize="9" FontWeight="Bold">
+                    <TextBlock.Style>
+                      <Style TargetType="TextBlock">
+                        <Setter Property="Foreground" Value="{StaticResource Mint}"/>
+                        <Style.Triggers>
+                          <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Warning}"><Setter Property="Foreground" Value="{StaticResource Amber}"/></DataTrigger>
+                          <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Failed}"><Setter Property="Foreground" Value="{StaticResource Red}"/></DataTrigger>
+                        </Style.Triggers>
+                      </Style>
+                    </TextBlock.Style>
+                  </TextBlock>
+                </Border>
+              </Grid>
+            </DataTemplate>
+          </TabControl.Resources>
           <TabItem Header="Preflight">
             <Grid Margin="16">
               <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
               <TextBlock Text="Preflight checks" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,12"/>
               <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <ItemsControl ItemsSource="{Binding Checks}">
-                  <ItemsControl.ItemTemplate>
-                    <DataTemplate>
-                      <Grid Margin="0,0,0,10">
-                        <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                        <StackPanel>
-                          <Grid>
-                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Visibility="{Binding AlbumNameTextVisibility}"/>
-                            <Button x:Name="AlbumNameLink" Content="{Binding Name}" Tag="{Binding AlbumFolderPath}" Click="PreflightAlbum_Click" Visibility="{Binding AlbumNameLinkVisibility}" HorizontalAlignment="Left" ToolTip="Open album folder in File Explorer">
-                              <Button.Style>
-                                <Style TargetType="Button">
-                                  <Setter Property="Background" Value="Transparent"/>
-                                  <Setter Property="Foreground" Value="{StaticResource Mint}"/>
-                                  <Setter Property="BorderThickness" Value="0"/>
-                                  <Setter Property="Padding" Value="0"/>
-                                  <Setter Property="FontWeight" Value="SemiBold"/>
-                                  <Setter Property="Cursor" Value="Hand"/>
-                                  <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><ContentPresenter/></ControlTemplate></Setter.Value></Setter>
-                                  <Style.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter Property="TextBlock.TextDecorations" Value="Underline"/></Trigger></Style.Triggers>
-                                </Style>
-                              </Button.Style>
-                            </Button>
-                          </Grid>
-                          <TextBlock Text="{Binding Detail}" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,2,10,0"/>
-                        </StackPanel>
-                        <Border Grid.Column="1" CornerRadius="8" Padding="8,3" VerticalAlignment="Top">
-                          <Border.Style>
-                            <Style TargetType="Border">
-                              <Setter Property="Background" Value="#0F1A21"/>
-                              <Style.Triggers>
-                                <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Warning}"><Setter Property="Background" Value="#3A2B16"/></DataTrigger>
-                                <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Failed}"><Setter Property="Background" Value="#3A1D22"/></DataTrigger>
-                              </Style.Triggers>
-                            </Style>
-                          </Border.Style>
-                          <TextBlock Text="{Binding State}" FontSize="9" FontWeight="Bold">
-                            <TextBlock.Style>
-                              <Style TargetType="TextBlock">
-                                <Setter Property="Foreground" Value="{StaticResource Mint}"/>
-                                <Style.Triggers>
-                                  <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Warning}"><Setter Property="Foreground" Value="{StaticResource Amber}"/></DataTrigger>
-                                  <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Failed}"><Setter Property="Foreground" Value="{StaticResource Red}"/></DataTrigger>
-                                </Style.Triggers>
-                              </Style>
-                            </TextBlock.Style>
-                          </TextBlock>
-                        </Border>
-                      </Grid>
-                    </DataTemplate>
-                  </ItemsControl.ItemTemplate>
-                </ItemsControl>
+                <ItemsControl ItemsSource="{Binding PreflightChecks}" ItemTemplate="{StaticResource StatusRowTemplate}"/>
+              </ScrollViewer>
+            </Grid>
+          </TabItem>
+          <TabItem Header="Albums">
+            <Grid Margin="16">
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
+              <TextBlock Text="Albums" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,12"/>
+              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <ItemsControl ItemsSource="{Binding Albums}" ItemTemplate="{StaticResource StatusRowTemplate}"/>
               </ScrollViewer>
             </Grid>
           </TabItem>

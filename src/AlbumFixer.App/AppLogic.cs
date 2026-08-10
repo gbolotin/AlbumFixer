@@ -144,7 +144,8 @@ public sealed class MainViewModel : NotifyBase, IDisposable
     }
 
     public ObservableCollection<string> SourceFolders { get; } = [];
-    public RangeObservableCollection<CheckRow> Checks { get; } = [];
+    public RangeObservableCollection<CheckRow> PreflightChecks { get; } = [];
+    public RangeObservableCollection<CheckRow> Albums { get; } = [];
     public RangeObservableCollection<MediaRow> Media { get; } = [];
     public ObservableCollection<TimelineRow> Timeline { get; } = [];
     public ObservableCollection<ActivityRow> Activity { get; } = [];
@@ -310,7 +311,8 @@ public sealed class MainViewModel : NotifyBase, IDisposable
                 _preflight = null;
                 _previousOutputFileCount = 0;
                 _albumCheckRows.Clear();
-                Checks.Clear();
+                PreflightChecks.Clear();
+                Albums.Clear();
                 AlbumName = completedScans.Length == 1 ? completedScans[0].AlbumName : $"{completedScans.Length} completed albums";
                 Workflow = completedScans.Length == 1 ? completedScans[0].WorkflowLabel : "Already completed — no pending work";
                 Inventory = $"{completedScans.Length} completed album{S(completedScans.Length)}  •  0 pending";
@@ -345,7 +347,8 @@ public sealed class MainViewModel : NotifyBase, IDisposable
             _previousOutputFileCount = preflightLoad.PreviousOutputFileCount;
             _preflight = PreflightService.CombineBatch(_albumPreflights);
             _albumCheckRows.Clear();
-            var rows = new List<CheckRow>();
+            var preflightRows = new List<CheckRow>();
+            var albumRows = new List<CheckRow>();
             foreach (var item in _preflight.Checks)
             {
                 var album = _albumPreflights.FirstOrDefault(candidate =>
@@ -353,10 +356,18 @@ public sealed class MainViewModel : NotifyBase, IDisposable
                 var row = new CheckRow(item.Name,
                     album is not null ? album.CanStart ? "Ready" : "Blocked" : item.State switch { CheckState.Passed => "Ready", CheckState.Warning => "Review", _ => "Blocked" },
                     item.Detail, item.State, album?.Index, album?.Scan.AlbumRoot);
-                rows.Add(row);
-                if (album is not null) _albumCheckRows[album.Index] = row;
+                if (album is null)
+                {
+                    preflightRows.Add(row);
+                }
+                else
+                {
+                    albumRows.Add(row);
+                    _albumCheckRows[album.Index] = row;
+                }
             }
-            Replace(Checks, rows);
+            Replace(PreflightChecks, preflightRows);
+            Replace(Albums, albumRows);
             Raise(nameof(AlbumCount)); Raise(nameof(RunnableAlbumCount)); Raise(nameof(BatchWorkerLimit)); Raise(nameof(PreviousOutputFileCount)); Raise(nameof(IsBatch)); Raise(nameof(IsSingleSacd)); Raise(nameof(HasSacdWorkflows)); Raise(nameof(DeletesSourceAfterSuccess)); Raise(nameof(DeletesAnySourceAfterSuccess)); Raise(nameof(StartActionLabel)); Raise(nameof(SourceActionTitle)); Raise(nameof(SourceActionDetail));
             var blocked = AlbumCount - RunnableAlbumCount;
             StatusTitle = _preflight.CanStart ? (IsBatch ? "Batch ready to process" : "Ready to process") : "Run blocked safely";
@@ -369,7 +380,7 @@ public sealed class MainViewModel : NotifyBase, IDisposable
                 StatusDetail += $" {completedScans.Length} already completed album{S(completedScans.Length)} skipped.";
             Log(_preflight.CanStart ? "READY" : "BLOCKED", StatusDetail); await LoadReportAsync();
         }
-        catch (Exception error) { _scan = null; _scans = []; _albumPreflights = []; _preflight = null; _previousOutputFileCount = 0; _albumCheckRows.Clear(); StatusTitle = "Could not inventory this folder"; StatusDetail = error.Message; Log("ERROR", error.Message); }
+        catch (Exception error) { _scan = null; _scans = []; _albumPreflights = []; _preflight = null; _previousOutputFileCount = 0; _albumCheckRows.Clear(); PreflightChecks.Clear(); Albums.Clear(); StatusTitle = "Could not inventory this folder"; StatusDetail = error.Message; Log("ERROR", error.Message); }
         finally { Busy = false; Raise(nameof(CanStart)); StartCommand.Refresh(); }
     }
 
@@ -895,7 +906,7 @@ public sealed class MainViewModel : NotifyBase, IDisposable
     }
 
     private void CopyReport() { if (ReportJson.Length > 0) Clipboard.SetText(ReportJson); }
-    private void Invalidate() { if (Busy) return; _scan = null; _scans = []; _albumPreflights = []; _preflight = null; _previousOutputFileCount = 0; _albumCheckRows.Clear(); Checks.Clear(); Media.Clear(); AlbumName = SourceFolderCount switch { 0 => "No source folders selected", 1 => Path.GetFileName(SourceFolders[0].TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)), _ => $"{SourceFolderCount} source folders selected" }; Workflow = "Scan to classify albums recursively"; Inventory = SourceSize = "—"; StatusTitle = "Ready to scan"; StatusDetail = "Inventory is read-only."; Raise(nameof(SourceFolderCount)); Raise(nameof(BrowseInitialDirectory)); Raise(nameof(CanStart)); Raise(nameof(AlbumCount)); Raise(nameof(RunnableAlbumCount)); Raise(nameof(BatchWorkerLimit)); Raise(nameof(PreviousOutputFileCount)); Raise(nameof(IsBatch)); Raise(nameof(IsSingleSacd)); Raise(nameof(HasSacdWorkflows)); Raise(nameof(DeletesSourceAfterSuccess)); Raise(nameof(DeletesAnySourceAfterSuccess)); Raise(nameof(StartActionLabel)); Raise(nameof(SourceActionTitle)); Raise(nameof(SourceActionDetail)); ScanCommand.Refresh(); StartCommand.Refresh(); RefreshReportCommand.Refresh(); ClearSourceFoldersCommand.Refresh(); }
+    private void Invalidate() { if (Busy) return; _scan = null; _scans = []; _albumPreflights = []; _preflight = null; _previousOutputFileCount = 0; _albumCheckRows.Clear(); PreflightChecks.Clear(); Albums.Clear(); Media.Clear(); AlbumName = SourceFolderCount switch { 0 => "No source folders selected", 1 => Path.GetFileName(SourceFolders[0].TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)), _ => $"{SourceFolderCount} source folders selected" }; Workflow = "Scan to classify albums recursively"; Inventory = SourceSize = "—"; StatusTitle = "Ready to scan"; StatusDetail = "Inventory is read-only."; Raise(nameof(SourceFolderCount)); Raise(nameof(BrowseInitialDirectory)); Raise(nameof(CanStart)); Raise(nameof(AlbumCount)); Raise(nameof(RunnableAlbumCount)); Raise(nameof(BatchWorkerLimit)); Raise(nameof(PreviousOutputFileCount)); Raise(nameof(IsBatch)); Raise(nameof(IsSingleSacd)); Raise(nameof(HasSacdWorkflows)); Raise(nameof(DeletesSourceAfterSuccess)); Raise(nameof(DeletesAnySourceAfterSuccess)); Raise(nameof(StartActionLabel)); Raise(nameof(SourceActionTitle)); Raise(nameof(SourceActionDetail)); ScanCommand.Refresh(); StartCommand.Refresh(); RefreshReportCommand.Refresh(); ClearSourceFoldersCommand.Refresh(); }
     private static string? NormalizeSourceFolder(string? folder)
     {
         if (string.IsNullOrWhiteSpace(folder)) return null;

@@ -42,7 +42,7 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
-    private async void PreflightAlbum_Click(object sender, RoutedEventArgs e)
+    private async void Album_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not FrameworkElement { Tag: string albumFolderPath }) return;
         try
