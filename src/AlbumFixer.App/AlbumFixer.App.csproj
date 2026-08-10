@@ -1,4 +1,21 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><OutputType>WinExe</OutputType><UseWPF>true</UseWPF><RootNamespace>AlbumFixer.App</RootNamespace><AssemblyName>Album Fixer</AssemblyName><ApplicationManifest>app.manifest</ApplicationManifest><ApplicationIcon>Assets\AlbumFixer.ico</ApplicationIcon></PropertyGroup>
-  <ItemGroup><ProjectReference Include="..\AlbumFixer.Core\AlbumFixer.Core.csproj"/><Resource Include="Assets\AlbumFixer.ico"/><Resource Include="Assets\Remove.png"/></ItemGroup>
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>AlbumFixer.App</RootNamespace>
+    <AssemblyName>Album Fixer</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\AlbumFixer.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AlbumFixer.Core\AlbumFixer.Core.csproj" />
+    <Resource Include="Assets\AlbumFixer.ico" />
+    <Resource Include="Assets\Remove.png" />
+  </ItemGroup>
 </Project>

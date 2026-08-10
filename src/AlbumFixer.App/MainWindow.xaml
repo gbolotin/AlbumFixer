@@ -31,7 +31,10 @@
                         <Grid>
                           <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                           <TextBlock Text="{Binding}" ToolTip="{Binding}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                          <Button Grid.Column="1" Tag="{Binding}" Click="RemoveSourceFolder_Click" Width="24" Height="24" Padding="4"
+                          <Button Grid.Column="1"
+                                  Command="{Binding DataContext.RemoveSourceFolderCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}"
+                                  Width="24" Height="24" Padding="4"
                                   ToolTip="Remove source folder" AutomationProperties.Name="Remove source folder" Focusable="False">
                             <Button.Style>
                               <Style TargetType="Button">
@@ -57,7 +60,7 @@
           </Border>
           <Grid Grid.Row="2" Margin="0,9,0,0">
             <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-            <Button Content="+ Add" Click="Browse_Click" IsEnabled="{Binding CanBrowse}" Style="{StaticResource ButtonStyle}" Padding="11,8"/>
+            <Button Content="+ Add" Command="{Binding BrowseCommand}" Style="{StaticResource ButtonStyle}" Padding="11,8"/>
             <Button Grid.Column="1" Content="Clear" Command="{Binding ClearSourceFoldersCommand}" Style="{StaticResource ButtonStyle}" Margin="7,0,0,0" Padding="11,8"/>
           </Grid>
           <Button Grid.Row="3" Content="Scan albums" Command="{Binding ScanCommand}" Style="{StaticResource ButtonStyle}" Margin="0,9,0,0"/>
@@ -139,7 +142,11 @@
                 <StackPanel>
                   <Grid>
                     <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Visibility="{Binding AlbumNameTextVisibility}"/>
-                    <Button x:Name="AlbumNameLink" Content="{Binding Name}" Tag="{Binding AlbumFolderPath}" Click="Album_Click" Visibility="{Binding AlbumNameLinkVisibility}" HorizontalAlignment="Left" ToolTip="Open album folder in File Explorer">
+                    <Button x:Name="AlbumNameLink"
+                            Content="{Binding Name}"
+                            Command="{Binding DataContext.OpenAlbumFolderCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                            CommandParameter="{Binding AlbumFolderPath}"
+                            Visibility="{Binding AlbumNameLinkVisibility}" HorizontalAlignment="Left" ToolTip="Open album folder in File Explorer">
                       <Button.Style>
                         <Style TargetType="Button">
                           <Setter Property="Background" Value="Transparent"/>

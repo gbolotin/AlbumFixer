@@ -46,6 +46,12 @@ The packaged app is self-contained for 64-bit Windows and does not require a sep
 
 Album Fixer does not silently download tools. Missing FFmpeg tools block FLAC runs, and missing `ffprobe` or `sacd_extract` blocks SACD ISO runs. A missing optional Codex fallback matters only when required metadata is actually absent.
 
+## Application architecture
+
+The WPF application uses MVVM. `MainViewModel` owns presentation state and exposes CommunityToolkit commands, while `MainWindow` contains only view-specific drag/drop and close-event adaptation. Dialogs, shell access, clipboard access, and the UI timer are behind injected interfaces.
+
+`App.xaml.cs` is the composition root. It builds the `Microsoft.Extensions.DependencyInjection` service provider, registers the core processing services and WPF adapters, resolves the main window, and disposes the graph when the application exits.
+
 ## Build and test
 
 ```powershell
