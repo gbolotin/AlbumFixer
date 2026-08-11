@@ -12,21 +12,15 @@ public partial class App : Application
     {
         var services = new ServiceCollection();
 
-        services.AddSingleton(new AlbumFixerOptions(
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".codex",
-                "skills",
-                "album-fixer",
-                "SKILL.md")));
-
         services.AddSingleton<AlbumScanner>();
         services.AddSingleton<PreflightService>();
         services.AddSingleton<HostStagingService>();
         services.AddSingleton<LocalFlacProcessor>();
         services.AddSingleton<ExternalMetadataService>();
+        services.AddSingleton<LocalMetadataEnrichmentService>();
         services.AddSingleton<LocalDsdProcessor>();
         services.AddSingleton<HostCommitService>();
+        services.AddSingleton<StartupPrerequisiteService>();
 
         services.AddSingleton<IUserInteractionService, WpfUserInteractionService>();
         services.AddSingleton<IUiTimer, DispatcherUiTimer>();
@@ -37,12 +31,13 @@ public partial class App : Application
             new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true });
     }
 
-    protected override void OnStartup(StartupEventArgs e)
+    protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
 
         MainWindow = _services.GetRequiredService<MainWindow>();
         MainWindow.Show();
+        await _services.GetRequiredService<MainViewModel>().InitializeAsync();
     }
 
     protected override void OnExit(ExitEventArgs e)

@@ -19,8 +19,6 @@ public static class HostReportWriter
         JobPhase stoppedPhase,
         int percent,
         string detail,
-        int? exitCode,
-        string? threadId,
         CancellationToken token = default)
     {
         var normalizedStatus = status.Equals("canceled", StringComparison.OrdinalIgnoreCase) ? "canceled" : "failed";
@@ -28,7 +26,7 @@ public static class HostReportWriter
         var sourceCacheUsed = HostStagingService.RequiresSourceCache(scan.AlbumRoot);
         var report = new
         {
-            schema_version = "1.0",
+            schema_version = "2.0",
             album = scan.AlbumName,
             edition = "Unresolved — run stopped before release identification completed",
             format = scan.HasFlac ? "flac" : scan.HasDsd ? "dsd" : "unknown",
@@ -42,8 +40,7 @@ public static class HostReportWriter
                 path = item.RelativePath,
                 type = item.Kind,
                 size = item.Size,
-                sha256 = (string?)null,
-                hash_status = "not_computed",
+                size_status = "inventory_only",
                 note = item.Note
             }),
             tools = preflight.Tools,
@@ -53,12 +50,11 @@ public static class HostReportWriter
                 owner = scan.AlbumRoot,
                 local_staging_used = true,
                 source_cache_used = sourceCacheUsed,
-                source_input_mode = sourceCacheUsed ? "verified_temp_cache" : "local_fixed_disk_in_place",
+                source_input_mode = sourceCacheUsed ? "size_checked_temp_cache" : "local_fixed_disk_in_place",
                 copy_in_status = sourceCacheUsed ? "incomplete_or_unverified" : "not_required_local_fixed_disk",
                 staging_path = jobDirectory,
-                thread_id = threadId,
-                codex_exit_code = exitCode,
-                staging_preserved = Directory.Exists(jobDirectory)
+                staging_preserved = false,
+                cleanup_policy = "always_remove_after_terminal_report"
             },
             pipeline = new
             {
@@ -91,24 +87,23 @@ public static class HostReportWriter
             recovery = new
             {
                 originals_retained = true,
-                action = "Review the preserved staging job and retry only after the reported blocker is resolved"
+                transient_staging_cleanup = "required_after_report_write",
+                action = "Review the reported blocker and retry; no transient staging is required for recovery"
             }
         };
 
         var json = JsonSerializer.Serialize(report, JsonOptions);
-        Directory.CreateDirectory(jobDirectory);
-        var localPath = Path.Combine(jobDirectory, "conversion-report.json");
-        await AtomicWriteAsync(localPath, json, overwrite: true, token);
-
         var albumPath = Path.GetFullPath(Path.Combine(scan.AlbumRoot, "conversion-report.json"));
         try
         {
-            if (File.Exists(albumPath)) return albumPath;
-            await AtomicWriteAsync(albumPath, json, overwrite: false, token);
+            await AtomicWriteAsync(albumPath, json, overwrite: true, token);
             return albumPath;
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
+            Directory.CreateDirectory(jobDirectory);
+            var localPath = Path.Combine(jobDirectory, "conversion-report.json");
+            await AtomicWriteAsync(localPath, json, overwrite: true, token);
             return localPath;
         }
     }

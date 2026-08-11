@@ -28,7 +28,7 @@ public static class MetadataGapService
 
         var splitCompleted = ReadBoolean(root, "split_completed");
         if (!splitCompleted)
-            throw new InvalidOperationException("The metadata-gap handoff does not confirm that splitting completed. The metadata agent will not start.");
+            throw new InvalidOperationException("The metadata-gap handoff does not confirm that splitting completed. Metadata enrichment will not start.");
 
         var missing = ReadStrings(root, "missing_fields");
         var requested = ReadBoolean(root, "requires_research");

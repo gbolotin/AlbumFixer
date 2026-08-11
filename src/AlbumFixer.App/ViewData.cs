@@ -15,8 +15,7 @@ public sealed record AlbumJobOutcome(
     string ReportPath,
     int Tracks,
     bool SourcesDeleted,
-    bool Incomplete,
-    string? ThreadId);
+    bool Incomplete);
 
 public sealed record JobUiUpdate(
     int Index,
@@ -24,8 +23,7 @@ public sealed record JobUiUpdate(
     string AlbumName,
     ProgressSnapshot? Progress = null,
     string? Kind = null,
-    string? Message = null,
-    string? ThreadId = null);
+    string? Message = null);
 
 public sealed record BatchAlbumReportEntry(
     int Index,
@@ -36,7 +34,6 @@ public sealed record BatchAlbumReportEntry(
     string? ReportPath,
     int Tracks,
     bool SourcesDeleted,
-    string? ThreadId,
     string? Error);
 
 public sealed class CheckRow : ObservableObject

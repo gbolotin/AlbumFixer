@@ -6,6 +6,7 @@
     <AssemblyName>Album Fixer</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\AlbumFixer.ico</ApplicationIcon>
+    <SacdExtractSha256>F274F0A3845DBE6DFB2DB168C0C87B15DE3851256A4B5D1A804251BD809BE7B3</SacdExtractSha256>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,5 +18,17 @@
     <ProjectReference Include="..\AlbumFixer.Core\AlbumFixer.Core.csproj" />
     <Resource Include="Assets\AlbumFixer.ico" />
     <Resource Include="Assets\Remove.png" />
+    <None Update="Tools\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
   </ItemGroup>
+
+  <Target Name="ValidateBundledSacdExtract" BeforeTargets="Build">
+    <GetFileHash Files="$(MSBuildProjectDirectory)\Tools\sacd_extract.exe" Algorithm="SHA256">
+      <Output TaskParameter="Items" ItemName="BundledSacdExtract" />
+    </GetFileHash>
+    <Error Condition="'%(BundledSacdExtract.FileHash)' != '$(SacdExtractSha256)'"
+           Text="The bundled sacd_extract.exe does not match the approved SHA-256." />
+  </Target>
 </Project>

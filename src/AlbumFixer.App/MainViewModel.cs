@@ -9,15 +9,17 @@ namespace AlbumFixer.App;
 
 public sealed class MainViewModel : ObservableObject, IDisposable
 {
-    private readonly AlbumFixerOptions _options;
     private readonly AlbumScanner _scanner;
     private readonly PreflightService _preflightService;
     private readonly HostStagingService _staging;
     private readonly LocalFlacProcessor _localProcessor;
+    private readonly LocalMetadataEnrichmentService _metadataEnrichment;
     private readonly LocalDsdProcessor _localDsdProcessor;
     private readonly HostCommitService _commit;
+    private readonly StartupPrerequisiteService startupPrerequisites;
     private readonly IUserInteractionService _userInteraction;
     private readonly IUiTimer _progressTimer;
+    private readonly CancellationTokenSource lifetimeCancellation = new();
     private CancellationTokenSource? _cancel;
     private ScanResult? _scan;
     private IReadOnlyList<ScanResult> _scans = [];
@@ -45,32 +47,34 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _reportSections = "—";
     private string _reportDisposition = "—";
     private string _jobDirectory = "—";
-    private string _threadId = "—";
     private JobPhase _lastPhase = JobPhase.Ready;
     private string _lastRunDetail = "No run has started.";
     private DateTimeOffset _runStartedAt;
     private int _previousOutputFileCount;
     private bool _addingSourceFolders;
     private long _albumActivitySequence;
+    private bool startupChecked;
 
     public MainViewModel(
-        AlbumFixerOptions options,
         AlbumScanner scanner,
         PreflightService preflightService,
         HostStagingService staging,
         LocalFlacProcessor localProcessor,
+        LocalMetadataEnrichmentService metadataEnrichment,
         LocalDsdProcessor localDsdProcessor,
         HostCommitService commit,
+        StartupPrerequisiteService startupPrerequisites,
         IUserInteractionService userInteraction,
         IUiTimer progressTimer)
     {
-        _options = options;
         _scanner = scanner;
         _preflightService = preflightService;
         _staging = staging;
         _localProcessor = localProcessor;
+        _metadataEnrichment = metadataEnrichment;
         _localDsdProcessor = localDsdProcessor;
         _commit = commit;
+        this.startupPrerequisites = startupPrerequisites;
         _userInteraction = userInteraction;
         _progressTimer = progressTimer;
 
@@ -86,7 +90,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ClearSourceFoldersCommand = new RelayCommand(ClearSourceFolders, () => CanBrowse && SourceFolders.Count > 0);
         CopyReportCommand = new RelayCommand(CopyReport, () => ReportJson.Length > 0);
 
-        var titles = new[] { "Inventoried", "Preparing source", "Source verified", "Split / extract", "Tagging", "Local verification", "Copying back", "Destination hashes", "Final commit", "Final verification", "Source disposition", "Cleanup" };
+        var titles = new[] { "Inventoried", "Preparing source", "Source size checked", "Split / extract", "Tagging", "Local verification", "Copying back", "Destination sizes", "Final commit", "Final verification", "Source disposition", "Cleanup" };
         for (var i = 0; i < titles.Length; i++) Timeline.Add(new() { Number = i + 1, Phase = (JobPhase)(i + 1), Title = titles[i] });
     }
 
@@ -169,9 +173,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         : !DeleteOriginals
             ? "Delete originals is off. Verified output will be committed and every original source will be retained."
         : IsSingleSacd
-            ? "Every reported SACD area is extracted to DSF and verified twice. Tags and artwork must leave the DSD payload unchanged, and final network paths are reverified before the exact ISO may be deleted."
+            ? "Every reported SACD area is extracted to DSF twice and compared by file size. Tags, artwork, DSD structure, and final network file sizes are checked before the exact ISO may be deleted."
         : DeletesSourceAfterSuccess
-            ? "PCM/MD5 comparison is skipped. Album Fixer deletes only the exact inventoried image, and only after tracks are committed and pass quick FLAC, tag, artwork, and copy-hash checks. If artwork cannot be completed, usable tracks are delivered as incomplete work and the image is retained."
+            ? "PCM/MD5 and cryptographic hash comparisons are skipped. Album Fixer deletes only the exact inventoried image, and only after tracks are committed and pass quick FLAC, tag, artwork, and file-size checks. If artwork cannot be completed, usable tracks are delivered as incomplete work and the image is retained."
             : "PCM/MD5 comparison is skipped. Multiple original images are retained after tracks are committed and pass quick checks.";
     public string ReportHeadline { get => _reportHeadline; private set => SetProperty(ref _reportHeadline, value); }
     public string ReportDetail { get => _reportDetail; private set => SetProperty(ref _reportDetail, value); }
@@ -191,7 +195,53 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string ReportSections { get => _reportSections; private set => SetProperty(ref _reportSections, value); }
     public string ReportDisposition { get => _reportDisposition; private set => SetProperty(ref _reportDisposition, value); }
     public string JobDirectory { get => _jobDirectory; private set => SetProperty(ref _jobDirectory, value); }
-    public string ThreadId { get => _threadId; private set => SetProperty(ref _threadId, value); }
+
+    public async Task InitializeAsync()
+    {
+        if (startupChecked) return;
+        startupChecked = true;
+        Busy = true;
+        StatusTitle = "Checking required components…";
+        StatusDetail = "Album Fixer will verify bundled components and install FFmpeg if it is missing.";
+
+        try
+        {
+            var progress = new Progress<string>(detail => StatusDetail = detail);
+            var result = await startupPrerequisites.EnsureInstalledAsync(progress, lifetimeCancellation.Token);
+            if (result.Succeeded)
+            {
+                StatusTitle = "Required components are ready";
+                StatusDetail = "ffmpeg, ffprobe, and sacd_extract are available.";
+                Log("READY", StatusDetail);
+                return;
+            }
+
+            StatusTitle = "Some components could not be installed";
+            StatusDetail = "Affected workflows will remain blocked until the missing components are installed.";
+            foreach (var failure in result.Failures) Log("COMPONENT", failure);
+            _userInteraction.ShowError(
+                "Component installation failed",
+                "Album Fixer could not install these required components:\n\n" +
+                string.Join("\n\n", result.Failures.Select(failure => "• " + failure)) +
+                "\n\nYou can continue using the app, but workflows that need these components will be blocked. Album Fixer will try again the next time it starts.");
+        }
+        catch (OperationCanceledException) when (lifetimeCancellation.IsCancellationRequested)
+        {
+        }
+        catch (Exception error)
+        {
+            StatusTitle = "Component check failed";
+            StatusDetail = error.Message;
+            Log("COMPONENT", error.Message);
+            _userInteraction.ShowError(
+                "Component check failed",
+                $"Album Fixer could not complete its startup component check.\n\n{error.Message}\n\nThe app will remain open, but affected workflows may be blocked.");
+        }
+        finally
+        {
+            Busy = false;
+        }
+    }
 
     private async Task BrowseAsync()
     {
@@ -339,7 +389,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var scans = _scans;
             var preflightLoad = await Task.Run(async () =>
             {
-                var albums = await _preflightService.CheckAlbumsAsync(scans, _options.SkillPath).ConfigureAwait(false);
+                var albums = await _preflightService.CheckAlbumsAsync(scans).ConfigureAwait(false);
                 var previousOutputFileCount = albums.Sum(album =>
                     PreviousOutputCleanupService.Discover(album.Scan.AlbumRoot)?.Files.Count ?? 0);
                 return (Albums: albums, PreviousOutputFileCount: previousOutputFileCount);
@@ -485,10 +535,25 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         catch (Exception error)
         {
             Apply(new(JobPhase.Failed, (int)Progress, "failed", error.Message, DateTimeOffset.UtcNow)); Log("ERROR", error.Message);
-            if (_scans.Count == 1) await EnsureTerminalReportAsync(null, false, ThreadId == "—" ? null : ThreadId);
+            if (_scans.Count == 1) await EnsureTerminalReportAsync(false);
             await LoadReportAsync();
         }
-        finally { _progressTimer.Stop(); RefreshProgressTime(); _cancel.Dispose(); _cancel = null; IsRunActive = false; Busy = false; }
+        finally
+        {
+            if (_preflight is not null && !string.IsNullOrWhiteSpace(JobDirectory))
+            {
+                try
+                {
+                    var cleaned = await WorkflowCleanupService.CleanupLocalJobAsync(JobDirectory, _preflight.TempRoot);
+                    Log("CLEANUP", cleaned ? "Removed the Album Fixer Temp job." : $"Could not remove the Album Fixer Temp job: {JobDirectory}");
+                }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException)
+                {
+                    Log("CLEANUP", $"Could not remove the Album Fixer Temp job: {error.Message}");
+                }
+            }
+            _progressTimer.Stop(); RefreshProgressTime(); _cancel.Dispose(); _cancel = null; IsRunActive = false; Busy = false;
+        }
     }
 
     private async Task<AlbumJobOutcome> ProcessAlbumAsync(
@@ -506,7 +571,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             : JobDirectory;
         Directory.CreateDirectory(jobDirectory);
         var last = new ProgressSnapshot(JobPhase.Ready, 0, "pending", "Waiting for a batch worker.", DateTimeOffset.UtcNow);
-        string? threadId = null;
         void Report(ProgressSnapshot snapshot)
         {
             last = snapshot;
@@ -522,14 +586,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 ? "Waiting for an available NAS source-cache lane."
                 : "Waiting for an available local source-verification lane; no Temp source copy is required.", DateTimeOffset.UtcNow));
             var staged = await pipeline.RunCopyInAsync(
-                ct => _staging.StageAsync(scan, _preflight, _options.SkillPath, jobDirectory, progress, ct), token);
+                ct => _staging.StageAsync(scan, _preflight, jobDirectory, progress, ct), token);
             staged = staged with { PipelineLimits = pipeline.Limits };
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "SPLIT", Message: scan.Mode == WorkflowMode.DsdExtraction
                 ? "Starting sequential SACD extraction and independent DSD verification."
                 : "Starting the deterministic local CUE/FFmpeg splitter."));
             Report(new(JobPhase.SourceCopyVerified, Math.Max(last.Percent, 17), "queued", staged.SourceCacheUsed
                 ? "Temp source cache verified; waiting for a local processing lane."
-                : "Fixed-disk source hash recorded; waiting for a local processing lane.", DateTimeOffset.UtcNow));
+                : "Fixed-disk source size recorded; waiting for a local processing lane.", DateTimeOffset.UtcNow));
             var localResult = await pipeline.RunProcessingAsync(scan.Mode == WorkflowMode.DsdExtraction, ct =>
                 scan.Mode == WorkflowMode.DsdExtraction
                     ? _localDsdProcessor.ProcessAsync(scan, staged, progress, ct)
@@ -540,53 +604,29 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (gaps.RequiresResearch)
             {
                 var fields = string.Join(", ", gaps.MissingFields);
-                var artworkOnly = gaps.MissingFields.Count > 0 &&
-                                  gaps.MissingFields.All(field => field.Equals("COVER", StringComparison.OrdinalIgnoreCase));
-                var permitsIncompleteMetadata = scan.Mode == WorkflowMode.DsdExtraction || artworkOnly;
-                var codexPath = await PreflightService.FindOptionalCodexAsync(token);
-                if (codexPath is null || !File.Exists(codexPath))
+                if (scan.Mode == WorkflowMode.FlacCueSplit)
                 {
-                    if (!permitsIncompleteMetadata)
-                        throw new InvalidOperationException($"Required FLAC metadata is missing ({fields}) and the optional metadata agent is unavailable. Local results are preserved at {staged.AlbumRoot}.");
-                    uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: $"Optional metadata lookup is unavailable for {fields}. Verified tracks will still be delivered as incomplete work and the source image will be retained."));
+                    uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: $"Running deterministic local metadata enrichment for: {fields}."));
+                    gaps = await _metadataEnrichment.EnrichAsync(scan, staged, localResult, progress, token);
+                    var unresolvedRequired = gaps.MissingFields
+                        .Where(field => !field.Equals("COVER", StringComparison.OrdinalIgnoreCase))
+                        .ToArray();
+                    if (unresolvedRequired.Length > 0)
+                        throw new InvalidOperationException($"Required FLAC metadata remains unresolved after local lookup ({string.Join(", ", unresolvedRequired)}). Local results are preserved at {staged.AlbumRoot}.");
+                    if (gaps.RequiresResearch)
+                        uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: "Front artwork remains unavailable. Verified tracks will be delivered as incomplete work and the source image will be retained."));
+                    else
+                        uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: "Missing metadata and artwork were completed by deterministic local code."));
                 }
-                if (!File.Exists(_options.SkillPath))
+                else
                 {
-                    if (!permitsIncompleteMetadata)
-                        throw new InvalidOperationException($"Required FLAC metadata is missing ({fields}) and the Album Fixer skill is unavailable. Local results are preserved at {staged.AlbumRoot}.");
-                    uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: $"The metadata helper is unavailable for {fields}. Verified tracks will still be delivered as incomplete work."));
-                }
-
-                if (codexPath is not null && File.Exists(codexPath) && File.Exists(_options.SkillPath))
-                {
-                    try
-                    {
-                        Report(new(JobPhase.Tagging, Math.Max(last.Percent, 44), "running", $"Only missing metadata is being deferred to Codex: {fields}.", DateTimeOffset.UtcNow));
-                        uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: $"Starting the optional metadata-only agent for: {fields}."));
-                        var stagedSkillPath = await _staging.StageSkillAsync(_options.SkillPath, jobDirectory, token);
-                        var options = new RunOptions(codexPath, staged.AlbumRoot, jobDirectory, stagedSkillPath, staged.FfmpegPath, staged.FfprobePath, CodexWorkKind.MetadataEnrichment);
-                        using var runner = new CodexRunner();
-                        var events = new CallbackProgress<RunEvent>(item =>
-                        {
-                            if (item.ThreadId is not null) threadId = item.ThreadId;
-                            if (item.Progress is not null) Report(item.Progress);
-                            if (item.Message.Length > 0)
-                                uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: item.Kind.ToUpperInvariant(), Message: item.Message, ThreadId: item.ThreadId));
-                        });
-                        var metadataResult = await runner.RunAsync(options, events, token);
-                        threadId = metadataResult.ThreadId ?? threadId;
-                        if (metadataResult.LastProgress is not null) Report(metadataResult.LastProgress);
-                        await EnsureWorkerSucceededAsync(metadataResult, "Metadata agent");
-                    }
-                    catch (Exception error) when (permitsIncompleteMetadata && error is not OperationCanceledException)
-                    {
-                        uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: $"Metadata lookup did not complete ({error.Message}). Delivering the verified tracks as incomplete work and retaining the source image."));
-                    }
+                    uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA",
+                        Message: $"Catalog lookup left these SACD fields unresolved: {fields}. Verified tracks will be delivered as incomplete work and the source ISO will be retained."));
                 }
             }
             else
             {
-                uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: "All required metadata and artwork were found locally; Codex was not started."));
+                uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: "All required metadata and artwork were found locally; no fallback process was needed."));
             }
 
             Report(new(JobPhase.LocalVerificationPassed, Math.Max(last.Percent, 50), "queued", "Local processing is ready for host verification and an available NAS write-back lane.", DateTimeOffset.UtcNow));
@@ -595,28 +635,41 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 var commitStaged = staged with { PipelineTelemetry = pipeline.Telemetry };
                 return _commit.CommitAsync(scan, commitStaged, progress, deleteOriginals, ct);
             }, token);
-            return new(jobDirectory, committed.ReportPath, committed.Tracks, committed.SourcesDeleted, committed.Incomplete, threadId);
+            return new(jobDirectory, committed.ReportPath, committed.Tracks, committed.SourcesDeleted, committed.Incomplete);
         }
         catch (OperationCanceledException error)
         {
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: new(JobPhase.Canceled, last.Percent, "canceled", error.Message, DateTimeOffset.UtcNow)));
-            await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, true, threadId, uiUpdates, index, albumIndex);
+            await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, true, uiUpdates, index, albumIndex);
             throw;
         }
         catch (Exception error)
         {
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: new(JobPhase.Failed, last.Percent, "failed", error.Message, DateTimeOffset.UtcNow)));
-            await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, false, threadId, uiUpdates, index, albumIndex);
+            await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, false, uiUpdates, index, albumIndex);
             throw;
+        }
+        finally
+        {
+            try
+            {
+                var cleaned = await WorkflowCleanupService.CleanupLocalJobAsync(jobDirectory, _preflight.TempRoot);
+                uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "CLEANUP", Message: cleaned
+                    ? "Removed all transient files for this album transaction."
+                    : $"Could not remove the transient album job: {jobDirectory}"));
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException)
+            {
+                uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "CLEANUP", Message: $"Could not remove the transient album job: {error.Message}"));
+            }
         }
     }
 
     private void ApplyJobUpdate(JobUiUpdate update)
     {
-        if (update.ThreadId is not null) ThreadId = update.ThreadId;
         if (update.Kind is not null && update.Message is not null)
         {
-            if (!IsStartupNoise(update.Message)) Log(update.Kind, $"[{update.AlbumName}] {update.Message}");
+            Log(update.Kind, $"[{update.AlbumName}] {update.Message}");
         }
         if (update.Progress is null) return;
         _jobProgress[update.Index] = update.Progress;
@@ -667,16 +720,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         string jobDirectory,
         ProgressSnapshot last,
         bool canceled,
-        string? threadId,
         IProgress<JobUiUpdate> uiUpdates,
         int index,
         int albumIndex)
     {
-        if (_preflight is null || !Directory.Exists(jobDirectory)) return;
+        if (_preflight is null) return;
         try
         {
             await HostReportWriter.EnsureTerminalReportAsync(scan, _preflight, jobDirectory,
-                canceled ? "canceled" : "failed", last.Phase, last.Percent, last.Detail, null, threadId);
+                canceled ? "canceled" : "failed", last.Phase, last.Percent, last.Detail);
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "REPORT", Message: "A terminal report was preserved; this album's originals remain in place."));
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
@@ -698,7 +750,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             JobPhase.Tagging => $"Tagging · {snapshot.Percent}%",
             JobPhase.LocalVerificationPassed => $"Locally verified · {snapshot.Percent}%",
             JobPhase.CopyingBack => $"Copying back · {snapshot.Percent}%",
-            JobPhase.NetworkHashesVerified => $"Hashes verified · {snapshot.Percent}%",
+            JobPhase.DestinationSizesVerified => $"Sizes verified · {snapshot.Percent}%",
             JobPhase.FinalCommit => $"Committing · {snapshot.Percent}%",
             JobPhase.FinalVerificationPassed => $"Final verified · {snapshot.Percent}%",
             JobPhase.SourceDisposition => $"Source action · {snapshot.Percent}%",
@@ -733,15 +785,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var result = results.FirstOrDefault(candidate => candidate.Item.Index == album.Index);
             if (!album.CanStart)
                 return new BatchAlbumReportEntry(album.Index + 1, album.Scan.AlbumName, album.Scan.AlbumRoot, "blocked",
-                    null, null, 0, false, null, album.Detail);
+                    null, null, 0, false, album.Detail);
             if (result is null)
                 return new BatchAlbumReportEntry(album.Index + 1, album.Scan.AlbumName, album.Scan.AlbumRoot, "canceled",
-                    Path.Combine(JobDirectory, $"album-{album.Index + 1:000}"), null, 0, false, null, "The admitted job did not start.");
+                    Path.Combine(JobDirectory, $"album-{album.Index + 1:000}"), null, 0, false, "The admitted job did not start.");
             return new BatchAlbumReportEntry(album.Index + 1, album.Scan.AlbumName, album.Scan.AlbumRoot,
                 result.Succeeded ? result.Value!.Incomplete ? "incomplete" : "passed" : result.Canceled ? "canceled" : "failed",
                 result.Value?.JobDirectory ?? Path.Combine(JobDirectory, $"album-{album.Index + 1:000}"),
                 result.Value?.ReportPath, result.Value?.Tracks ?? 0, result.Value?.SourcesDeleted ?? false,
-                result.Value?.ThreadId, result.Error?.Message);
+                result.Error?.Message);
         }).OrderBy(album => album.Index).ToArray();
         var report = new
         {
@@ -848,14 +900,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         catch (Exception error) when (error is IOException or System.Text.Json.JsonException) { ReportHeadline = "Report is not readable yet"; ReportDetail = error.Message; }
     }
 
-    private async Task EnsureTerminalReportAsync(int? exitCode, bool canceled, string? threadId)
+    private async Task EnsureTerminalReportAsync(bool canceled)
     {
-        if (_scan is null || _preflight is null || !Directory.Exists(JobDirectory)) return;
+        if (_scan is null || _preflight is null) return;
         try
         {
             await HostReportWriter.EnsureTerminalReportAsync(_scan, _preflight, JobDirectory,
-                canceled ? "canceled" : "failed", _lastPhase, (int)Progress, _lastRunDetail,
-                exitCode, threadId);
+                canceled ? "canceled" : "failed", _lastPhase, (int)Progress, _lastRunDetail);
             Log("REPORT", "A terminal report was preserved; every original remains in place.");
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
@@ -872,11 +923,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var number = snapshot.Phase is >= JobPhase.Inventoried and <= JobPhase.CleanupCompleted ? (int)snapshot.Phase : Timeline.FirstOrDefault(x => x.State == "Active")?.Number ?? 1;
         foreach (var item in Timeline) item.State = snapshot.Phase == JobPhase.Failed && item.Number == number ? "Failed" : snapshot.Phase == JobPhase.Canceled && item.Number == number ? "Canceled" : item.Number < number ? "Complete" : item.Number == number ? snapshot.Phase == JobPhase.CleanupCompleted ? "Complete" : "Active" : "Pending";
     }
-
-    private static bool IsStartupNoise(string message) =>
-        message.Contains("codex_core::plugins::manifest", StringComparison.OrdinalIgnoreCase) ||
-        message.Contains("codex_core::skills::loader", StringComparison.OrdinalIgnoreCase) ||
-        message.Contains("codex_core::shell_snapshot", StringComparison.OrdinalIgnoreCase);
 
     private void UpdateAlbumActivityOrder(int albumIndex, ProgressSnapshot snapshot)
     {
@@ -1049,31 +1095,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
     private static void Replace<T>(RangeObservableCollection<T> target, IEnumerable<T> items) => target.ReplaceAll(items);
     private static string S(int count) => count == 1 ? "" : "s";
-    private static string PhaseTitle(JobPhase phase) => phase switch { JobPhase.Inventoried => "Inventory complete", JobPhase.CopyingIn => "Preparing the source…", JobPhase.SourceCopyVerified => "Source verified", JobPhase.Processing => "Splitting or extracting…", JobPhase.Tagging => "Writing metadata and artwork…", JobPhase.LocalVerificationPassed => "Local verification passed", JobPhase.CopyingBack => "Copying verified output back…", JobPhase.NetworkHashesVerified => "Destination-side hashes verified", JobPhase.FinalCommit => "Committing final files…", JobPhase.FinalVerificationPassed => "Final-path verification passed", JobPhase.SourceDisposition => "Recording source disposition…", JobPhase.CleanupCompleted => "Album completed", JobPhase.Failed => "Run stopped safely", JobPhase.Canceled => "Run canceled", _ => "Preparing the job…" };
-    private static async Task EnsureWorkerSucceededAsync(RunResult result, string workerName)
-    {
-        var finalMessage = await FinalMessage(result.FinalMessagePath);
-        if (result.Canceled)
-            throw new OperationCanceledException($"{workerName} canceled. Staging and every original were retained for review.");
-        if (result.LastProgress?.Phase == JobPhase.Failed || string.Equals(result.LastProgress?.Status, "failed", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException(finalMessage ?? result.LastProgress?.Detail ?? $"{workerName} failed.");
-        if (result.ExitCode != 0)
-            throw new InvalidOperationException($"{workerName} exited with code {result.ExitCode}. Incomplete jobs retain originals.");
-    }
-    private static async Task<string?> FinalMessage(string path)
-    {
-        if (!File.Exists(path)) return null;
-
-        var text = (await File.ReadAllTextAsync(path, Encoding.UTF8)).Trim();
-        return text.Length <= 800 ? text : text[..799] + "…";
-    }
-
+    private static string PhaseTitle(JobPhase phase) => phase switch { JobPhase.Inventoried => "Inventory complete", JobPhase.CopyingIn => "Preparing the source…", JobPhase.SourceCopyVerified => "Source verified", JobPhase.Processing => "Splitting or extracting…", JobPhase.Tagging => "Writing metadata and artwork…", JobPhase.LocalVerificationPassed => "Local verification passed", JobPhase.CopyingBack => "Copying verified output back…", JobPhase.DestinationSizesVerified => "Destination-side sizes verified", JobPhase.FinalCommit => "Committing final files…", JobPhase.FinalVerificationPassed => "Final-path verification passed", JobPhase.SourceDisposition => "Recording source disposition…", JobPhase.CleanupCompleted => "Album completed", JobPhase.Failed => "Run stopped safely", JobPhase.Canceled => "Run canceled", _ => "Preparing the job…" };
     public void Dispose()
     {
         _progressTimer.Stop();
         _progressTimer.Tick -= ProgressTimer_Tick;
         _cancel?.Cancel();
         _cancel?.Dispose();
+        lifetimeCancellation.Cancel();
+        lifetimeCancellation.Dispose();
         GC.SuppressFinalize(this);
     }
 }

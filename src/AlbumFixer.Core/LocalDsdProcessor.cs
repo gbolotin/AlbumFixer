@@ -1,7 +1,6 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -43,7 +42,6 @@ public sealed partial class LocalDsdProcessor
         var source = staged.Sources[0];
         var iso = HostStagingService.SafeCombine(staged.InputAlbumRoot, source.RelativePath);
         var workingDirectory = Path.GetDirectoryName(staged.SacdExtractPath)!;
-        var toolHash = await HostStagingService.Sha256Async(staged.SacdExtractPath, token);
         var versionOutput = await RunProcessAsync(staged.SacdExtractPath, ["-v"], workingDirectory, null, token, allowNonzero: false);
         var version = versionOutput.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
             .FirstOrDefault(line => line.Contains("sacd_extract client", StringComparison.OrdinalIgnoreCase))?.Trim()
@@ -67,9 +65,15 @@ public sealed partial class LocalDsdProcessor
             layout.Areas.Max(area => area.Tracks.Count),
             years.Original,
             years.Edition,
-            layout.CatalogNumber), token);
+            layout.CatalogNumber), token: token);
         var metadata = ResolveMetadata(scan.AlbumRoot, layout, years, external);
-        var cover = await PrepareCoverAsync(staged.InputAlbumRoot, staged.AlbumRoot, token);
+        var preparedCover = await new InMemoryArtworkService().PrepareLocalAsync(
+            staged.InputAlbumRoot,
+            staged.FfmpegPath,
+            staged.FfprobePath,
+            ArtworkSelectionMode.Dsd,
+            token);
+        var cover = preparedCover.Artwork ?? throw new InvalidDataException(preparedCover.Issue ?? "SACD extraction requires local front-cover artwork.");
         var reportAreas = new JsonArray();
         var allTrackReports = new List<JsonObject>();
         var totalTracks = 0;
@@ -118,22 +122,21 @@ public sealed partial class LocalDsdProcessor
                 var track = area.Tracks[trackIndex];
                 var primary = primaryFiles[trackIndex];
                 var independent = independentFiles[trackIndex];
-                var primaryHash = await HostStagingService.Sha256Async(primary, token);
-                var independentHash = await HostStagingService.Sha256Async(independent, token);
-                if (new FileInfo(primary).Length != new FileInfo(independent).Length ||
-                    !primaryHash.Equals(independentHash, StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException($"Independent extraction mismatch for {area.DisplayName} track {track.Number:00}.");
+                var primarySize = new FileInfo(primary).Length;
+                var independentSize = new FileInfo(independent).Length;
+                if (primarySize != independentSize)
+                    throw new InvalidDataException($"Independent extraction size mismatch for {area.DisplayName} track {track.Number:00}.");
 
                 var outputName = $"{track.Number:00} - {SafeFileName(track.Title)}.dsf";
                 var finalTrack = Path.Combine(finalAreaRoot, outputName);
                 File.Move(primary, finalTrack, overwrite: false);
-                var payloadBefore = await DsfPayloadSha256Async(finalTrack, token);
-                await WriteTagsAsync(finalTrack, cover.Path, layout, area, track, metadata, token);
-                var payloadAfter = await DsfPayloadSha256Async(finalTrack, token);
-                if (!payloadBefore.Equals(payloadAfter, StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException($"DSD audio payload changed while tagging {areaFolderName}/{outputName}.");
+                var payloadBytesBefore = await DsfPayloadLengthAsync(finalTrack, token);
+                await WriteTagsAsync(finalTrack, cover, layout, area, track, metadata, token);
+                var payloadBytesAfter = await DsfPayloadLengthAsync(finalTrack, token);
+                if (payloadBytesBefore != payloadBytesAfter)
+                    throw new InvalidDataException($"DSD audio payload size changed while tagging {areaFolderName}/{outputName}.");
 
-                var probe = await VerifyDsfAsync(staged.FfprobePath, finalTrack, layout, area, track, metadata, cover.Path, token);
+                var probe = await VerifyDsfAsync(staged.FfprobePath, finalTrack, layout, area, track, metadata, cover.Sha256, token);
                 var relative = JsonPath(HostStagingService.SafeRelative(staged.AlbumRoot, finalTrack));
                 var trackReport = new JsonObject
                 {
@@ -149,10 +152,11 @@ public sealed partial class LocalDsdProcessor
                     ["channels"] = probe.Channels,
                     ["channel_layout"] = probe.ChannelLayout,
                     ["dst_decompressed"] = true,
-                    ["untagged_sha256"] = primaryHash,
-                    ["independent_extraction_sha256"] = independentHash,
-                    ["dsd_payload_sha256_before_tags"] = payloadBefore,
-                    ["dsd_payload_sha256_after_tags"] = payloadAfter,
+                    ["untagged_size"] = primarySize,
+                    ["independent_extraction_size"] = independentSize,
+                    ["dsd_payload_bytes_before_tags"] = payloadBytesBefore,
+                    ["dsd_payload_bytes_after_tags"] = payloadBytesAfter,
+                    ["file_size"] = new FileInfo(finalTrack).Length,
                     ["metadata_version"] = "ID3v2"
                 };
                 trackReports.Add(trackReport);
@@ -173,11 +177,11 @@ public sealed partial class LocalDsdProcessor
             });
         }
 
-        progress.Report(Snapshot(JobPhase.Tagging, 45, "DSF tags and front-cover artwork were written; every DSD payload hash is unchanged."));
+        progress.Report(Snapshot(JobPhase.Tagging, 45, "DSF tags and front-cover artwork were written; every DSD payload size is unchanged."));
         var reportPath = Path.Combine(staged.AlbumRoot, "conversion-report.json");
         var report = new JsonObject
         {
-            ["schema_version"] = "1.0",
+            ["schema_version"] = "2.0",
             ["album"] = layout.AlbumTitle,
             ["artist"] = layout.AlbumArtist,
             ["edition"] = string.Join(", ", new[] { metadata.CatalogNumber, "SACD", scan.AlbumName }.Where(value => !string.IsNullOrWhiteSpace(value))),
@@ -189,11 +193,9 @@ public sealed partial class LocalDsdProcessor
             ["source"] = new JsonObject
             {
                 ["file"] = JsonPath(source.RelativePath),
-                ["size"] = source.Size,
-                ["sha256"] = source.Sha256
+                ["size"] = source.Size
             },
             ["extraction_tool"] = version,
-            ["extraction_tool_sha256"] = toolHash,
             ["disc_layout_command"] = layoutCommand,
             ["disc_layout_file"] = "sacd_extract-layout.txt",
             ["metadata_sources"] = new JsonArray(new[] { "SACD disc text and track table", "album folder", cover.Source }
@@ -214,11 +216,7 @@ public sealed partial class LocalDsdProcessor
                 ["sources"] = new JsonArray(metadata.Sources.Select(value => JsonValue.Create(value)).ToArray()),
                 ["warnings"] = new JsonArray(metadata.Warnings.Select(value => JsonValue.Create(value)).ToArray())
             },
-            ["cover"] = new JsonObject
-            {
-                ["file"] = "cover.jpg",
-                ["source"] = cover.Source
-            },
+            ["cover"] = cover.ToReport(),
             ["genre"] = new JsonObject
             {
                 ["value"] = metadata.Genre,
@@ -232,9 +230,9 @@ public sealed partial class LocalDsdProcessor
             ["verification"] = new JsonObject
             {
                 ["status"] = metadata.MissingFields.Count == 0 ? "passed" : "incomplete",
-                ["method"] = "Two deterministic untagged extractions per reported area; exact per-track size/SHA-256 equality; DSF/DSD probe and signal checks; unchanged DSD payload through ID3/artwork tagging.",
+                ["method"] = "Two deterministic untagged extractions per reported area; per-track file-size equality; DSF/DSD probe and signal checks; unchanged DSD payload size through ID3/artwork tagging.",
                 ["independent_extraction"] = "passed",
-                ["tag_payload_verification"] = "passed",
+                ["tag_payload_size_verification"] = "passed",
                 ["audio_and_tags"] = "passed",
                 ["source_deletion_eligible"] = metadata.MissingFields.Count == 0,
                 ["sources_deleted"] = false,
@@ -247,7 +245,7 @@ public sealed partial class LocalDsdProcessor
                 ["identifier"] = Path.GetFileName(staged.JobDirectory),
                 ["local_staging_used"] = true,
                 ["source_cache_used"] = staged.SourceCacheUsed,
-                ["source_input_mode"] = staged.SourceCacheUsed ? "verified_temp_cache" : "local_fixed_disk_in_place",
+                ["source_input_mode"] = staged.SourceCacheUsed ? "size_checked_temp_cache" : "local_fixed_disk_in_place",
                 ["staging_path"] = staged.JobDirectory,
                 ["processor"] = "local_sacd_extract_sequential_areas"
             }
@@ -269,7 +267,7 @@ public sealed partial class LocalDsdProcessor
         return new(totalTracks, reportPath, new MetadataGapResult(true, metadata.MissingFields.Count > 0, metadata.MissingFields, evidence));
     }
 
-    internal static async Task<string> DsfPayloadSha256Async(string path, CancellationToken token = default)
+    internal static async Task<long> DsfPayloadLengthAsync(string path, CancellationToken token = default)
     {
         await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
@@ -287,14 +285,14 @@ public sealed partial class LocalDsdProcessor
             if (chunkSize < 12 || stream.Position - 12 + chunkSize > stream.Length)
                 throw new InvalidDataException($"Invalid DSF chunk size in {path}.");
             if (chunkName.Equals("data", StringComparison.Ordinal))
-                return await HashRangeAsync(stream, chunkSize - 12, token);
+                return chunkSize - 12;
             stream.Position += chunkSize - 12;
         }
         throw new InvalidDataException($"The DSF audio data chunk is missing from {path}.");
     }
 
     private static async Task WriteTagsAsync(
-        string path, string coverPath, SacdLayout layout, SacdArea area, SacdTrack track, ResolvedDsdMetadata metadata, CancellationToken token)
+        string path, PreparedArtwork cover, SacdLayout layout, SacdArea area, SacdTrack track, ResolvedDsdMetadata metadata, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         using var file = TagFile.Create(path);
@@ -311,12 +309,7 @@ public sealed partial class LocalDsdProcessor
         file.Tag.Comment = $"MIX={area.DisplayName}";
         file.Tag.Pictures =
         [
-            new TagLib.Picture(coverPath)
-            {
-                Type = TagLib.PictureType.FrontCover,
-                Description = "Cover (front)",
-                MimeType = "image/jpeg"
-            }
+            InMemoryArtworkService.CreatePicture(cover)
         ];
         if (file.GetTag(TagLib.TagTypes.Id3v2, true) is TagLib.Id3v2.Tag id3)
         {
@@ -333,7 +326,7 @@ public sealed partial class LocalDsdProcessor
     }
 
     internal static async Task<DsfProbe> VerifyDsfAsync(
-        string ffprobe, string path, SacdLayout layout, SacdArea area, SacdTrack track, ResolvedDsdMetadata metadata, string coverPath,
+        string ffprobe, string path, SacdLayout layout, SacdArea area, SacdTrack track, ResolvedDsdMetadata metadata, string expectedArtworkSha256,
         CancellationToken token = default)
     {
         var output = await RunProcessAsync(ffprobe,
@@ -379,7 +372,9 @@ public sealed partial class LocalDsdProcessor
             !UserTextEquals(id3, "ORIGINALDATE", metadata.OriginalDate) ||
             !UserTextEquals(id3, "RELEASEDATE", metadata.ReleaseDate))
             throw new InvalidDataException($"Extended DSF release metadata did not read back correctly from {path}.");
-        if (!File.Exists(coverPath)) throw new FileNotFoundException("The album cover is missing after DSF tagging.", coverPath);
+        var artworkSha256 = InMemoryArtworkService.ReadFrontCoverSha256(path);
+        if (!string.Equals(artworkSha256, expectedArtworkSha256, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"The embedded DSF artwork does not match the prepared in-memory cover: {path}");
         return new(sampleRate, channels, Text(audio, "channel_layout") ?? (channels == 2 ? "stereo" : $"{channels} channels"), duration);
     }
 
@@ -398,12 +393,19 @@ public sealed partial class LocalDsdProcessor
     }
 
     internal static async Task VerifyCommittedDsfAsync(
-        string ffprobe, string path, string expectedPayloadSha256, CancellationToken token = default)
+        string ffprobe,
+        string path,
+        long expectedFileSize,
+        long expectedPayloadBytes,
+        string expectedArtworkSha256,
+        CancellationToken token = default)
     {
         if (!File.Exists(path)) throw new FileNotFoundException("A report-listed DSF track is missing.", path);
-        var payload = await DsfPayloadSha256Async(path, token);
-        if (!payload.Equals(expectedPayloadSha256, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException($"The final DSD payload differs from local verification: {path}");
+        if (new FileInfo(path).Length != expectedFileSize)
+            throw new InvalidDataException($"The final DSF file size differs from local staging: {path}");
+        var payloadBytes = await DsfPayloadLengthAsync(path, token);
+        if (payloadBytes != expectedPayloadBytes)
+            throw new InvalidDataException($"The final DSD payload size differs from local verification: {path}");
         var output = await RunProcessAsync(ffprobe,
             ["-v", "error", "-show_streams", "-show_format", "-of", "json", path], Path.GetDirectoryName(ffprobe)!, null, token);
         using var document = JsonDocument.Parse(output);
@@ -418,6 +420,9 @@ public sealed partial class LocalDsdProcessor
             string.IsNullOrWhiteSpace(tagged.Tag.FirstGenre) || tagged.Tag.Track == 0 || tagged.Tag.TrackCount == 0 ||
             tagged.Tag.Disc == 0 || tagged.Tag.DiscCount == 0 || tagged.Tag.Year == 0 || tagged.Tag.Pictures.Length == 0)
             throw new InvalidDataException($"Required DSF tags or embedded artwork are missing from the final file: {path}");
+        var artworkSha256 = InMemoryArtworkService.ReadFrontCoverSha256(path);
+        if (!string.Equals(artworkSha256, expectedArtworkSha256, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"The final DSF embedded artwork differs from local staging: {path}");
     }
 
     private static SacdLayout ParseLayout(string output)
@@ -453,28 +458,6 @@ public sealed partial class LocalDsdProcessor
             areas.Add(new(speakerConfig.Contains("2 Channel", StringComparison.OrdinalIgnoreCase), speakerConfig, totalPlayTime, tracks));
         }
         return new(albumTitle, albumArtist, catalog?.Trim(), creationDate, areas);
-    }
-
-    private static async Task<LocalCover> PrepareCoverAsync(string sourceAlbumRoot, string outputAlbumRoot, CancellationToken token)
-    {
-        var candidates = Directory.EnumerateFiles(sourceAlbumRoot, "*", SearchOption.AllDirectories)
-            .Where(path => new[] { ".jpg", ".jpeg" }.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase))
-            .OrderBy(path => CoverRank(sourceAlbumRoot, path)).ThenBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
-        if (candidates.Length == 0) throw new InvalidDataException("SACD extraction requires local JPEG cover artwork.");
-        var source = candidates[0];
-        var target = Path.Combine(outputAlbumRoot, "cover.jpg");
-        if (!source.Equals(target, StringComparison.OrdinalIgnoreCase)) File.Copy(source, target, overwrite: false);
-        await Task.CompletedTask;
-        return new(target, $"local file: {JsonPath(HostStagingService.SafeRelative(sourceAlbumRoot, source))}");
-    }
-
-    private static int CoverRank(string root, string path)
-    {
-        var name = Path.GetFileNameWithoutExtension(path);
-        if (name.Equals("cover", StringComparison.OrdinalIgnoreCase) || name.Equals("folder", StringComparison.OrdinalIgnoreCase) || name.Equals("front", StringComparison.OrdinalIgnoreCase)) return 0;
-        if (name.Contains("front", StringComparison.OrdinalIgnoreCase) || name.Contains("cover", StringComparison.OrdinalIgnoreCase)) return 1;
-        if (Path.GetDirectoryName(path)?.Contains($"{Path.DirectorySeparatorChar}Artwork", StringComparison.OrdinalIgnoreCase) == true) return 2;
-        return Path.GetDirectoryName(path)?.Equals(root, StringComparison.OrdinalIgnoreCase) == true ? 3 : 4;
     }
 
     private static IReadOnlyList<string> FindDsfFiles(string root) => Directory.EnumerateFiles(root, "*.dsf", SearchOption.AllDirectories)
@@ -639,21 +622,6 @@ public sealed partial class LocalDsdProcessor
         }
     }
 
-    private static async Task<string> HashRangeAsync(Stream stream, long bytes, CancellationToken token)
-    {
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        var buffer = new byte[1024 * 1024];
-        var remaining = bytes;
-        while (remaining > 0)
-        {
-            var read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), token);
-            if (read == 0) throw new EndOfStreamException();
-            hash.AppendData(buffer, 0, read);
-            remaining -= read;
-        }
-        return Convert.ToHexString(hash.GetHashAndReset());
-    }
-
     private static string CommandText(string executable, IEnumerable<string> arguments) =>
         string.Join(" ", new[] { Quote(executable) }.Concat(arguments.Select(Quote)));
     private static string Quote(string value) => value.Any(char.IsWhiteSpace) ? $"\"{value.Replace("\"", "\\\"")}\"" : value;
@@ -699,7 +667,6 @@ public sealed partial class LocalDsdProcessor
         IReadOnlyList<string> Sources,
         IReadOnlyList<string> Warnings,
         IReadOnlyList<string> MissingFields);
-    private sealed record LocalCover(string Path, string Source);
 
     [GeneratedRegex("^\\s*Area Information \\[\\d+\\]:", RegexOptions.Multiline | RegexOptions.IgnoreCase)]
     private static partial Regex AreaStart();

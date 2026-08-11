@@ -26,7 +26,10 @@ public sealed record ExternalAlbumMetadata(
     string? GenreConfidence,
     string? GenreRationale,
     IReadOnlyList<string> Sources,
-    IReadOnlyList<string> Warnings)
+    IReadOnlyList<string> Warnings,
+    string? MusicBrainzReleaseId,
+    string? MusicBrainzReleaseGroupId,
+    IReadOnlyList<string> TrackTitles)
 {
     public bool HasMatch => Sources.Count > 0;
 }
@@ -55,7 +58,10 @@ public sealed class ExternalMetadataService
         _requestTimeout = requestTimeout ?? TimeSpan.FromSeconds(8);
     }
 
-    public async Task<ExternalAlbumMetadata> ResolveAsync(AlbumMetadataQuery query, CancellationToken token = default)
+    public async Task<ExternalAlbumMetadata> ResolveAsync(
+        AlbumMetadataQuery query,
+        bool includeTrackTitles = false,
+        CancellationToken token = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(query.Album);
         ArgumentException.ThrowIfNullOrWhiteSpace(query.Artist);
@@ -71,7 +77,7 @@ public sealed class ExternalMetadataService
             await TryProviderAsync("Discogs", () => ResolveDiscogsAsync(query, token), matches, warnings, token);
         }
 
-        await TryProviderAsync("MusicBrainz", () => ResolveMusicBrainzAsync(query, token), matches, warnings, token);
+        await TryProviderAsync("MusicBrainz", () => ResolveMusicBrainzAsync(query, includeTrackTitles, token), matches, warnings, token);
         await TryProviderAsync("Apple Music", () => ResolveAppleAsync(query, token), matches, warnings, token);
 
         var genreMatch = matches.FirstOrDefault(match => match.Genre is not null);
@@ -87,7 +93,54 @@ public sealed class ExternalMetadataService
             genreMatch?.GenreConfidence,
             genreMatch?.GenreRationale,
             matches.SelectMany(match => match.Sources).Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
-            warnings.Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
+            warnings.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
+            First(matches, match => match.MusicBrainzReleaseId),
+            First(matches, match => match.MusicBrainzReleaseGroupId),
+            matches.Select(match => match.TrackTitles).FirstOrDefault(titles => titles.Count == query.TrackCount) ?? []);
+    }
+
+    public Task<ExternalAlbumMetadata> ResolveAsync(
+        AlbumMetadataQuery query,
+        CancellationToken token) => ResolveAsync(query, includeTrackTitles: false, token);
+
+    public async Task<DownloadedArtwork> DownloadFrontCoverAsync(
+        string releaseId,
+        CancellationToken token = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(releaseId);
+        const long maximumDownloadBytes = 15L * 1024 * 1024;
+        var source = new Uri($"https://coverartarchive.org/release/{Uri.EscapeDataString(releaseId)}/front-500");
+        using var request = new HttpRequestMessage(HttpMethod.Get, source);
+        request.Headers.UserAgent.ParseAdd(UserAgent);
+        request.Headers.Accept.ParseAdd("image/jpeg, image/png;q=0.9, image/*;q=0.8");
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(_requestTimeout);
+        using var response = await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+        response.EnsureSuccessStatusCode();
+        var contentType = response.Content.Headers.ContentType?.MediaType;
+        if (contentType is null || !contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Cover Art Archive returned a non-image response.");
+        if (response.Content.Headers.ContentLength is > maximumDownloadBytes)
+            throw new InvalidDataException("Cover Art Archive returned an unexpectedly large image.");
+
+        await using var input = await response.Content.ReadAsStreamAsync(timeout.Token);
+        await using var output = new MemoryStream();
+        var buffer = new byte[81920];
+        long total = 0;
+        while (true)
+        {
+            var read = await input.ReadAsync(buffer, timeout.Token);
+            if (read == 0) break;
+            total += read;
+            if (total > maximumDownloadBytes)
+                throw new InvalidDataException("Cover Art Archive image exceeded the download limit.");
+            await output.WriteAsync(buffer.AsMemory(0, read), timeout.Token);
+        }
+        if (total == 0) throw new InvalidDataException("Cover Art Archive returned an empty image.");
+        return new(
+            output.ToArray(),
+            contentType,
+            response.RequestMessage?.RequestUri?.AbsoluteUri ?? source.AbsoluteUri);
     }
 
     internal static string? ChooseBroadGenre(IEnumerable<(string Name, int Weight)> values)
@@ -103,7 +156,10 @@ public sealed class ExternalMetadataService
             .Select(pair => pair.Key).FirstOrDefault();
     }
 
-    private async Task<ProviderMetadata?> ResolveMusicBrainzAsync(AlbumMetadataQuery query, CancellationToken token)
+    private async Task<ProviderMetadata?> ResolveMusicBrainzAsync(
+        AlbumMetadataQuery query,
+        bool includeTrackTitles,
+        CancellationToken token)
     {
         var lucene = $"release:\"{EscapeLucene(query.Album)}\" AND artist:\"{EscapeLucene(query.Artist)}\"";
         var searchUri = new Uri($"https://musicbrainz.org/ws/2/release/?query={Uri.EscapeDataString(lucene)}&fmt=json&limit=100");
@@ -148,10 +204,12 @@ public sealed class ExternalMetadataService
         var genreSourceType = "musicbrainz_release_group";
         var genreRationale = "Broad genre selected from MusicBrainz release-group genres and weighted tags.";
         var sources = new List<string>();
+        string? originalDate = null;
         if (groupId is not null)
         {
             var groupUri = new Uri($"https://musicbrainz.org/ws/2/release-group/{Uri.EscapeDataString(groupId)}?inc=genres%2Btags%2Burl-rels&fmt=json");
             using var details = await GetMusicBrainzJsonAsync(groupUri, token);
+            originalDate = Text(details.RootElement, "first-release-date");
             var genres = WeightedNames(details.RootElement, "genres", defaultWeight: 10)
                 .Concat(WeightedNames(details.RootElement, "tags", defaultWeight: 1));
             genre = ChooseBroadGenre(genres);
@@ -172,10 +230,13 @@ public sealed class ExternalMetadataService
 
         if (exactEdition && releaseId is not null) sources.Add($"https://musicbrainz.org/release/{releaseId}");
         if (groupId is not null) sources.Add($"https://musicbrainz.org/release-group/{groupId}");
+        var trackTitles = includeTrackTitles && releaseId is not null
+            ? await ResolveMusicBrainzTrackTitlesAsync(releaseId, query.TrackCount, token)
+            : [];
         return new(
             genre,
             exactEdition ? Text(candidate, "date") : null,
-            null,
+            originalDate,
             exactEdition ? candidateLabel.Label : null,
             exactEdition ? candidateLabel.CatalogNumber : null,
             exactEdition ? Text(candidate, "barcode") : null,
@@ -183,7 +244,28 @@ public sealed class ExternalMetadataService
             genre is null ? null : genreSourceType,
             genre is null ? null : exactEdition ? "high" : "medium",
             genre is null ? null : genreRationale,
-            sources);
+            sources,
+            releaseId,
+            groupId,
+            trackTitles);
+    }
+
+    private async Task<IReadOnlyList<string>> ResolveMusicBrainzTrackTitlesAsync(
+        string releaseId,
+        int expectedTrackCount,
+        CancellationToken token)
+    {
+        var uri = new Uri($"https://musicbrainz.org/ws/2/release/{Uri.EscapeDataString(releaseId)}?inc=recordings&fmt=json");
+        using var details = await GetMusicBrainzJsonAsync(uri, token);
+        if (!details.RootElement.TryGetProperty("media", out var media) || media.ValueKind != JsonValueKind.Array) return [];
+        var titles = media.EnumerateArray()
+            .Where(value => value.TryGetProperty("tracks", out var tracks) && tracks.ValueKind == JsonValueKind.Array)
+            .SelectMany(value => value.GetProperty("tracks").EnumerateArray())
+            .Select(track => Text(track, "title") ?? (track.TryGetProperty("recording", out var recording) ? Text(recording, "title") : null))
+            .Where(title => !string.IsNullOrWhiteSpace(title))
+            .Select(title => title!)
+            .ToArray();
+        return titles.Length == expectedTrackCount ? titles : [];
     }
 
     private async Task<ProviderMetadata?> ResolveDiscogsAsync(AlbumMetadataQuery query, CancellationToken token)
@@ -238,7 +320,10 @@ public sealed class ExternalMetadataService
             genre is null ? null : "discogs_exact_release",
             genre is null ? null : "high",
             genre is null ? null : "Broad genre selected from the exact Discogs SACD release genres and styles.",
-            [$"https://www.discogs.com/release/{id.Value}"]);
+            [$"https://www.discogs.com/release/{id.Value}"],
+            null,
+            null,
+            []);
     }
 
     private async Task<(string? Genre, string? Source)> ResolveLinkedDiscogsGenreAsync(JsonElement musicBrainzGroup, AlbumMetadataQuery query, CancellationToken token)
@@ -293,7 +378,10 @@ public sealed class ExternalMetadataService
                 genre is null ? null : "apple_music_catalog",
                 genre is null ? null : "medium",
                 genre is null ? null : "Broad genre selected from an exact Apple Music artist, album, year, and track-count match.",
-                [source]);
+                [source],
+                null,
+                null,
+                []);
         }
         return null;
     }
@@ -459,5 +547,8 @@ public sealed class ExternalMetadataService
         string? GenreSourceType,
         string? GenreConfidence,
         string? GenreRationale,
-        IReadOnlyList<string> Sources);
+        IReadOnlyList<string> Sources,
+        string? MusicBrainzReleaseId,
+        string? MusicBrainzReleaseGroupId,
+        IReadOnlyList<string> TrackTitles);
 }

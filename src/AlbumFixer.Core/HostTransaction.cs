@@ -1,16 +1,14 @@
 using System.Diagnostics;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace AlbumFixer.Core;
 
-public sealed record StagedSource(string RelativePath, long Size, string Sha256);
+public sealed record StagedSource(string RelativePath, long Size);
 public sealed record StagedJob(
     string JobDirectory,
     string AlbumRoot,
-    string SkillPath,
     string FfmpegPath,
     string FfprobePath,
     string ManifestPath,
@@ -34,27 +32,28 @@ public sealed class HostStagingService
     public async Task<StagedJob> StageAsync(
         ScanResult scan,
         PreflightResult preflight,
-        string skillPath,
         string jobDirectory,
         IProgress<ProgressSnapshot> progress,
         CancellationToken token = default)
     {
         ValidateJobDirectory(jobDirectory, preflight.TempRoot);
+        var abandonedCleanup = await WorkflowCleanupService.CleanupDestinationStagesAsync(scan.AlbumRoot);
+        if (!abandonedCleanup.Completed)
+            throw new IOException($"Could not remove abandoned Album Fixer destination staging: {string.Join(", ", abandonedCleanup.RemainingPaths)}");
         var albumRoot = Path.Combine(jobDirectory, "album");
         var toolsRoot = Path.Combine(jobDirectory, "tools");
-        var skillRoot = Path.Combine(jobDirectory, "skill");
         var sourceCacheUsed = RequiresSourceCache(scan.AlbumRoot);
         var inputAlbumRoot = sourceCacheUsed ? albumRoot : scan.AlbumRoot;
         Directory.CreateDirectory(albumRoot);
         Directory.CreateDirectory(toolsRoot);
 
         progress.Report(Snapshot(JobPhase.Inventoried, 1, "Album inventory is complete. The original is unchanged."));
-        var previousOutputCleanup = await PreviousOutputCleanupService.CleanupAsync(scan.AlbumRoot, token);
+        var previousOutputCleanup = PreviousOutputCleanupService.Cleanup(scan.AlbumRoot, token);
         if (previousOutputCleanup is not null)
             progress.Report(Snapshot(JobPhase.Inventoried, 1,
                 $"Removed {previousOutputCleanup.DeletedFiles} report-proven track{(previousOutputCleanup.DeletedFiles == 1 ? "" : "s")} from an incomplete earlier run and archived its report."));
         var previousVerifiedOutput = PreviousOutputCleanupService.DiscoverVerified(scan.AlbumRoot);
-        await PreviousOutputCleanupService.VerifyDirectFilesAsync(previousVerifiedOutput, token);
+        PreviousOutputCleanupService.VerifyDirectFileSizes(previousVerifiedOutput, token);
         var directPreviousFiles = PreviousOutputCleanupService.DirectFiles(previousVerifiedOutput);
         var directPreviousAudio = PreviousOutputCleanupService.DirectFiles(previousVerifiedOutput)
             .Where(file => Path.GetExtension(file.RelativePath).Equals(".flac", StringComparison.OrdinalIgnoreCase))
@@ -71,11 +70,11 @@ public sealed class HostStagingService
             .ToArray();
         if (sourceFiles.Length == 0) throw new InvalidOperationException("No exact source file was identified for verified staging.");
 
-        var sourceHashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var sourceSizes = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         foreach (var source in sourceFiles)
         {
             token.ThrowIfCancellationRequested();
-            sourceHashes[source] = await Sha256Async(source, token);
+            sourceSizes[source] = new FileInfo(source).Length;
         }
 
         if (sourceCacheUsed)
@@ -117,23 +116,21 @@ public sealed class HostStagingService
         {
             token.ThrowIfCancellationRequested();
             var relative = SafeRelative(scan.AlbumRoot, source);
-            var originalHash = sourceHashes[source];
-            var size = new FileInfo(source).Length;
+            var size = sourceSizes[source];
             if (sourceCacheUsed)
             {
                 var localPath = SafeCombine(albumRoot, relative);
-                var localHash = await Sha256Async(localPath, token);
-                if (new FileInfo(localPath).Length != size || !localHash.Equals(originalHash, StringComparison.OrdinalIgnoreCase))
-                    throw new IOException($"The local copy of '{relative}' does not match the original SHA-256. The original was retained.");
+                if (new FileInfo(localPath).Length != size)
+                    throw new IOException($"The local copy of '{relative}' does not match the original file size. The original was retained.");
             }
-            stagedSources.Add(new(relative, size, originalHash));
+            stagedSources.Add(new(relative, size));
         }
         progress.Report(Snapshot(JobPhase.SourceCopyVerified, 17, sourceCacheUsed
-            ? "The Windows Temp source cache matches the original size and SHA-256."
-            : "The fixed-disk source will be read in place; its original size and SHA-256 were recorded."));
+            ? "The Windows Temp source cache matches the original file size."
+            : "The fixed-disk source will be read in place; its original file size was recorded."));
 
         var ffprobe = RequireTool(preflight, "ffprobe");
-        var ffmpeg = scan.HasFlac ? RequireTool(preflight, "ffmpeg") : string.Empty;
+        var ffmpeg = scan.HasFlac || scan.HasDsd ? RequireTool(preflight, "ffmpeg") : string.Empty;
         var sacdExtract = scan.Mode == WorkflowMode.DsdExtraction ? RequireTool(preflight, "sacd_extract") : string.Empty;
         var stagedFfmpeg = ffmpeg.Length == 0 ? string.Empty : Path.Combine(toolsRoot, "ffmpeg.exe");
         var stagedFfprobe = Path.Combine(toolsRoot, "ffprobe.exe");
@@ -174,14 +171,13 @@ public sealed class HostStagingService
             {
                 path = source.RelativePath,
                 size = source.Size,
-                original_sha256 = source.Sha256,
-                staged_sha256 = sourceCacheUsed ? source.Sha256 : null,
-                copy_in_status = sourceCacheUsed ? "verified" : "not_required_local_fixed_disk"
+                staged_size = sourceCacheUsed ? source.Size : (long?)null,
+                copy_in_status = sourceCacheUsed ? "size_verified" : "not_required_local_fixed_disk"
             })
         };
         await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false), token);
 
-        return new(jobDirectory, albumRoot, string.Empty, stagedFfmpeg, stagedFfprobe, manifestPath, stagedSources,
+        return new(jobDirectory, albumRoot, stagedFfmpeg, stagedFfprobe, manifestPath, stagedSources,
             previousOutputCleanup, previousVerifiedOutput, stagedSacdExtract,
             SourceAlbumRoot: inputAlbumRoot, SourceCacheUsed: sourceCacheUsed);
     }
@@ -199,30 +195,6 @@ public sealed class HostStagingService
         {
             return true;
         }
-    }
-
-    public async Task<string> StageSkillAsync(string skillPath, string jobDirectory, CancellationToken token = default)
-    {
-        if (!File.Exists(skillPath)) throw new FileNotFoundException("The optional Album Fixer metadata skill is unavailable.", skillPath);
-        var skillRoot = SafeCombine(jobDirectory, "skill");
-        if (Directory.Exists(skillRoot) && Directory.EnumerateFileSystemEntries(skillRoot).Any())
-            throw new IOException("The local metadata-skill staging folder is not empty.");
-        Directory.CreateDirectory(skillRoot);
-        var installedSkillRoot = Path.GetDirectoryName(Path.GetFullPath(skillPath))
-            ?? throw new InvalidOperationException("The Album Fixer skill has no parent directory.");
-        foreach (var source in EnumerateTree(installedSkillRoot))
-        {
-            token.ThrowIfCancellationRequested();
-            var destination = SafeCombine(skillRoot, SafeRelative(installedSkillRoot, source));
-            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-            await CopyFileAsync(source, destination, null, token);
-        }
-        return Path.Combine(skillRoot, "SKILL.md");
-    }
-    public static async Task<string> Sha256Async(string path, CancellationToken token = default)
-    {
-        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        return Convert.ToHexString(await SHA256.HashDataAsync(stream, token));
     }
 
     public static void ValidateJobDirectory(string jobDirectory, string tempRoot)
@@ -316,11 +288,33 @@ public sealed class HostCommitService
         bool deleteOriginals,
         CancellationToken token = default)
     {
+        try
+        {
+            var result = await CommitCoreAsync(scan, staged, progress, deleteOriginals, token);
+            var cleanup = await WorkflowCleanupService.CleanupDestinationStagesAsync(scan.AlbumRoot);
+            if (!cleanup.Completed)
+                throw new IOException($"Could not remove Album Fixer destination staging: {string.Join(", ", cleanup.RemainingPaths)}");
+            return result;
+        }
+        catch
+        {
+            await WorkflowCleanupService.CleanupDestinationStagesAsync(scan.AlbumRoot);
+            throw;
+        }
+    }
+
+    private static async Task<HostCommitResult> CommitCoreAsync(
+        ScanResult scan,
+        StagedJob staged,
+        IProgress<ProgressSnapshot> progress,
+        bool deleteOriginals,
+        CancellationToken token)
+    {
         if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.DsdExtraction)
             throw new NotSupportedException("Verified host write-back is available for FLAC + CUE and SACD ISO workflows only. Every original was retained.");
         var isDsd = scan.Mode == WorkflowMode.DsdExtraction;
         if (!staged.SourceCacheUsed)
-            await VerifyOriginalSourcesUnchangedAsync(scan, staged, token);
+            VerifyOriginalSourceSizesUnchanged(scan, staged, token);
 
         var localReportPath = Path.Combine(staged.AlbumRoot, "conversion-report.json");
         if (!File.Exists(localReportPath)) throw new FileNotFoundException("The local processor did not create the required conversion report.", localReportPath);
@@ -331,7 +325,7 @@ public sealed class HostCommitService
             ? NormalizeAndCollectDsdOutputs(report, staged.AlbumRoot)
             : NormalizeAndCollectOutputs(report, staged.AlbumRoot);
         if (outputs.Count == 0) throw new InvalidOperationException("The conversion report contains no playback tracks to commit.");
-        await PreviousOutputCleanupService.VerifyDirectFilesAsync(staged.PreviousVerifiedOutput, token);
+        PreviousOutputCleanupService.VerifyDirectFileSizes(staged.PreviousVerifiedOutput, token);
         var replacementFiles = PreviousOutputCleanupService.DirectFiles(staged.PreviousVerifiedOutput);
         var replacementPaths = replacementFiles
             .Select(file => file.RelativePath)
@@ -341,7 +335,7 @@ public sealed class HostCommitService
         if (unmatchedReplacements.Length > 0)
             throw new IOException($"The new split no longer produces every report-proven root output: {string.Join(", ", unmatchedReplacements)}. The prior tracks were retained.");
         var localPlayback = await VerifyPlaybackFilesAsync(outputs, staged.AlbumRoot, staged, report, isDsd, token);
-        var localArtworkIssues = isDsd ? [] : ArtworkIssues(report, staged.AlbumRoot, localPlayback.ArtworkIssues);
+        var localArtworkIssues = isDsd ? [] : ArtworkIssues(report, localPlayback.ArtworkIssues);
         var localIncompleteIssues = IncompleteIssues(report, localArtworkIssues);
         var incomplete = localIncompleteIssues.Count > 0;
         if (isDsd) ConfirmDsdVerification(report, "local staging", sourceDeletionRequested: true);
@@ -349,17 +343,17 @@ public sealed class HostCommitService
         await AtomicWriteAsync(localReportPath, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
         progress.Report(new(JobPhase.LocalVerificationPassed, 50, incomplete ? "incomplete" : "running", isDsd
             ? incomplete
-                ? "Independent SACD extraction and DSD payload checks passed locally; unresolved metadata will be delivered as incomplete work."
-                : "Independent SACD extraction, DSF/DSD, tag, artwork, and payload checks passed locally."
+                ? "Independent SACD extraction size and DSD structure checks passed locally; unresolved metadata will be delivered as incomplete work."
+                : "Independent SACD extraction size, DSF/DSD, tag, and artwork checks passed locally."
             : incomplete
                 ? "Local FLAC and tag checks passed; front-cover artwork is deferred and the original source will be retained."
                 : "Quick local FLAC, tag, and artwork checks passed. Full PCM comparison was skipped.", DateTimeOffset.UtcNow));
         var jobId = Path.GetFileName(staged.JobDirectory.TrimEnd(Path.DirectorySeparatorChar));
-        var networkStage = HostStagingService.SafeCombine(scan.AlbumRoot, $".album-fixer-stage-{jobId}");
+        var networkStage = WorkflowCleanupService.DestinationStagePath(scan.AlbumRoot, staged.JobDirectory);
         if (Directory.Exists(networkStage) || File.Exists(networkStage)) throw new IOException($"A destination staging path already exists: {networkStage}");
         Directory.CreateDirectory(networkStage);
 
-        var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var sizes = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         progress.Report(Snapshot(JobPhase.CopyingBack, 58, "Copying verified tracks and provenance to a private destination-side staging folder."));
         foreach (var relative in outputs)
         {
@@ -372,13 +366,13 @@ public sealed class HostCommitService
             var network = HostStagingService.SafeCombine(networkStage, relative);
             Directory.CreateDirectory(Path.GetDirectoryName(network)!);
             await HostStagingService.CopyFileAsync(local, network, null, token);
-            var localHash = await HostStagingService.Sha256Async(local, token);
-            var networkHash = await HostStagingService.Sha256Async(network, token);
-            if (!localHash.Equals(networkHash, StringComparison.OrdinalIgnoreCase))
-                throw new IOException($"Destination-side SHA-256 differs for '{relative}'. The original was retained.");
-            hashes[relative] = localHash;
+            var localSize = new FileInfo(local).Length;
+            var networkSize = new FileInfo(network).Length;
+            if (localSize != networkSize)
+                throw new IOException($"Destination-side file size differs for '{relative}'. The original was retained.");
+            sizes[relative] = localSize;
         }
-        progress.Report(Snapshot(JobPhase.NetworkHashesVerified, 68, "Every destination-side staging file matches its local SHA-256."));
+        progress.Report(Snapshot(JobPhase.DestinationSizesVerified, 68, "Every destination-side staging file matches its local file size."));
 
         var existingReport = Path.Combine(scan.AlbumRoot, "conversion-report.json");
         var previousReport = Path.Combine(networkStage, ".previous-conversion-report.json");
@@ -417,12 +411,12 @@ public sealed class HostCommitService
             report["commit"] = commit;
             commit["status"] = "committed";
             commit["network_side_staging"] = networkStage;
-            commit["network_hashes_verified"] = true;
+            commit["destination_sizes_verified"] = true;
             commit["committed_at_utc"] = DateTimeOffset.UtcNow;
-            commit["files"] = new JsonArray(hashes.Select(pair => (JsonNode)new JsonObject
+            commit["files"] = new JsonArray(sizes.Select(pair => (JsonNode)new JsonObject
             {
                 ["file"] = pair.Key,
-                ["sha256"] = pair.Value
+                ["size"] = pair.Value
             }).ToArray());
             if (rolledBack.Count > 0)
                 commit["replaced_previous_outputs"] = new JsonArray(rolledBack.Select(path => JsonValue.Create(path)).ToArray());
@@ -433,9 +427,9 @@ public sealed class HostCommitService
             job["local_staging_path"] = staged.JobDirectory;
             job["host_copy_in_manifest"] = staged.ManifestPath;
             job["source_cache_used"] = staged.SourceCacheUsed;
-            job["source_input_mode"] = staged.SourceCacheUsed ? "verified_temp_cache" : "local_fixed_disk_in_place";
-            job["copy_in_status"] = staged.SourceCacheUsed ? "verified" : "not_required_local_fixed_disk";
-            job["copy_back_status"] = "verified";
+            job["source_input_mode"] = staged.SourceCacheUsed ? "size_checked_temp_cache" : "local_fixed_disk_in_place";
+            job["copy_in_status"] = staged.SourceCacheUsed ? "size_verified" : "not_required_local_fixed_disk";
+            job["copy_back_status"] = "size_verified";
             if (staged.PipelineLimits is { } limits)
             {
                 var telemetry = staged.PipelineTelemetry ?? new BatchPipelineTelemetry(0, 0, 0, 0);
@@ -494,7 +488,7 @@ public sealed class HostCommitService
 
         token.ThrowIfCancellationRequested();
         var finalPlayback = await VerifyPlaybackFilesAsync(outputs, scan.AlbumRoot, staged, report, isDsd, token);
-        var finalArtworkIssues = isDsd ? [] : ArtworkIssues(report, scan.AlbumRoot, finalPlayback.ArtworkIssues);
+        var finalArtworkIssues = isDsd ? [] : ArtworkIssues(report, finalPlayback.ArtworkIssues);
         var finalIncompleteIssues = IncompleteIssues(report, finalArtworkIssues);
         incomplete = finalIncompleteIssues.Count > 0;
         var rollbackCleaned = rolledBack.Count == 0 || TryDeleteDirectory(rollbackRoot);
@@ -508,13 +502,13 @@ public sealed class HostCommitService
         else SetQuickVerification(report, "final album path", deletesSource, finalIncompleteIssues);
         token.ThrowIfCancellationRequested();
         IReadOnlyList<DeletionTarget> deletionTargets = deletesSource
-            ? await ResolveDeletionTargetsAsync(scan, staged, isDsd, token)
+            ? ResolveDeletionTargets(scan, staged, isDsd, token)
             : [];
         var deletion = new JsonObject
         {
             ["status"] = deletesSource ? "pending" : "retained",
             ["policy"] = deletesSource
-                ? isDsd ? "verified_sacd_independent_extraction_and_dsd_payload_equivalence" : "user_requested_without_pcm_equivalence"
+                ? isDsd ? "sacd_independent_extraction_size_and_structure_checks" : "user_requested_size_and_quick_checks_without_pcm_equivalence"
                 : deleteOriginals ? "source_retained_without_complete_deletion_authorization" : "source_retained_by_user_request",
             ["authorized_after"] = deletesSource ? isDsd ? "full_dsd_final_path_verification" : "quick_final_path_checks" : null,
             ["files"] = new JsonArray(staged.Sources.Select(source => JsonValue.Create(source.RelativePath)).ToArray()),
@@ -524,8 +518,8 @@ public sealed class HostCommitService
             ? "The user chose to retain original sources."
             : isDsd
             ? incomplete
-                ? "The DSF tracks passed extraction and payload verification, but metadata remains incomplete; the original SACD ISO was retained."
-                : "The SACD report did not prove every independent-extraction and DSD payload gate."
+                ? "The DSF tracks passed extraction-size and structure verification, but metadata remains incomplete; the original SACD ISO was retained."
+                : "The SACD report did not prove every independent-extraction size and DSD structure gate."
             : incomplete
                 ? "Artwork is incomplete; the original FLAC image was retained for later repair."
                 : "Automatic deletion confirmation covers one exact FLAC image only.";
@@ -533,11 +527,11 @@ public sealed class HostCommitService
         await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
         progress.Report(new(JobPhase.FinalVerificationPassed, 90, incomplete ? "incomplete" : "running", isDsd
             ? incomplete
-                ? "Final DSF/DSD payload, report-path, and copy-hash checks passed; unresolved metadata remains marked incomplete."
-                : "Final DSF/DSD, tag, artwork, payload, report-path, and copy-hash checks passed."
+                ? "Final DSF/DSD structure, report-path, and file-size checks passed; unresolved metadata remains marked incomplete."
+                : "Final DSF/DSD, tag, artwork, report-path, and file-size checks passed."
             : incomplete
-                ? "Final FLAC, tag, and copy-hash checks passed; artwork remains deferred."
-                : "Quick final FLAC, tag, artwork, and copy-hash checks passed.", DateTimeOffset.UtcNow));
+                ? "Final FLAC, tag, and file-size checks passed; artwork remains deferred."
+                : "Quick final FLAC, tag, artwork, and file-size checks passed.", DateTimeOffset.UtcNow));
 
         var deleted = false;
         if (deletesSource)
@@ -588,8 +582,9 @@ public sealed class HostCommitService
         await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None);
 
         var networkCleaned = TryDeleteDirectory(networkStage);
-        HostStagingService.ValidateJobDirectory(staged.JobDirectory, Path.Combine(Path.GetTempPath(), "album-fixer"));
-        var localCleaned = TryDeleteDirectory(staged.JobDirectory);
+        var localCleaned = await WorkflowCleanupService.CleanupLocalJobAsync(
+            staged.JobDirectory,
+            Path.Combine(Path.GetTempPath(), "album-fixer"));
         try
         {
             commit = report["commit"] as JsonObject ?? new JsonObject();
@@ -612,7 +607,7 @@ public sealed class HostCommitService
             ? $"the original {(isDsd ? "SACD ISO" : "FLAC image")} was deleted"
             : $"all {staged.Sources.Count} original source image{(staged.Sources.Count == 1 ? " was" : "s were")} retained";
         var cleanupDetail = incomplete
-            ? $"Tracks were delivered as incomplete work; audio and copy hashes passed, unresolved metadata or artwork is deferred, and {disposition}."
+            ? $"Tracks were delivered as incomplete work; structural and file-size checks passed, unresolved metadata or artwork is deferred, and {disposition}."
             : localCleaned && networkCleaned
                 ? $"Conversion completed; final files and report passed quick checks, and {disposition}."
                 : $"Conversion completed and {disposition}; a staging folder may require cleanup.";
@@ -653,13 +648,6 @@ public sealed class HostCommitService
         }
         if (report["genre"] is not JsonObject genre || string.IsNullOrWhiteSpace(genre["value"]?.GetValue<string>()))
             throw new JsonException("The conversion report has no nonempty genre value or provenance.");
-        if (report["cover"] is JsonObject cover && cover["file"] is not null)
-        {
-            var coverRelative = NormalizePathValue(cover["file"], stagedAlbumRoot, "cover");
-            cover["file"] = coverRelative;
-            if (File.Exists(HostStagingService.SafeCombine(stagedAlbumRoot, coverRelative)) && !sources.Contains(coverRelative))
-                outputs.Add(coverRelative);
-        }
         return outputs.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToList();
     }
 
@@ -684,11 +672,7 @@ public sealed class HostCommitService
         }
         if (report["genre"] is not JsonObject genre || string.IsNullOrWhiteSpace(genre["value"]?.GetValue<string>()))
             throw new JsonException("The SACD conversion report has no nonempty genre value or provenance.");
-        if (report["cover"] is not JsonObject cover || cover["file"] is null)
-            throw new JsonException("The SACD conversion report has no required cover.jpg file entry.");
-        var coverRelative = NormalizePathValue(cover["file"], stagedAlbumRoot, "cover");
-        cover["file"] = coverRelative;
-        outputs.Add(coverRelative);
+        RequireEmbeddedArtworkSha256(report);
         if (report["artifacts"] is JsonArray artifacts)
         {
             for (var index = 0; index < artifacts.Count; index++)
@@ -720,9 +704,10 @@ public sealed class HostCommitService
     {
         if (!isDsd)
         {
-            return new(await VerifyTrackHeadersAsync(outputs, albumRoot, staged, token));
+            return new(await VerifyTrackHeadersAsync(outputs, albumRoot, staged, TryEmbeddedArtworkSha256(report), token));
         }
 
+        var expectedArtworkSha256 = RequireEmbeddedArtworkSha256(report);
         if (report["areas"] is not JsonArray areas) throw new JsonException("The SACD report has no areas array.");
         foreach (var areaNode in areas)
         {
@@ -732,10 +717,18 @@ public sealed class HostCommitService
             {
                 if (trackNode is not JsonObject track) throw new JsonException("A SACD track is not an object.");
                 var relative = track["file"]?.GetValue<string>() ?? throw new JsonException("A SACD track path is missing.");
-                var expectedPayload = track["dsd_payload_sha256_after_tags"]?.GetValue<string>()
-                    ?? throw new JsonException($"A SACD track has no tagged DSD payload hash: {relative}");
+                var expectedPayloadBytes = track["dsd_payload_bytes_after_tags"]?.GetValue<long>()
+                    ?? throw new JsonException($"A SACD track has no tagged DSD payload size: {relative}");
+                var expectedFileSize = track["file_size"]?.GetValue<long>()
+                    ?? throw new JsonException($"A SACD track has no recorded file size: {relative}");
                 var path = HostStagingService.SafeCombine(albumRoot, relative);
-                await LocalDsdProcessor.VerifyCommittedDsfAsync(staged.FfprobePath, path, expectedPayload, token);
+                await LocalDsdProcessor.VerifyCommittedDsfAsync(
+                    staged.FfprobePath,
+                    path,
+                    expectedFileSize,
+                    expectedPayloadBytes,
+                    expectedArtworkSha256,
+                    token);
             }
         }
         foreach (var relative in outputs.Where(path => !Path.GetExtension(path).Equals(".dsf", StringComparison.OrdinalIgnoreCase)))
@@ -744,7 +737,12 @@ public sealed class HostCommitService
         return new([]);
     }
 
-    private static async Task<IReadOnlyList<string>> VerifyTrackHeadersAsync(IEnumerable<string> outputs, string albumRoot, StagedJob staged, CancellationToken token)
+    private static async Task<IReadOnlyList<string>> VerifyTrackHeadersAsync(
+        IEnumerable<string> outputs,
+        string albumRoot,
+        StagedJob staged,
+        string? expectedArtworkSha256,
+        CancellationToken token)
     {
         var artworkIssues = new List<string>();
         foreach (var relative in outputs.Where(path => Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase)))
@@ -789,6 +787,12 @@ public sealed class HostCommitService
                 artworkIssues.Add($"Embedded front-cover dimensions are unreadable in '{relative}'.");
             else if (width > 600 || height > 600 || width != height)
                 artworkIssues.Add($"Embedded front cover in '{relative}' is {width}x{height}; it must be square and no larger than 600x600.");
+            if (expectedArtworkSha256 is not null)
+            {
+                var actualArtworkSha256 = InMemoryArtworkService.ReadFrontCoverSha256(path);
+                if (!string.Equals(actualArtworkSha256, expectedArtworkSha256, StringComparison.OrdinalIgnoreCase))
+                    artworkIssues.Add($"Embedded front cover in '{relative}' does not match the report-proven in-memory artwork.");
+            }
 
             if (!root.TryGetProperty("format", out var format) ||
                 !format.TryGetProperty("tags", out var tags) ||
@@ -820,7 +824,7 @@ public sealed class HostCommitService
     private static string? Text(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
-    private static async Task VerifyOriginalSourcesUnchangedAsync(
+    private static void VerifyOriginalSourceSizesUnchanged(
         ScanResult scan,
         StagedJob staged,
         CancellationToken token)
@@ -834,13 +838,10 @@ public sealed class HostCommitService
             var info = new FileInfo(fullPath);
             if (info.Length != source.Size)
                 throw new IOException($"The original source size changed during the run: {source.RelativePath}. It was retained.");
-            var hash = await HostStagingService.Sha256Async(fullPath, token);
-            if (!hash.Equals(source.Sha256, StringComparison.OrdinalIgnoreCase))
-                throw new IOException($"The original source SHA-256 changed during the run: {source.RelativePath}. It was retained.");
         }
     }
 
-    private static async Task<IReadOnlyList<DeletionTarget>> ResolveDeletionTargetsAsync(
+    private static IReadOnlyList<DeletionTarget> ResolveDeletionTargets(
         ScanResult scan,
         StagedJob staged,
         bool isDsd,
@@ -859,7 +860,7 @@ public sealed class HostCommitService
                 item.RelativePath.Equals(source.RelativePath, StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException("The deletion target is not the source image identified by the read-only inventory.");
 
-        await VerifyOriginalSourcesUnchangedAsync(scan, staged, token);
+        VerifyOriginalSourceSizesUnchanged(scan, staged, token);
         var fullPath = HostStagingService.SafeCombine(scan.AlbumRoot, source.RelativePath);
         var info = new FileInfo(fullPath);
         if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
@@ -870,26 +871,41 @@ public sealed class HostCommitService
     private sealed record DeletionTarget(string RelativePath, string FullPath);
     private sealed record PlaybackVerification(IReadOnlyList<string> ArtworkIssues);
 
-    private static IReadOnlyList<string> ArtworkIssues(JsonObject report, string albumRoot, IReadOnlyList<string> embeddedArtworkIssues)
+    private static IReadOnlyList<string> ArtworkIssues(JsonObject report, IReadOnlyList<string> embeddedArtworkIssues)
     {
         var issues = embeddedArtworkIssues.ToList();
-        if (report["cover"] is not JsonObject cover || cover["file"] is null)
-            issues.Add("The album has no prepared cover.jpg sidecar.");
+        if (report["cover"] is not JsonObject cover)
+            issues.Add("The report has no embedded-only front-cover descriptor.");
         else
         {
-            try
-            {
-                var relative = NormalizePathValue(cover["file"], albumRoot, "cover");
-                if (!File.Exists(HostStagingService.SafeCombine(albumRoot, relative)))
-                    issues.Add($"The report-listed cover sidecar is missing: {relative}.");
-            }
-            catch (Exception error) when (error is JsonException or InvalidOperationException or ArgumentException or NotSupportedException)
-            {
-                issues.Add($"The report-listed cover sidecar is invalid: {error.Message}");
-            }
+            if (!string.Equals(cover["storage"]?.GetValue<string>(), "embedded_only", StringComparison.OrdinalIgnoreCase))
+                issues.Add("The report does not identify front-cover storage as embedded_only.");
+            if (!string.Equals(cover["mime_type"]?.GetValue<string>(), PreparedArtwork.MimeType, StringComparison.OrdinalIgnoreCase))
+                issues.Add("The report does not identify the embedded front cover as image/jpeg.");
+            if (cover["width"]?.GetValue<int>() is not > 0 or > InMemoryArtworkService.MaximumDimension ||
+                cover["height"]?.GetValue<int>() is not > 0 or > InMemoryArtworkService.MaximumDimension ||
+                cover["width"]?.GetValue<int>() != cover["height"]?.GetValue<int>())
+                issues.Add("The report has invalid embedded front-cover dimensions.");
+            if (cover["byte_size"]?.GetValue<int>() is not > 0 or > InMemoryArtworkService.MaximumPreparedBytes)
+                issues.Add("The report has an invalid embedded front-cover byte size.");
+            if (TryEmbeddedArtworkSha256(report) is null)
+                issues.Add("The report has no valid embedded front-cover SHA-256.");
         }
         return issues.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
+
+    private static string? TryEmbeddedArtworkSha256(JsonObject report)
+    {
+        if (report["cover"] is not JsonObject cover ||
+            !string.Equals(cover["storage"]?.GetValue<string>(), "embedded_only", StringComparison.OrdinalIgnoreCase) ||
+            cover["sha256"]?.GetValue<string>() is not { Length: 64 } sha256 ||
+            !sha256.All(Uri.IsHexDigit)) return null;
+        return sha256;
+    }
+
+    private static string RequireEmbeddedArtworkSha256(JsonObject report) =>
+        TryEmbeddedArtworkSha256(report)
+        ?? throw new JsonException("The conversion report has no valid embedded-only front-cover SHA-256 descriptor.");
 
     private static IReadOnlyList<string> IncompleteIssues(JsonObject report, IReadOnlyList<string> artworkIssues)
     {
@@ -916,8 +932,8 @@ public sealed class HostCommitService
         report["verification"] = verification;
         verification["status"] = incomplete ? "incomplete" : "passed";
         verification["method"] = incomplete
-            ? "Quick ffprobe FLAC/header/tag checks plus SHA-256 copy integrity passed; unresolved metadata or artwork is deferred and decoded PCM byte-count/MD5 comparison was skipped by user."
-            : "Quick ffprobe FLAC/header/tag/artwork checks plus SHA-256 copy integrity; decoded PCM byte-count and MD5 comparison skipped by user.";
+            ? "Quick ffprobe FLAC/header/tag checks plus file-size copy checks passed; unresolved metadata or artwork is deferred and decoded PCM byte-count/MD5 comparison was skipped by user."
+            : "Quick ffprobe FLAC/header/tag/artwork checks plus file-size copy checks; decoded PCM byte-count and MD5 comparison skipped by user.";
         verification["pcm_equivalence"] = "skipped_by_user";
         verification["audio_and_tags"] = "passed";
         verification["artwork"] = incomplete ? "incomplete" : "passed";
@@ -945,7 +961,7 @@ public sealed class HostCommitService
         (verification["status"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true ||
          verification["status"]?.GetValue<string>().Equals("incomplete", StringComparison.OrdinalIgnoreCase) == true) &&
         verification["independent_extraction"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true &&
-        verification["tag_payload_verification"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true;
+        verification["tag_payload_size_verification"]?.GetValue<string>().Equals("passed", StringComparison.OrdinalIgnoreCase) == true;
     private static bool DsdDeletionEligible(JsonObject report) =>
         DsdAudioVerificationPassed(report) &&
         IncompleteIssues(report, []).Count == 0 &&
@@ -954,7 +970,7 @@ public sealed class HostCommitService
     private static void ConfirmDsdVerification(JsonObject report, string stage, bool sourceDeletionRequested)
     {
         if (!DsdAudioVerificationPassed(report))
-            throw new InvalidDataException("The SACD report does not prove independent extraction and unchanged tagged DSD payloads.");
+            throw new InvalidDataException("The SACD report does not prove independent extraction sizes and unchanged tagged DSD payload size.");
         var verification = (JsonObject)report["verification"]!;
         var issues = IncompleteIssues(report, []);
         var incomplete = issues.Count > 0;

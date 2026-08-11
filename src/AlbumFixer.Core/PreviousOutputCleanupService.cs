@@ -2,7 +2,7 @@ using System.Text.Json;
 
 namespace AlbumFixer.Core;
 
-public sealed record PreviousOutputFile(string RelativePath, string FullPath, string? Sha256);
+public sealed record PreviousOutputFile(string RelativePath, string FullPath, long? Size);
 public sealed record PreviousOutputPlan(
     string AlbumRoot,
     string ReportPath,
@@ -45,7 +45,7 @@ public static class PreviousOutputCleanupService
             var status = verification.ValueKind == JsonValueKind.Object ? Text(verification, "status") ?? "pending" : "pending";
             if (status.Equals("passed", StringComparison.OrdinalIgnoreCase)) return null;
 
-            var hashes = CommitHashes(report);
+            var sizes = CommitSizes(report);
             var tracksRoot = HostStagingService.SafeCombine(root, "Tracks");
             var files = EnumerateReportedOutputs(report)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -53,12 +53,12 @@ public static class PreviousOutputCleanupService
                 {
                     var normalized = NormalizeRelative(relative);
                     var fullPath = HostStagingService.SafeCombine(root, normalized);
-                    hashes.TryGetValue(normalized, out var sha256);
-                    return new PreviousOutputFile(normalized, fullPath, sha256);
+                    var size = sizes.TryGetValue(normalized, out var recordedSize) ? recordedSize : (long?)null;
+                    return new PreviousOutputFile(normalized, fullPath, size);
                 })
                 .Where(file => IsLegacyTrackPath(file.RelativePath)
                     ? IsWithin(tracksRoot, file.FullPath)
-                    : file.Sha256 is not null)
+                    : file.Size is not null)
                 .Where(file => File.Exists(file.FullPath))
                 .OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
@@ -89,15 +89,15 @@ public static class PreviousOutputCleanupService
             if (verification.ValueKind != JsonValueKind.Object ||
                 !string.Equals(Text(verification, "status"), "passed", StringComparison.OrdinalIgnoreCase)) return null;
 
-            var hashes = CommitHashes(report);
+            var sizes = CommitSizes(report);
             var files = EnumerateReportedOutputs(report)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Select(relative =>
                 {
                     var normalized = NormalizeRelative(relative);
                     var fullPath = HostStagingService.SafeCombine(root, normalized);
-                    hashes.TryGetValue(normalized, out var sha256);
-                    return new PreviousOutputFile(normalized, fullPath, sha256);
+                    var size = sizes.TryGetValue(normalized, out var recordedSize) ? recordedSize : (long?)null;
+                    return new PreviousOutputFile(normalized, fullPath, size);
                 })
                 .Where(file => File.Exists(file.FullPath))
                 .OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
@@ -137,7 +137,7 @@ public static class PreviousOutputCleanupService
                     string.Equals(Text(deletion, "status"), "completed", StringComparison.OrdinalIgnoreCase);
             if (!sourcesDeleted) return null;
 
-            var hashes = CommitHashes(report);
+            var sizes = CommitSizes(report);
             var reportedPaths = EnumerateReportedOutputs(report)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
@@ -146,8 +146,8 @@ public static class PreviousOutputCleanupService
                 {
                     var normalized = NormalizeRelative(relative);
                     var fullPath = HostStagingService.SafeCombine(root, normalized);
-                    hashes.TryGetValue(normalized, out var sha256);
-                    return new PreviousOutputFile(normalized, fullPath, sha256);
+                    var size = sizes.TryGetValue(normalized, out var recordedSize) ? recordedSize : (long?)null;
+                    return new PreviousOutputFile(normalized, fullPath, size);
                 })
                 .OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
@@ -168,19 +168,18 @@ public static class PreviousOutputCleanupService
     public static IReadOnlyList<PreviousOutputFile> DirectFiles(VerifiedOutputPlan? plan) =>
         plan?.Files.Where(file => IsAtAlbumRoot(plan.AlbumRoot, file.FullPath)).ToArray() ?? [];
 
-    public static async Task VerifyDirectFilesAsync(VerifiedOutputPlan? plan, CancellationToken token = default)
+    public static void VerifyDirectFileSizes(VerifiedOutputPlan? plan, CancellationToken token = default)
     {
         foreach (var file in DirectFiles(plan))
         {
             token.ThrowIfCancellationRequested();
-            if (file.Sha256 is null)
-                throw new IOException($"Verified prior output has no recorded SHA-256 and cannot be replaced: {file.RelativePath}");
+            if (file.Size is null)
+                throw new IOException($"Verified prior output has no recorded file size and cannot be replaced: {file.RelativePath}");
             var attributes = File.GetAttributes(file.FullPath);
             if ((attributes & FileAttributes.ReparsePoint) != 0)
                 throw new IOException($"Verified prior output is a reparse point and cannot be replaced safely: {file.RelativePath}");
-            var actual = await HostStagingService.Sha256Async(file.FullPath, token);
-            if (!actual.Equals(file.Sha256, StringComparison.OrdinalIgnoreCase))
-                throw new IOException($"Verified prior output changed after its report was written and was retained: {file.RelativePath}");
+            if (new FileInfo(file.FullPath).Length != file.Size.Value)
+                throw new IOException($"Verified prior output size changed after its report was written and was retained: {file.RelativePath}");
         }
     }
 
@@ -191,7 +190,7 @@ public static class PreviousOutputCleanupService
                AudioExtensions.Contains(Path.GetExtension(relative));
     }
 
-    public static async Task<PreviousOutputCleanupResult?> CleanupAsync(
+    public static PreviousOutputCleanupResult? Cleanup(
         string albumRoot,
         CancellationToken token = default)
     {
@@ -204,12 +203,8 @@ public static class PreviousOutputCleanupService
             var attributes = File.GetAttributes(file.FullPath);
             if ((attributes & FileAttributes.ReparsePoint) != 0)
                 throw new IOException($"Previous output is a reparse point and cannot be removed safely: {file.RelativePath}");
-            if (file.Sha256 is not null)
-            {
-                var actual = await HostStagingService.Sha256Async(file.FullPath, token);
-                if (!actual.Equals(file.Sha256, StringComparison.OrdinalIgnoreCase))
-                    throw new IOException($"Previous output changed after its report was written and was retained: {file.RelativePath}");
-            }
+            if (file.Size is not null && new FileInfo(file.FullPath).Length != file.Size.Value)
+                throw new IOException($"Previous output size changed after its report was written and was retained: {file.RelativePath}");
         }
 
         foreach (var file in plan.Files)
@@ -247,19 +242,18 @@ public static class PreviousOutputCleanupService
         }
     }
 
-    private static Dictionary<string, string> CommitHashes(JsonElement report)
+    private static Dictionary<string, long> CommitSizes(JsonElement report)
     {
-        var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var sizes = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         if (!Property(report, "commit", out var commit) || commit.ValueKind != JsonValueKind.Object ||
-            !Property(commit, "files", out var files) || files.ValueKind != JsonValueKind.Array) return hashes;
+            !Property(commit, "files", out var files) || files.ValueKind != JsonValueKind.Array) return sizes;
         foreach (var item in files.EnumerateArray())
         {
             var file = Text(item, "file");
-            var hash = Text(item, "sha256");
-            if (file is null || hash is null) continue;
-            hashes[NormalizeRelative(file)] = hash;
+            if (file is null || !Property(item, "size", out var size) || !size.TryGetInt64(out var bytes) || bytes < 0) continue;
+            sizes[NormalizeRelative(file)] = bytes;
         }
-        return hashes;
+        return sizes;
     }
 
     private static IEnumerable<string> EnumerateReportedOutputs(JsonElement report)
@@ -332,8 +326,7 @@ public static class PreviousOutputCleanupService
     {
         if (string.IsNullOrWhiteSpace(path) || Path.IsPathRooted(path)) return false;
         var normalized = NormalizeRelative(path);
-        return AudioExtensions.Contains(Path.GetExtension(normalized)) ||
-               normalized.Equals("cover.jpg", StringComparison.OrdinalIgnoreCase);
+        return AudioExtensions.Contains(Path.GetExtension(normalized));
     }
 
     private static string NormalizeRelative(string path) =>

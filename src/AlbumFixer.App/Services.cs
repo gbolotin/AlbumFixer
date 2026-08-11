@@ -5,8 +5,6 @@ using Microsoft.Win32;
 
 namespace AlbumFixer.App;
 
-public sealed record AlbumFixerOptions(string SkillPath);
-
 public sealed record StartConfirmation(
     bool DeleteOriginals,
     bool IsBatch,
@@ -21,6 +19,7 @@ public interface IUserInteractionService
     bool ConfirmCloseWhileRunning();
     void CopyToClipboard(string text);
     Task OpenFolderAsync(string path);
+    void ShowError(string title, string message);
 }
 
 public sealed class WpfUserInteractionService : IUserInteractionService
@@ -56,20 +55,20 @@ public sealed class WpfUserInteractionService : IUserInteractionService
 
         var message = confirmation.IsSingleSacd
             ? $"""
-               Album Fixer will copy and SHA-256 verify the SACD ISO in local staging, extract every reported area to DSF, repeat each extraction independently, verify native DSD signal properties and unchanged audio payloads through tagging, then reverify the committed network paths. Only after every gate passes will it permanently delete the exact inventoried ISO.
+               Album Fixer will copy and size-check the SACD ISO in local staging, extract every reported area to DSF, repeat each extraction independently, compare extraction sizes, verify native DSD structure and tags, then recheck the committed network paths. Cryptographic hashes are not calculated. Only after every gate passes will it permanently delete the exact inventoried ISO.
                {cleanup}
 
                Start this SACD extraction?
                """
             : confirmation.DeletesSourceAfterSuccess
                 ? $"""
-                   Album Fixer will skip decoded PCM/MD5 comparison. After the tracks are committed and pass quick FLAC, tag, artwork, and copy-hash checks, it will permanently delete the exact inventoried FLAC image. If artwork cannot be completed, usable tracks are delivered as incomplete work and the source image is retained.
+                   Album Fixer will skip decoded PCM/MD5 and cryptographic hash comparisons. After the tracks are committed and pass quick FLAC, tag, artwork, and file-size checks, it will permanently delete the exact inventoried FLAC image. If artwork cannot be completed, usable tracks are delivered as incomplete work and the source image is retained.
                    {cleanup}
 
                    Start this run?
                    """
                 : $"""
-                   Album Fixer found multiple FLAC images. It will create CD<n> folders, run quick FLAC, tag, artwork, and copy-hash checks, and retain every original image after the tracks are committed.
+                   Album Fixer found multiple FLAC images. It will create CD<n> folders, run quick FLAC, tag, artwork, and file-size checks, and retain every original image after the tracks are committed.
                    {cleanup}
 
                    Start this run?
@@ -100,6 +99,9 @@ public sealed class WpfUserInteractionService : IUserInteractionService
             MessageBoxResult.No) == MessageBoxResult.Yes;
 
     public void CopyToClipboard(string text) => Clipboard.SetText(text);
+
+    public void ShowError(string title, string message) =>
+        MessageBox.Show(Owner, message, title, MessageBoxButton.OK, MessageBoxImage.Error);
 
     public async Task OpenFolderAsync(string path)
     {
