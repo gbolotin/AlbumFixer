@@ -11,12 +11,15 @@ try
 {
     await ToolDiscoveryReportsEveryStartupComponent();
     await ScannerClassifiesFlacCue(root);
+    await ScannerInventoriesChecksumIdentitySidecars(root);
+    await ScannerDescendsIntoSingleNestedAlbum(root);
     await ScannerPrefersExistingTracks(root);
     await ScannerPlansMultipleAlbums(root);
     await ScannerAcceptsMultipleImagesInOneAlbumFolder(root);
     await ScannerRecognizesAndCleansIncompletePreviousOutput(root);
     await ScannerSkipsCompletedAlbumsWithDeletedSources(root);
-    await ScannerRejectsMissingSourceFallbackCompletion(root);
+    await ScannerAdoptsOptionalOnlyVerifiedSacdCompletion(root);
+    await ScannerRecoversVerifiedMissingSourceFallbackCompletion(root);
     await ScannerRecoversRetainedEquivalentFlacAfterCanceledFallback(root);
     await ScannerRecoversCompletedSacdAfterCanceledFallback(root);
     await AlbumTransactionLockSerializesOwners(root);
@@ -27,17 +30,25 @@ try
     await HostStagesAndChecksSourceSize(root);
     await LocalSplitterRunsLocally(root);
     await LocalMetadataEnrichmentRunsInCode(root);
+    await ExternalArtworkFallbackSupportsSacdAndPreservesLocalPriority(root);
+    await ExistingTracksRepairUsesPrioritizedEvidenceAndTransactionalCommit(root);
+    DuplicateTaggedBonusTrackUsesFilenameAnchor();
+    RecognizedGenreFoldersAreNotArtistEvidence();
+    await ExistingTracksRepairSupportsMultipleDiscs(root);
     await LocalSplitterCropsAndNormalizesBookletFront(root);
     await LocalSplitterCreatesCdFoldersForMultipleImages(root);
     await HostProcessesExistingDuplicateCoverWithoutImageOutputs(root);
     await HostCommitsVerifiedFlac(root, deleteOriginals: true);
     await HostCommitsVerifiedFlac(root, deleteOriginals: false);
+    await HostCommitsVerifiedFlac(root, deleteOriginals: true, optionalMetadataMissing: true);
+    await HostCommitsVerifiedFlac(root, deleteOriginals: true, requiredMetadataMissing: true);
     await HostReplacesVerifiedRootOutput(root);
     await HostCommitsMultipleImagesAndRetainsSources(root);
     await HostCommitsIncompleteFlacWithoutArtwork(root);
     await HostCommitFailureRetainsSource(root);
     await FailureCleanupRemovesLocalAndDestinationStages(root);
     SacdLayoutParserSupportsToolIndexConventions();
+    await ExternalCatalogIdentityResolvesMissingSacdDiscText();
     await FailureReportIsAlwaysWritten(root);
     await FailureReportPreservesCompletedReport(root);
     await MetadataHandoffIsConditional(root);
@@ -78,6 +89,53 @@ static async Task ScannerClassifiesFlacCue(string root)
     Assert(result.ImageCount == 1 && result.CueCount == 1, "FLAC+CUE inventory counts are wrong.");
 }
 
+static async Task ScannerInventoriesChecksumIdentitySidecars(string root)
+{
+    var folder = Path.Combine(root, "checksum-identity", "1988 - Spirit Of Eden (2003 Remaster SACD-R)");
+    Directory.CreateDirectory(folder);
+    await File.WriteAllBytesAsync(Path.Combine(folder, "Unknown Album.iso"), [1, 2, 3]);
+    await File.WriteAllTextAsync(Path.Combine(folder, "Talk Talk - Spirit Of Eden.md5"),
+        "0123456789abcdef0123456789abcdef *Unknown Album.iso");
+    await File.WriteAllTextAsync(Path.Combine(folder, "Talk Talk - Spirit Of Eden.sfv"),
+        "Unknown Album.iso 12345678");
+
+    var scan = await new AlbumScanner().ScanAsync(folder);
+    var checksumSidecars = scan.Media
+        .Where(item => Path.GetExtension(item.Path) is ".md5" or ".sfv")
+        .ToArray();
+    Assert(scan.Mode == WorkflowMode.DsdExtraction && checksumSidecars.Length == 2 &&
+           checksumSidecars.All(item => item.Kind == "Provenance"),
+        "The scanner must inventory MD5 and SFV sidecars so SACD identity fallback can inspect their filenames.");
+
+    const string missingDiscText = """
+    Area Information [0]:
+    Track Count: 1
+    Total play time: 03:00:00 [mins:secs:frames]
+    Speaker config: 2 Channel
+    Duration: 03:00:00 [mins:secs:frames]
+    """;
+    var identity = LocalDsdProcessor.ResolveLocalIdentity(scan, LocalDsdProcessor.ParseLayout(missingDiscText));
+    Assert(identity.ChecksumArtist == "Talk Talk" && identity.ChecksumAlbum == "Spirit Of Eden",
+        "The scanned checksum filename must resolve the missing SACD artist and album title.");
+}
+
+static async Task ScannerDescendsIntoSingleNestedAlbum(string root)
+{
+    var container = Path.Combine(root, "single-nested-container");
+    var album = Path.Combine(container, "Random Access Memories [Limited Box Set Edition]");
+    Directory.CreateDirectory(album);
+    await File.WriteAllBytesAsync(Path.Combine(album, "1 Give Life Back to Music.flac"), [1]);
+    await File.WriteAllBytesAsync(Path.Combine(album, "2 The Game of Love.flac"), [2]);
+    await File.WriteAllBytesAsync(Path.Combine(album, "front.jpg"), [3]);
+
+    var scan = await new AlbumScanner().ScanAsync(container);
+    Assert(scan.AlbumRoot.Equals(album, StringComparison.OrdinalIgnoreCase) &&
+           scan.AlbumName == "Random Access Memories [Limited Box Set Edition]" &&
+           scan.Mode == WorkflowMode.ExistingTrackRepair && scan.TrackCount == 2 &&
+           scan.Media.Where(item => item.Kind == "Existing FLAC").All(item => !item.RelativePath.Contains("Random Access Memories", StringComparison.OrdinalIgnoreCase)),
+        "A source container with exactly one nested album must resolve directly to the child album instead of treating the container name as album identity.");
+}
+
 static async Task ScannerPrefersExistingTracks(string root)
 {
     var folder = Path.Combine(root, "repair"); Directory.CreateDirectory(folder);
@@ -88,6 +146,10 @@ static async Task ScannerPrefersExistingTracks(string root)
     var result = await new AlbumScanner().ScanAsync(folder);
     Assert(result.Mode == WorkflowMode.ExistingTrackRepair, "Existing tracks must take repair-only precedence.");
     Assert(result.Warnings.Any(value => value.Contains("coexist", StringComparison.OrdinalIgnoreCase)), "Coexisting image warning is missing.");
+    var preflight = await new PreflightService().CheckAsync(result);
+    Assert(!preflight.CanStart && preflight.Checks.Any(check => check.Name == "Verified write-back" && check.BlocksRun &&
+        check.Detail.Contains("standalone FLAC tracks", StringComparison.OrdinalIgnoreCase)),
+        "A mixed CUE/image plus existing-track folder must remain blocked as ambiguous.");
 }
 
 static async Task ScannerPlansMultipleAlbums(string root)
@@ -102,11 +164,20 @@ static async Task ScannerPlansMultipleAlbums(string root)
     await File.WriteAllBytesAsync(Path.Combine(covers, "cover.jpg"), [3]);
     await File.WriteAllBytesAsync(Path.Combine(second, "album.flac"), [2]);
     await File.WriteAllTextAsync(Path.Combine(second, "album.cue"), "FILE \"album.flac\" WAVE");
-    var result = await new AlbumScanner().ScanAsync(folder);
+    var scanner = new AlbumScanner();
+    var rootProgress = new System.Collections.Concurrent.ConcurrentQueue<InventoryProgress>();
+    var result = await scanner.ScanAsync(folder, new TestProgress<InventoryProgress>(rootProgress.Enqueue));
     Assert(result.Mode == WorkflowMode.MultipleAlbums, "An artist folder must be classified as a batch, not one album.");
     Assert(result.Warnings.Any(value => value.Contains("2 independent albums", StringComparison.OrdinalIgnoreCase)), "Multiple-album batch guidance is missing.");
-    var albums = await new AlbumScanner().ScanAlbumsAsync(folder);
+    Assert(rootProgress.Any(update => update.Stage == "Classifying media") && rootProgress.Max(update => update.Percent) == 100,
+        "Recursive inventory must report determinate file-level progress through completion.");
+    var albumProgress = new System.Collections.Concurrent.ConcurrentQueue<InventoryProgress>();
+    var albums = await scanner.ScanAlbumsAsync(result, new TestProgress<InventoryProgress>(albumProgress.Enqueue));
     Assert(albums.Count == 2, "The batch scanner must create one plan per independent album root.");
+    Assert(AlbumScanner.InventoryWorkerLimit is >= 1 and <= 4 &&
+           albumProgress.Any(update => update.Total == 2 && update.Completed == 2 && update.Percent == 100 &&
+                                       update.Stage.Contains("workers", StringComparison.OrdinalIgnoreCase)),
+        "Batch inventory must expose bounded concurrent album-scan progress.");
     Assert(albums.All(album => album.Mode == WorkflowMode.FlacCueSplit), "Every discovered FLAC+CUE album must be independently runnable.");
     Assert(albums.Select(album => album.AlbumRoot).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 2, "Batch album roots must be disjoint.");
     Assert(albums.All(album => !album.AlbumName.Equals("Covers", StringComparison.OrdinalIgnoreCase)), "Artwork-only folders must not become blocked batch albums.");
@@ -296,6 +367,78 @@ static async Task ScannerSkipsCompletedAlbumsWithDeletedSources(string root)
         "A missing source must remain a blocker unless the completed report confirms intentional deletion.");
 }
 
+static async Task ScannerAdoptsOptionalOnlyVerifiedSacdCompletion(string root)
+{
+    var folder = Path.Combine(root, "adopt-optional-only-sacd");
+    var stereo = Path.Combine(folder, "Stereo");
+    Directory.CreateDirectory(stereo);
+    var iso = Path.Combine(folder, "album.iso");
+    await File.WriteAllBytesAsync(iso, [1, 2, 3, 4]);
+    var first = Path.Combine(stereo, "01 - First.dsf");
+    var second = Path.Combine(stereo, "02 - Second.dsf");
+    CreateTaggedDsfFixture(first, "First", 1, 2, 0x33);
+    CreateTaggedDsfFixture(second, "Second", 2, 2, 0x77);
+
+    string Report(string missingField, string audioStatus)
+    {
+        var missing = System.Text.Json.JsonSerializer.Serialize(new[] { missingField });
+        var required = MetadataFieldPolicy.IsOptional(missingField) ? "[]" : missing;
+        return $$"""
+        {
+          "workflow_mode": "sacd_iso_extract",
+          "source": { "file": "album.iso", "size": 4 },
+          "areas": [{ "area": "stereo", "tracks": [
+            { "track": 1, "title": "First", "file": "Stereo/01 - First.dsf" },
+            { "track": 2, "title": "Second", "file": "Stereo/02 - Second.dsf" }
+          ] }],
+          "verification": {
+            "status": "incomplete",
+            "independent_extraction": "passed",
+            "tag_payload_size_verification": "passed",
+            "audio_and_tags": "{{audioStatus}}",
+            "sources_deleted": false,
+            "errors": [],
+            "missing_metadata": {{missing}},
+            "missing_required_metadata": {{required}}
+          },
+          "commit": {
+            "status": "completed_incomplete",
+            "destination_sizes_verified": true,
+            "final_path_verification": "passed_with_incomplete_metadata_or_artwork",
+            "files": [
+              { "file": "Stereo/01 - First.dsf", "size": {{new FileInfo(first).Length}} },
+              { "file": "Stereo/02 - Second.dsf", "size": {{new FileInfo(second).Length}} }
+            ]
+          },
+          "deletion": { "status": "retained", "performed": false, "files": ["album.iso"] }
+        }
+        """;
+    }
+
+    var reportPath = Path.Combine(folder, "conversion-report.json");
+    await File.WriteAllTextAsync(reportPath, Report("LABEL", "passed"));
+    var adoptedPlan = PreviousOutputCleanupService.DiscoverCompleted(folder);
+    var adopted = await new AlbumScanner().ScanAsync(folder);
+    var adoptedSummary = await ReportReader.LoadAsync(reportPath);
+    Assert(adoptedPlan is { RecoveredFromStaleFallback: true } &&
+           PreviousOutputCleanupService.HasTerminalSuccessEvidence(folder) &&
+           adopted.Mode == WorkflowMode.Completed && !adopted.RequiresProcessing && adopted.TrackCount == 0 &&
+           adopted.Media.Count(item => item.Kind == "Previous Album Fixer output") == 2 &&
+           adopted.Warnings.Any(warning => warning.Contains("optional", StringComparison.OrdinalIgnoreCase)) &&
+           adoptedSummary.Status == "passed",
+        "A size-matched, tag/artwork-verified SACD extraction with only optional metadata gaps must be adopted and presented as complete even when its ISO was retained.");
+
+    await File.WriteAllTextAsync(reportPath, Report("CATALOGNUMBER", "passed"));
+    var requiredMissing = await new AlbumScanner().ScanAsync(folder);
+    Assert(requiredMissing.Mode == WorkflowMode.NeedsInspection && requiredMissing.Mode != WorkflowMode.ExistingTrackRepair,
+        "A SACD extraction with required metadata missing must fail closed without entering FLAC repair mode.");
+
+    await File.WriteAllTextAsync(reportPath, Report("LABEL", "failed"));
+    var failedAudioProof = await new AlbumScanner().ScanAsync(folder);
+    Assert(failedAudioProof.Mode == WorkflowMode.NeedsInspection && failedAudioProof.Mode != WorkflowMode.ExistingTrackRepair,
+        "Optional metadata cannot make a SACD extraction complete when its audio/tag verification did not pass.");
+}
+
 static async Task AlbumTransactionLockSerializesOwners(string root)
 {
     var folder = Path.Combine(root, "album-transaction-lock");
@@ -315,7 +458,7 @@ static async Task AlbumTransactionLockSerializesOwners(string root)
         "The released album lock must be reusable by the next transaction.");
 }
 
-static async Task ScannerRejectsMissingSourceFallbackCompletion(string root)
+static async Task ScannerRecoversVerifiedMissingSourceFallbackCompletion(string root)
 {
     var tools = await new PreflightService().FindToolsAsync();
     if (tools["ffmpeg"] is not { } ffmpeg) return;
@@ -355,15 +498,37 @@ static async Task ScannerRejectsMissingSourceFallbackCompletion(string root)
     }
     """);
 
-    var rejected = await new AlbumScanner().ScanAsync(folder);
-    Assert(rejected.Mode != WorkflowMode.Completed && rejected.RequiresProcessing &&
-           rejected.Errors.Any(error => error.Contains("missing source", StringComparison.OrdinalIgnoreCase)),
-        "A fallback report must fail closed when the source image is absent and output equivalence cannot be recomputed.");
+    var recovered = await new AlbumScanner().ScanAsync(folder);
+    Assert(recovered.Mode == WorkflowMode.Completed && !recovered.RequiresProcessing && recovered.Errors.Count == 0 &&
+           recovered.Media.Count(item => item.Kind == "Previous Album Fixer output") == 2 &&
+           recovered.Warnings.Any(warning => warning.Contains("PCM equivalence could not be recomputed", StringComparison.OrdinalIgnoreCase)),
+        "A missing source image must be recovered when the exact CUE-derived track set passes quick FLAC, tag, and artwork verification.");
 
     File.Copy(Path.Combine(folder, "02 - Track 2.flac"), Path.Combine(folder, "03 - Unexpected.flac"));
     var unsafeRecovery = await new AlbumScanner().ScanAsync(folder);
     Assert(unsafeRecovery.Mode != WorkflowMode.Completed && unsafeRecovery.Errors.Any(error => error.Contains("missing source", StringComparison.OrdinalIgnoreCase)),
         "Recovery must fail closed when an unexpected or incomplete track set is present.");
+
+    File.Delete(Path.Combine(folder, "03 - Unexpected.flac"));
+    await RunToolAsync(ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=700:duration=0.1",
+        "-c:a", "flac", "-metadata", "TITLE=Track 2", "-metadata", "ALBUM=Recovered Album", "-metadata", "ARTIST=Tester",
+        "-metadata", "ALBUMARTIST=Tester", "-metadata", "TRACKNUMBER=2/2", "-metadata", "DISCNUMBER=1/1",
+        "-metadata", "DATE=2026", "-metadata", "GENRE=Rock", Path.Combine(folder, "02 - Track 2.flac"));
+    await File.WriteAllTextAsync(Path.Combine(folder, "conversion-report.json"), $$"""
+    {
+      "workflow_mode": "FlacCueSplit",
+      "generated_by": "Album Fixer host fallback",
+      "sources": [{ "path": "album.flac", "type": "FLAC image", "size": 12345 }],
+      "pipeline": { "status": "failed", "stopped_phase": "Inventoried", "detail": "Could not find file '{{missingSource.Replace("\\", "\\\\")}}'." },
+      "discs": [],
+      "verification": { "status": "failed", "sources_deleted": false },
+      "commit": { "status": "not_completed" },
+      "deletion": { "performed": false }
+    }
+    """);
+    var missingArtwork = await new AlbumScanner().ScanAsync(folder);
+    Assert(missingArtwork.Mode != WorkflowMode.Completed,
+        "Missing-source recovery must fail closed when a track does not contain verified embedded artwork.");
 }
 
 static async Task ScannerRecoversRetainedEquivalentFlacAfterCanceledFallback(string root)
@@ -786,8 +951,292 @@ static async Task LocalMetadataEnrichmentRunsInCode(string root)
     var reportCover = report.RootElement.GetProperty("cover");
     Assert(report.RootElement.GetProperty("metadata_lookup").GetProperty("implementation").GetString() == "deterministic_local_code" &&
            reportCover.GetProperty("storage").GetString() == "embedded_only" &&
+           reportCover.GetProperty("source").GetString()!.Contains("coverartarchive.org", StringComparison.OrdinalIgnoreCase) &&
            EmbeddedCoverSha256(Path.Combine(stagedAlbum, "01 - Track One.flac")) == reportCover.GetProperty("sha256").GetString(),
         "The report must identify local code and the downloaded in-memory cover used for embedding.");
+}
+
+static async Task ExternalArtworkFallbackSupportsSacdAndPreservesLocalPriority(string root)
+{
+    var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var preflight = await new PreflightService().CheckAsync(seed);
+    if (preflight.Tools["ffmpeg"] is not { } ffmpeg || preflight.Tools["ffprobe"] is not { } ffprobe) return;
+
+    var downloadedFixture = Path.Combine(root, "sacd-external-cover-fixture.jpg");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=orange:s=1000x800", "-frames:v", "1", "-update", "1", downloadedFixture);
+    var downloadedBytes = await File.ReadAllBytesAsync(downloadedFixture);
+    var coverRequests = 0;
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        if (request.RequestUri?.AbsoluteUri.Contains("coverartarchive.org/release/release-sacd-cover", StringComparison.Ordinal) == true)
+        {
+            coverRequests++;
+            return StubHttpHandler.Bytes(downloadedBytes, "image/jpeg");
+        }
+        throw new InvalidOperationException($"Unexpected SACD cover request: {request.RequestUri}");
+    }));
+    var external = new ExternalMetadataService(client, requestTimeout: TimeSpan.FromSeconds(1));
+    var artwork = new InMemoryArtworkService();
+    var albumWithoutArt = Path.Combine(root, "sacd-external-cover");
+    Directory.CreateDirectory(albumWithoutArt);
+    var fallback = await artwork.PrepareLocalThenExternalAsync(
+        albumWithoutArt, ffmpeg, ffprobe, ArtworkSelectionMode.Dsd, external, "release-sacd-cover");
+
+    Assert(fallback.Artwork is not null && fallback.Artwork.Source.Contains("coverartarchive.org", StringComparison.OrdinalIgnoreCase) &&
+           fallback.Artwork.Width == 600 && fallback.Artwork.Height == 600 && fallback.Artwork.JpegBytes.Length <= 1024 * 1024 &&
+           coverRequests == 1 && !Directory.EnumerateFiles(albumWithoutArt, "*", SearchOption.AllDirectories).Any(),
+        "SACD must use an exact external cover when local artwork is absent, normalize it in memory, and create no sidecar image.");
+
+    var albumWithArt = Path.Combine(root, "sacd-local-cover-priority");
+    Directory.CreateDirectory(albumWithArt);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=green:s=400x400", "-frames:v", "1", "-update", "1", Path.Combine(albumWithArt, "cover.jpg"));
+    var local = await artwork.PrepareLocalThenExternalAsync(
+        albumWithArt, ffmpeg, ffprobe, ArtworkSelectionMode.Dsd, external, "release-sacd-cover");
+    Assert(local.Artwork is not null && local.Artwork.Source.Contains("cover.jpg", StringComparison.OrdinalIgnoreCase) && coverRequests == 1,
+        "A usable local SACD cover must retain priority and suppress external cover download.");
+}
+
+static async Task ExistingTracksRepairUsesPrioritizedEvidenceAndTransactionalCommit(string root)
+{
+    var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var toolCheck = await new PreflightService().CheckAsync(seed);
+    if (toolCheck.Tools["ffmpeg"] is not { } ffmpeg || toolCheck.Tools["ffprobe"] is not { } ffprobe) return;
+
+    var album = Path.Combine(root, "Rock", "Priority Artist - Priority Album");
+    Directory.CreateDirectory(album);
+    var first = Path.Combine(album, "1-Wrong Filename.flac");
+    var second = Path.Combine(album, "2-Canonical Second.flac");
+    var embeddedFixture = Path.Combine(root, "repair-embedded.jpg");
+    var folderCover = Path.Combine(album, "folder.jpg");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=700:duration=0.25", "-c:a", "flac", first);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=900:duration=0.25", "-c:a", "flac", second);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=blue:s=96x96", "-frames:v", "1", "-update", "1", embeddedFixture);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=96x96", "-frames:v", "1", "-update", "1", folderCover);
+    var embeddedBytes = await File.ReadAllBytesAsync(embeddedFixture);
+    using (var file = TagLib.File.Create(first))
+    {
+        file.Tag.Title = "Trusted Existing Title";
+        file.Tag.Album = "Priority Album";
+        file.Tag.Performers = ["The Priority Artist"];
+        file.Tag.AlbumArtists = ["The Priority Artist"];
+        file.Tag.Track = 1;
+        file.Tag.Disc = 1;
+        file.Tag.Year = 1999;
+        file.Tag.Genres = ["Rock"];
+        file.Tag.Pictures =
+        [
+            new TagLib.Picture(new TagLib.ByteVector(embeddedBytes))
+            {
+                Type = TagLib.PictureType.FrontCover,
+                MimeType = "image/jpeg",
+                Description = "Trusted embedded front cover"
+            }
+        ];
+        file.Save();
+    }
+    using (var file = TagLib.File.Create(second))
+    {
+        file.Tag.Album = "Priority Album";
+        file.Tag.Performers = ["The Priority Artist"];
+        file.Tag.AlbumArtists = ["The Priority Artist"];
+        file.Tag.Track = 2;
+        file.Tag.Disc = 1;
+        file.Save();
+    }
+
+    var beforeFirstPayload = await FlacAudioPayload.Sha256Async(first);
+    var beforeSecondPayload = await FlacAudioPayload.Sha256Async(second);
+    var originalFolderCover = FileSha256(folderCover);
+    var scan = await new AlbumScanner().ScanAsync(album);
+    Assert(scan.Mode == WorkflowMode.ExistingTrackRepair && scan.CueCount == 0 && scan.ImageCount == 0 && scan.TrackCount == 2,
+        "Standalone FLAC tracks without a CUE must classify as existing-track repair.");
+    var preflight = await new PreflightService().CheckAsync(scan);
+    Assert(preflight.CanStart && preflight.Checks.Any(check => check.Name == "Verified write-back" &&
+        check.State == CheckState.Passed && check.Detail.Contains("audio payload", StringComparison.OrdinalIgnoreCase)),
+        "Standalone existing FLAC tracks must pass verified write-back preflight.");
+
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("/ws/2/release/?", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"releases":[{"id":"release-priority","score":100,"title":"Priority Album","artist-credit":[{"name":"Priority Artist"}],"release-group":{"id":"group-priority"},"date":"2000-01-01","track-count":2,"media":[{"format":"CD","track-count":2}],"label-info":[]}]}""");
+        if (uri.Contains("/ws/2/release-group/group-priority", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"first-release-date":"2000-01-01","genres":[{"name":"rock","count":10}],"tags":[],"relations":[]}""");
+        if (uri.Contains("/ws/2/release/release-priority", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"media":[{"tracks":[{"title":"Trusted Existing Title"},{"title":"Canonical Second"}]}]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[{"artistName":"Priority Artist","collectionName":"Priority Album","primaryGenreName":"Rock","releaseDate":"2000-01-01T00:00:00Z","trackCount":2,"collectionViewUrl":"https://music.apple.com/album/priority"}]}""");
+        throw new InvalidOperationException($"Unexpected existing-track metadata request: {uri}");
+    }));
+    var external = new ExternalMetadataService(client, discogsToken: null, musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var job = PreflightService.CreateJobDirectory(preflight.TempRoot);
+    var staged = await new HostStagingService().StageAsync(scan, preflight, job, new Progress<ProgressSnapshot>());
+    var local = await new LocalTrackRepairProcessor(external).ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+
+    Assert(local.Tracks == 2 && !local.Metadata.RequiresResearch,
+        "Existing tags, filename evidence, external metadata, and embedded artwork should complete the repair fixture.");
+    using (var untouched = TagLib.File.Create(second))
+        Assert(string.IsNullOrWhiteSpace(untouched.Tag.Title), "Local repair must not edit original tracks before transactional commit.");
+    using (var repairedFirst = TagLib.File.Create(Path.Combine(staged.AlbumRoot, "1-Wrong Filename.flac")))
+        Assert(repairedFirst.Tag.Title == "Trusted Existing Title" && repairedFirst.Tag.Year == 1999,
+            "Existing nonempty tags must outrank contradictory filename and external fallback evidence.");
+    using (var repairedSecond = TagLib.File.Create(Path.Combine(staged.AlbumRoot, "2-Canonical Second.flac")))
+        Assert(repairedSecond.Tag.Title == "Canonical Second" && repairedSecond.Tag.Year == 1999 && repairedSecond.Tag.FirstGenre == "Rock",
+            "Missing tags must be filled from the exact external tracklist and album-level existing evidence.");
+
+    using (var localReport = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(local.ReportPath)))
+    {
+        var reportRoot = localReport.RootElement;
+        var tracks = reportRoot.GetProperty("discs")[0].GetProperty("tracks");
+        Assert(reportRoot.GetProperty("workflow_mode").GetString() == "existing_track_repair" &&
+               reportRoot.GetProperty("cover").GetProperty("source").GetString()!.Contains("existing embedded artwork", StringComparison.OrdinalIgnoreCase) &&
+               tracks[0].GetProperty("title_source").GetString() == "existing_tag" &&
+               tracks[1].GetProperty("title_source").GetString() == "external_tracklist",
+            "The repair report must prove existing-tag/art priority and external filename-matched fallback usage.");
+    }
+
+    var committed = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>(), deleteOriginals: true);
+    Assert(committed.Tracks == 2 && !committed.SourcesDeleted && File.Exists(first) && File.Exists(second),
+        "Existing-track repair must replace tracks transactionally without applying source deletion.");
+    Assert(await FlacAudioPayload.Sha256Async(first) == beforeFirstPayload &&
+           await FlacAudioPayload.Sha256Async(second) == beforeSecondPayload,
+        "Final repaired FLAC files must preserve the exact compressed audio-frame payloads.");
+    Assert(FileSha256(folderCover) == originalFolderCover,
+        "A lower-priority folder cover must remain byte-identical while embedded track artwork is preferred.");
+    using (var repaired = TagLib.File.Create(second))
+        Assert(repaired.Tag.Title == "Canonical Second" && repaired.Tag.Pictures.Length == 1,
+            "The final repaired track must contain resolved tags and the prioritized embedded artwork.");
+    using (var finalReport = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(committed.ReportPath)))
+        Assert(finalReport.RootElement.GetProperty("verification").GetProperty("audio_payload_equivalence").GetString() == "passed" &&
+               finalReport.RootElement.GetProperty("deletion").GetProperty("policy").GetString() == "transactional_existing_track_replacement_without_source_deletion",
+            "The final report must record audio-payload equality and non-deletion transactional replacement.");
+    var completed = await new AlbumScanner().ScanAsync(album);
+    Assert(completed.Mode == WorkflowMode.Completed && !completed.RequiresProcessing,
+        "A successfully committed existing-track repair must inventory as already completed.");
+}
+
+static void DuplicateTaggedBonusTrackUsesFilenameAnchor()
+{
+    var evidence = Enumerable.Range(1, 14)
+        .Select(number => (1u, (uint?)number, (uint?)number, $"{number:00} - album track"))
+        .Append((1u, (uint?)14, null, "Get Lucky (Club Mix)"))
+        .ToArray();
+    var resolved = LocalTrackRepairProcessor.ResolveTrackNumbers(evidence);
+    Assert(resolved.SequenceEqual(Enumerable.Range(1, 15).Select(number => (uint)number)),
+        "When exactly one duplicate tagged coordinate has matching filename evidence, it must retain that number and the unnumbered bonus track must receive the next unused number.");
+
+    var stillAmbiguous = LocalTrackRepairProcessor.ResolveTrackNumbers(
+        [(1u, (uint?)14, null, "Bonus A"), (1u, (uint?)14, null, "Bonus B")]);
+    Assert(stillAmbiguous[0] == 14 && stillAmbiguous[1] == 14,
+        "Duplicate tagged coordinates without a unique filename anchor must remain ambiguous instead of being silently reordered.");
+}
+
+static void RecognizedGenreFoldersAreNotArtistEvidence()
+{
+    var identity = LocalTrackRepairProcessor.ParseFolderIdentity("Random Access Memories [Limited Box Set Edition]");
+    Assert(identity.Artist is null && identity.Album == "Random Access Memories",
+        "A containing library category must not become artist metadata; only identity encoded in the album folder itself may be parsed.");
+
+    var encodedIdentity = LocalTrackRepairProcessor.ParseFolderIdentity("Daft Punk - Random Access Memories [Limited Box Set Edition]");
+    Assert(encodedIdentity.Artist == "Daft Punk" && encodedIdentity.Album == "Random Access Memories",
+        "Artist metadata may still be parsed when it is explicitly encoded in the album folder itself.");
+
+    var albumRoot = Path.Combine(Path.GetTempPath(), "Music", "Alternative", "Random Access Memories [Limited Box Set Edition]");
+    Assert(LibraryFolderMetadata.InferGenre(albumRoot) == "Alternative",
+        "A recognized Alternative library folder may supply GENRE while remaining ineligible as ARTIST or ALBUMARTIST evidence.");
+}
+
+static async Task ExistingTracksRepairSupportsMultipleDiscs(string root)
+{
+    var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var toolCheck = await new PreflightService().CheckAsync(seed);
+    if (toolCheck.Tools["ffmpeg"] is not { } ffmpeg) return;
+
+    var album = Path.Combine(root, "Rock", "Two Disc Artist - Two Disc Album");
+    var discOne = Path.Combine(album, "Disc 1");
+    var discTwo = Path.Combine(album, "Disc 2");
+    Directory.CreateDirectory(discOne);
+    Directory.CreateDirectory(discTwo);
+    var fixtures = new[]
+    {
+        (Disc: 1u, Track: 1u, Path: Path.Combine(discOne, "01 - Disc One First.flac"), Title: "Disc One First"),
+        (Disc: 1u, Track: 2u, Path: Path.Combine(discOne, "02 - Disc One Second.flac"), Title: "Disc One Second"),
+        (Disc: 2u, Track: 1u, Path: Path.Combine(discTwo, "01 - Disc Two First.flac"), Title: "Disc Two First"),
+        (Disc: 2u, Track: 2u, Path: Path.Combine(discTwo, "02 - Disc Two Second.flac"), Title: "Disc Two Second")
+    };
+    for (var index = 0; index < fixtures.Length; index++)
+    {
+        var fixture = fixtures[index];
+        await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+            $"sine=frequency={500 + index * 100}:duration=0.15", "-c:a", "flac", fixture.Path);
+        using var file = TagLib.File.Create(fixture.Path);
+        file.Tag.Album = "Two Disc Album";
+        file.Tag.Performers = ["Two Disc Artist"];
+        file.Tag.AlbumArtists = ["Two Disc Artist"];
+        file.Tag.Track = fixture.Disc == 1 ? fixture.Track : 0;
+        file.Tag.TrackCount = fixture.Disc == 1 ? 2u : 0;
+        file.Tag.Disc = fixture.Disc == 1 ? fixture.Disc : 0;
+        file.Tag.DiscCount = fixture.Disc == 1 ? 2u : 0;
+        file.Tag.Year = 1979;
+        file.Tag.Genres = ["Rock"];
+        file.Save();
+    }
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=purple:s=96x96", "-frames:v", "1", "-update", "1", Path.Combine(album, "cover.jpg"));
+
+    var scan = await new AlbumScanner().ScanAsync(album);
+    Assert(scan.Mode == WorkflowMode.ExistingTrackRepair && scan.TrackCount == 4,
+        "A nested two-disc FLAC album must classify as one existing-track repair job.");
+    var preflight = await new PreflightService().CheckAsync(scan);
+    Assert(preflight.CanStart, "A nested two-disc FLAC album must pass existing-track repair preflight.");
+
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("/ws/2/release/?", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"releases":[{"id":"release-multidisc","score":100,"title":"Two Disc Album","artist-credit":[{"name":"Two Disc Artist"}],"release-group":{"id":"group-multidisc"},"date":"1979-01-01","track-count":4,"media":[{"format":"CD","track-count":2},{"format":"CD","track-count":2}],"label-info":[]}]}""");
+        if (uri.Contains("/ws/2/release-group/group-multidisc", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"first-release-date":"1979-01-01","genres":[{"name":"rock","count":10}],"tags":[],"relations":[]}""");
+        if (uri.Contains("/ws/2/release/release-multidisc", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"media":[{"position":2,"tracks":[{"position":2,"title":"Disc Two Second"},{"position":1,"title":"Disc Two First"}]},{"position":1,"tracks":[{"position":2,"title":"Disc One Second"},{"position":1,"title":"Disc One First"}]}]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[{"artistName":"Two Disc Artist","collectionName":"Two Disc Album","primaryGenreName":"Rock","releaseDate":"1979-01-01T00:00:00Z","trackCount":4,"collectionViewUrl":"https://music.apple.com/album/two-disc"}]}""");
+        throw new InvalidOperationException($"Unexpected multi-disc metadata request: {uri}");
+    }));
+    var external = new ExternalMetadataService(client, discogsToken: null,
+        musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var job = PreflightService.CreateJobDirectory(preflight.TempRoot);
+    var staged = await new HostStagingService().StageAsync(scan, preflight, job, new Progress<ProgressSnapshot>());
+    var local = await new LocalTrackRepairProcessor(external).ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+
+    Assert(local.Tracks == 4 && !local.Metadata.RequiresResearch,
+        "Repeated track numbers on different discs must not be treated as ambiguous.");
+    foreach (var fixture in fixtures)
+    {
+        var relative = Path.GetRelativePath(album, fixture.Path);
+        using var repaired = TagLib.File.Create(Path.Combine(staged.AlbumRoot, relative));
+        Assert(repaired.Tag.Title == fixture.Title && repaired.Tag.Track == fixture.Track && repaired.Tag.TrackCount == 2 &&
+               repaired.Tag.Disc == fixture.Disc && repaired.Tag.DiscCount == 2,
+            "Multi-disc repair must map external titles in disc/track order and write per-disc totals.");
+    }
+    using (var report = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(local.ReportPath)))
+    {
+        var discs = report.RootElement.GetProperty("discs");
+        Assert(discs.GetArrayLength() == 2 &&
+               discs[0].GetProperty("disc").GetUInt32() == 1 && discs[0].GetProperty("tracks").GetArrayLength() == 2 &&
+               discs[1].GetProperty("disc").GetUInt32() == 2 && discs[1].GetProperty("tracks").GetArrayLength() == 2,
+            "The repair report must preserve the two-disc hierarchy.");
+    }
+
+    var committed = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>(), deleteOriginals: true);
+    Assert(committed.Tracks == 4 && fixtures.All(fixture => File.Exists(fixture.Path)),
+        "Transactional commit must replace nested multi-disc tracks without deleting them as source images.");
+    using (var finalDiscTwoTrackOne = TagLib.File.Create(fixtures[2].Path))
+        Assert(finalDiscTwoTrackOne.Tag.Title == "Disc Two First" && finalDiscTwoTrackOne.Tag.Disc == 2 &&
+               finalDiscTwoTrackOne.Tag.Track == 1 && finalDiscTwoTrackOne.Tag.TrackCount == 2,
+            "Committed Disc 2 tags must retain disc-aware numbering and totals.");
 }
 
 static async Task LocalSplitterCropsAndNormalizesBookletFront(string root)
@@ -986,9 +1435,17 @@ static string FileSha256(string path) => Convert.ToHexString(SHA256.HashData(Fil
 static bool IsImagePath(string path) => new[] { ".jpg", ".jpeg", ".png" }
     .Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
 
-static async Task HostCommitsVerifiedFlac(string root, bool deleteOriginals)
+static async Task HostCommitsVerifiedFlac(
+    string root,
+    bool deleteOriginals,
+    bool optionalMetadataMissing = false,
+    bool requiredMetadataMissing = false)
 {
-    var destination = Path.Combine(root, deleteOriginals ? "commit-destination" : "commit-retain-original"); Directory.CreateDirectory(destination);
+    var destination = Path.Combine(root, requiredMetadataMissing
+        ? "commit-required-metadata"
+        : optionalMetadataMissing ? "commit-optional-metadata"
+        : deleteOriginals ? "commit-destination" : "commit-retain-original");
+    Directory.CreateDirectory(destination);
     var source = Path.Combine(destination, "source.flac");
     var cue = Path.Combine(destination, "source.cue");
     await File.WriteAllTextAsync(cue, "FILE \"source.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00");
@@ -1012,6 +1469,9 @@ static async Task HostCommitsVerifiedFlac(string root, bool deleteOriginals)
         "-metadata", "TITLE=Test", "-metadata", "ALBUM=Test Album", "-metadata", "ARTIST=Tester", "-metadata", "ALBUMARTIST=Tester",
         "-metadata", "TRACKNUMBER=1/1", "-metadata", "DISCNUMBER=1/1", "-metadata", "DATE=2026", "-metadata", "GENRE=Rock", track);
     var coverDescriptor = EmbeddedCoverDescriptorJson(track, 64, 64, "existing user cover");
+    var missingMetadata = requiredMetadataMissing
+        ? "[\"CATALOGNUMBER\"]"
+        : optionalMetadataMissing ? "[\"LABEL\", \"BARCODE\", \"RELEASECOUNTRY\"]" : "[]";
     var report = $$"""
     {
       "schema_version": "2.0",
@@ -1021,7 +1481,7 @@ static async Task HostCommitsVerifiedFlac(string root, bool deleteOriginals)
       "genre": { "value": "Rock", "source_type": "inferred", "confidence": "high", "rationale": "test" },
       "cover": {{coverDescriptor}},
       "discs": [{ "disc": 1, "source": "source.flac", "tracks": [{ "disc": 1, "track": 1, "title": "Test", "file": "01 - Test.flac" }] }],
-      "verification": { "status": "pending", "sources_deleted": false, "errors": [] }
+      "verification": { "status": "pending", "sources_deleted": false, "errors": [], "missing_metadata": {{missingMetadata}} }
     }
     """;
     await File.WriteAllTextAsync(Path.Combine(stagedAlbum, "conversion-report.json"), report);
@@ -1032,14 +1492,16 @@ static async Task HostCommitsVerifiedFlac(string root, bool deleteOriginals)
     Assert(!Directory.EnumerateFiles(stagedAlbum, "*", SearchOption.AllDirectories).Any(IsImagePath),
         "The commit staging tree must contain embedded artwork only, not an image sidecar.");
     var result = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>(), deleteOriginals);
-    Assert(result.Tracks == 1 && result.SourcesDeleted == deleteOriginals,
-        deleteOriginals ? "The exact source must be deleted after final quick checks." : "The source must be retained when deletion is not requested.");
+    var expectedDeletion = deleteOriginals && !requiredMetadataMissing;
+    Assert(result.Tracks == 1 && result.SourcesDeleted == expectedDeletion,
+        expectedDeletion ? "The exact source must be deleted after final quick checks." : "The source must be retained when deletion is not requested or required metadata is missing.");
     Assert(File.Exists(Path.Combine(destination, "01 - Test.flac")) && FileSha256(cover) == originalCoverHash,
         "The verified track must be committed while the existing user cover remains byte-identical.");
-    Assert(File.Exists(source) != deleteOriginals && File.Exists(cue) && File.Exists(result.ReportPath),
+    Assert(File.Exists(source) != expectedDeletion && File.Exists(cue) && File.Exists(result.ReportPath),
         "The source disposition did not match the requested delete-originals option; the CUE and final report must remain.");
     var summary = await ReportReader.LoadAsync(result.ReportPath);
-    Assert(summary.Status == "passed" && summary.Tracks == 1 && summary.Deleted == deleteOriginals,
+    Assert(summary.Status == (requiredMetadataMissing ? "incomplete" : "passed") &&
+           summary.Tracks == 1 && summary.Deleted == expectedDeletion,
         "The final report did not record the requested source disposition.");
     using var finalReport = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(result.ReportPath));
     var deletion = finalReport.RootElement.GetProperty("deletion");
@@ -1053,6 +1515,22 @@ static async Task HostCommitsVerifiedFlac(string root, bool deleteOriginals)
         "The final report did not record that the user chose to retain originals.");
     Assert(deleteOriginals || !finalReport.RootElement.GetProperty("verification").GetProperty("source_deletion_requested").GetBoolean(),
         "The final verification must record that source deletion was not requested.");
+    if (optionalMetadataMissing)
+    {
+        var verification = finalReport.RootElement.GetProperty("verification");
+        Assert(verification.GetProperty("status").GetString() == "passed" &&
+               finalReport.RootElement.GetProperty("work_status").GetString() == "complete" &&
+               verification.GetProperty("warnings").EnumerateArray().Count() == 3,
+            "Missing LABEL, BARCODE, and RELEASECOUNTRY must remain informational warnings without blocking complete status or source deletion.");
+    }
+    if (requiredMetadataMissing)
+    {
+        var verification = finalReport.RootElement.GetProperty("verification");
+        Assert(result.Incomplete && result.IncompleteKind == CompletionIssueKind.RequiredMetadata &&
+               verification.GetProperty("incomplete_kind").GetString() == "required_metadata_missing" &&
+               summary.Headline.Contains("required metadata missing", StringComparison.OrdinalIgnoreCase),
+            "Missing required metadata must retain the source and expose a specific required-metadata label instead of a generic incomplete label.");
+    }
     var pipeline = finalReport.RootElement.GetProperty("pipeline");
     Assert(pipeline.GetProperty("configured").GetProperty("processing_workers").GetInt32() == 4 &&
            pipeline.GetProperty("observed_at_commit").GetProperty("copy_back_workers").GetInt32() == 2,
@@ -1214,7 +1692,9 @@ static async Task HostCommitsIncompleteFlacWithoutArtwork(string root)
     var staged = new StagedJob(job, stagedAlbum, ffmpeg, ffprobe, Path.Combine(job, "host-manifest.json"), [stagedSource]);
     var result = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>());
 
-    Assert(result.Tracks == 1 && result.Incomplete && !result.SourcesDeleted, "Missing artwork must deliver tracks as incomplete work without deleting the source.");
+    Assert(result.Tracks == 1 && result.Incomplete && !result.SourcesDeleted &&
+           result.IncompleteKind == CompletionIssueKind.CoverArtwork,
+        "Missing artwork must use the explicit cover-artwork issue kind, deliver tracks as incomplete work, and retain the source.");
     Assert(File.Exists(Path.Combine(destination, "01 - Test.flac")) && File.Exists(source), "The incomplete track and original source must both remain in the album folder.");
     var summary = await ReportReader.LoadAsync(result.ReportPath);
     Assert(summary.Status == "incomplete" && !summary.Deleted, "The final report must mark deferred artwork as incomplete work.");
@@ -1323,6 +1803,12 @@ static async Task FailureCleanupRemovesLocalAndDestinationStages(string root)
 
 static void SacdLayoutParserSupportsToolIndexConventions()
 {
+    var stereoArguments = LocalDsdProcessor.ExtractionArguments(true, "album.iso", "stereo-output");
+    var multichannelArguments = LocalDsdProcessor.ExtractionArguments(false, "album.iso", "multichannel-output");
+    Assert(stereoArguments.SequenceEqual(["-2", "-s", "-c", "-i", "album.iso", "-y", "stereo-output"]) &&
+           multichannelArguments.SequenceEqual(["-m", "-s", "-c", "-i", "album.iso", "-y", "multichannel-output"]),
+        "DSF extraction must use sacd_extract's -y DSF output-directory option for both stereo and multichannel areas; -o produces an incorrect single output for some non-DST SACDs.");
+
     const string currentOutput = """
     Album Information:
         Album Catalog Number: UIGY-9519
@@ -1375,6 +1861,43 @@ static void SacdLayoutParserSupportsToolIndexConventions()
     catch (Exception error) { invalidIndexes = error; }
     Assert(invalidIndexes is InvalidDataException && invalidIndexes.Message.Contains("noncontiguous", StringComparison.OrdinalIgnoreCase),
         "A gapped SACD title table must produce a clear validation error instead of a dictionary exception.");
+
+    const string missingDiscText = """
+    Album Information:
+        Album Catalog Number: 5914552
+    Disc Information:
+        Disc Catalog Number: 5914552
+        Creation date: 2003-07-14
+    Area count: 1
+        Area Information [0]:
+        Track Count: 2
+        Total play time: 15:44:62 [mins:secs:frames]
+        Speaker config: 2 Channel
+        Duration: 08:02:73 [mins:secs:frames]
+        Duration: 07:39:64 [mins:secs:frames]
+    """;
+    var structural = LocalDsdProcessor.ParseLayout(missingDiscText);
+    Assert(structural.AlbumTitle.Length == 0 && structural.AlbumArtist.Length == 0 &&
+           structural.Areas[0].Tracks.All(track => track.Title.Length == 0),
+        "A structurally valid SACD without disc text must reach fallback resolution instead of failing during layout parsing.");
+    var albumRoot = Path.Combine("X:\\Rock", "1988 - Spirit Of Eden (2003 Remaster SACD-R)");
+    var scan = new ScanResult(albumRoot, Path.GetFileName(albumRoot), WorkflowMode.DsdExtraction,
+        [new(Path.Combine(albumRoot, "Talk Talk - Spirit Of Eden.md5"), "Talk Talk - Spirit Of Eden.md5", "Provenance", 100, "checksum")],
+        [], [], 0, 1, 0, 0, false, true);
+    var localIdentity = LocalDsdProcessor.ResolveLocalIdentity(scan, structural);
+    Assert(localIdentity.ChecksumArtist == "Talk Talk" && localIdentity.ChecksumAlbum == "Spirit Of Eden" &&
+           localIdentity.FolderAlbum == "Spirit Of Eden",
+        "Checksum filename must outrank the folder as the strongest local artist/title fallback while the folder supplies corroborating title evidence.");
+    var catalogIdentity = new ExternalAlbumIdentity("Spirit of Eden", "Talk Talk", "5914552", "2003-07-14",
+        "https://musicbrainz.org/release/spirit-release", ["The Rainbow", "Eden"]);
+    var identified = LocalDsdProcessor.ApplyAlbumIdentity(structural, localIdentity, catalogIdentity);
+    var emptyExternal = new ExternalAlbumMetadata(null, null, null, null, null, null, null, null, null, null,
+        [], [], null, null, []);
+    var completed = LocalDsdProcessor.ApplyExternalTrackListing(identified, catalogIdentity, emptyExternal);
+    Assert(completed.AlbumArtist == "Talk Talk" && completed.AlbumTitle == "Spirit of Eden" &&
+           completed.Areas[0].Tracks.Select(track => track.Title).SequenceEqual(["The Rainbow", "Eden"]) &&
+           completed.Areas[0].Tracks.All(track => track.Performer == "Talk Talk"),
+        "Exact catalog identity and its count-matching external track listing must complete missing SACD disc text deterministically.");
 }
 
 static async Task RunToolAsync(string tool, params string[] arguments)
@@ -1490,6 +2013,39 @@ static async Task ExternalMetadataResolvesExactSacdRelease()
     Assert(result.Genre == "Rock" && result.GenreSourceType == "discogs_linked_from_musicbrainz" && result.Label == "Vertigo" && result.CatalogNumber == "UIGY-9547", "Exact MusicBrainz/Discogs SACD metadata was not selected.");
     Assert(result.Barcode == "4988005811783" && result.ReleaseCountry == "JP" && result.ReleaseDate == "2014-04-23", "Exact SACD edition fields were not retained.");
     Assert(result.OriginalDate?.StartsWith("1985", StringComparison.Ordinal) == true && result.Sources.Count >= 3, "Corroborating Discogs/Apple Music metadata or source provenance is missing.");
+}
+
+static async Task ExternalCatalogIdentityResolvesMissingSacdDiscText()
+{
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("/ws/2/release/?", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""
+            {"releases":[{"id":"spirit-release","score":100,"title":"Spirit of Eden","artist-credit":[{"name":"Talk Talk"}],"release-group":{"id":"spirit-group"},"date":"2003-07-14","track-count":4,"media":[{"position":1,"format":"Hybrid SACD (CD layer)","track-count":2},{"position":2,"format":"Hybrid SACD (SACD layer, 2 channels)","track-count":2}],"label-info":[{"catalog-number":"7243 5 91455 2 8","label":{"name":"Parlophone"}}]}]}
+            """);
+        if (uri.Contains("/ws/2/release/spirit-release?inc=recordings", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""
+            {"media":[{"position":1,"format":"Hybrid SACD (CD layer)","track-count":2,"tracks":[{"title":"CD-layer Rainbow"},{"title":"CD-layer Eden"}]},{"position":2,"format":"Hybrid SACD (SACD layer, 2 channels)","track-count":2,"tracks":[{"title":"The Rainbow"},{"title":"Eden"}]}]}
+            """);
+        if (uri.Contains("/ws/2/release-group/spirit-group", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"first-release-date":"1988-09-16","genres":[],"tags":[],"relations":[]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[]}""");
+        throw new InvalidOperationException($"Unexpected catalog identity request: {uri}");
+    }));
+    var service = new ExternalMetadataService(client, musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var identity = await service.ResolveIdentityByCatalogAsync("5914552", 2, 2003);
+    Assert(identity is not null && identity.Album == "Spirit of Eden" && identity.Artist == "Talk Talk" &&
+           identity.CatalogNumber == "7243 5 91455 2 8" && identity.TrackTitles.SequenceEqual(["The Rainbow", "Eden"]) &&
+           identity.MusicBrainzReleaseId == "spirit-release",
+        "An unambiguous physical-disc catalog substring and matching hybrid-SACD medium must resolve the full release identity, SACD-layer track titles, and cover-release identifier without rejecting the release-level combined track count.");
+    var metadata = await service.ResolveAsync(
+        new("Spirit of Eden", "Talk Talk", 2, 1988, 2003, "5914552"),
+        includeTrackTitles: true);
+    Assert(metadata.MusicBrainzReleaseId == "spirit-release" &&
+           metadata.TrackTitles.SequenceEqual(["The Rainbow", "Eden"]),
+        "General external matching must retain the exact hybrid-SACD release ID for cover lookup and select only its SACD medium track list.");
 }
 
 static async Task ExternalMetadataUsesAppleGenreFallback()
@@ -1617,4 +2173,9 @@ sealed class StubHttpHandler(Func<HttpRequestMessage, CancellationToken, HttpRes
             Headers = { ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(mediaType) }
         }
     };
+}
+
+sealed class TestProgress<T>(Action<T> report) : IProgress<T>
+{
+    public void Report(T value) => report(value);
 }

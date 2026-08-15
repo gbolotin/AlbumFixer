@@ -54,26 +54,63 @@ public sealed partial class LocalDsdProcessor
         var layoutOutput = await RunProcessAsync(staged.SacdExtractPath, ["-P", "-i", iso], workingDirectory, null, token);
         var layoutPath = Path.Combine(staged.AlbumRoot, "sacd_extract-layout.txt");
         await File.WriteAllTextAsync(layoutPath, layoutOutput, new UTF8Encoding(false), token);
-        var layout = ParseLayout(layoutOutput);
-        if (layout.Areas.Count == 0) throw new InvalidDataException("sacd_extract reported no playable SACD areas.");
+        var structuralLayout = ParseLayout(layoutOutput);
+        if (structuralLayout.Areas.Count == 0) throw new InvalidDataException("sacd_extract reported no playable SACD areas.");
 
-        var years = ResolveYears(scan.AlbumName, layout.CreationDate);
-        progress.Report(Snapshot(JobPhase.Processing, 20, "Searching Discogs, MusicBrainz, and Apple Music for missing SACD metadata; lookup failures will not stop extraction."));
+        var years = ResolveYears(scan.AlbumName, structuralLayout.CreationDate);
+        var localIdentity = ResolveLocalIdentity(scan, structuralLayout);
+        var trackCount = structuralLayout.Areas.Max(area => area.Tracks.Count);
+        progress.Report(Snapshot(JobPhase.Processing, 20,
+            "Resolving missing SACD identity by exact catalog number, checksum filename, folder name, and matching external track listing."));
+        ExternalAlbumIdentity? catalogIdentity = null;
+        if (Nonempty(structuralLayout.CatalogNumber) is { } catalogNumber)
+            catalogIdentity = await _externalMetadata.ResolveIdentityByCatalogAsync(
+                catalogNumber, trackCount, years.Edition, requireSacd: true, token);
+        var identifiedLayout = ApplyAlbumIdentity(structuralLayout, localIdentity, catalogIdentity);
+        if (string.IsNullOrWhiteSpace(identifiedLayout.AlbumTitle) || string.IsNullOrWhiteSpace(identifiedLayout.AlbumArtist))
+            throw new InvalidDataException(
+                "The SACD disc text has no album title or artist, and exact catalog, checksum-filename, and folder-name fallback did not establish both fields unambiguously.");
+
+        var existingTrackHints = identifiedLayout.Areas
+            .OrderByDescending(area => area.Tracks.Count(track => !string.IsNullOrWhiteSpace(track.Title)))
+            .First().Tracks.Select(track => track.Title).Where(title => !string.IsNullOrWhiteSpace(title)).ToArray();
         var external = await _externalMetadata.ResolveAsync(new(
-            layout.AlbumTitle,
-            layout.AlbumArtist,
-            layout.Areas.Max(area => area.Tracks.Count),
+            identifiedLayout.AlbumTitle,
+            identifiedLayout.AlbumArtist,
+            trackCount,
             years.Original,
             years.Edition,
-            layout.CatalogNumber), token: token);
+            identifiedLayout.CatalogNumber,
+            TrackTitleHints: existingTrackHints.Length == trackCount ? existingTrackHints : null),
+            includeTrackTitles: true,
+            token);
+        if (catalogIdentity is not null)
+            external = external with
+            {
+                Sources = external.Sources.Append(catalogIdentity.Source).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+            };
+        var layout = ApplyExternalTrackListing(identifiedLayout, catalogIdentity, external);
         var metadata = ResolveMetadata(scan.AlbumRoot, layout, years, external);
-        var preparedCover = await new InMemoryArtworkService().PrepareLocalAsync(
+        var requiredMissingMetadata = MetadataFieldPolicy.RequiredMissing(metadata.MissingFields);
+        var optionalMissingMetadata = MetadataFieldPolicy.OptionalMissing(metadata.MissingFields);
+        var metadataWarnings = metadata.Warnings
+            .Concat(optionalMissingMetadata.Select(field => $"Optional metadata field remains unresolved: {field}."))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var requiredMetadataIncomplete = requiredMissingMetadata.Count > 0;
+        var coverReleaseId = external.MusicBrainzReleaseId ?? catalogIdentity?.MusicBrainzReleaseId;
+        var preparedCover = await new InMemoryArtworkService().PrepareLocalThenExternalAsync(
             staged.InputAlbumRoot,
             staged.FfmpegPath,
             staged.FfprobePath,
             ArtworkSelectionMode.Dsd,
+            _externalMetadata,
+            coverReleaseId,
             token);
-        var cover = preparedCover.Artwork ?? throw new InvalidDataException(preparedCover.Issue ?? "SACD extraction requires local front-cover artwork.");
+        var cover = preparedCover.Artwork ?? throw new InvalidDataException(
+            preparedCover.Issue ?? "SACD extraction requires usable local artwork or an exact external front-cover match.");
+        if (cover.Source.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+            progress.Report(Snapshot(JobPhase.Processing, 20, "No usable local cover was found; an exact external front cover was normalized safely in memory."));
         var reportAreas = new JsonArray();
         var allTrackReports = new List<JsonObject>();
         var totalTracks = 0;
@@ -91,9 +128,8 @@ public sealed partial class LocalDsdProcessor
             var independentRoot = Path.Combine(staged.JobDirectory, "sacd-independent", areaFolderName);
             Directory.CreateDirectory(primaryRoot);
             Directory.CreateDirectory(independentRoot);
-            var areaFlag = area.IsStereo ? "-2" : "-m";
-            var primaryArguments = new[] { areaFlag, "-s", "-c", "-i", iso, "-o", primaryRoot };
-            var independentArguments = new[] { areaFlag, "-s", "-c", "-i", iso, "-o", independentRoot };
+            var primaryArguments = ExtractionArguments(area.IsStereo, iso, primaryRoot);
+            var independentArguments = ExtractionArguments(area.IsStereo, iso, independentRoot);
 
             progress.Report(Snapshot(JobPhase.Processing, 21 + areaIndex * 8,
                 $"Extracting the {area.DisplayName} area to untagged DSF tracks."));
@@ -198,8 +234,11 @@ public sealed partial class LocalDsdProcessor
             ["extraction_tool"] = version,
             ["disc_layout_command"] = layoutCommand,
             ["disc_layout_file"] = "sacd_extract-layout.txt",
-            ["metadata_sources"] = new JsonArray(new[] { "SACD disc text and track table", "album folder", cover.Source }
-                .Concat(metadata.Sources).Select(value => JsonValue.Create(value)).ToArray()),
+            ["metadata_sources"] = new JsonArray((layout.IdentitySources ?? [])
+                .Append(cover.Source)
+                .Concat(metadata.Sources)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(value => JsonValue.Create(value)).ToArray()),
             ["release_metadata"] = new JsonObject
             {
                 ["original_date"] = metadata.OriginalDate,
@@ -211,10 +250,12 @@ public sealed partial class LocalDsdProcessor
             },
             ["metadata_lookup"] = new JsonObject
             {
-                ["status"] = metadata.MissingFields.Count == 0 ? "complete" : metadata.Sources.Count > 0 ? "partial" : "unresolved",
+                ["status"] = requiredMetadataIncomplete
+                    ? metadata.Sources.Count > 0 ? "partial" : "unresolved"
+                    : optionalMissingMetadata.Count > 0 ? "complete_with_optional_gaps" : "complete",
                 ["nonblocking"] = true,
                 ["sources"] = new JsonArray(metadata.Sources.Select(value => JsonValue.Create(value)).ToArray()),
-                ["warnings"] = new JsonArray(metadata.Warnings.Select(value => JsonValue.Create(value)).ToArray())
+                ["warnings"] = new JsonArray(metadataWarnings.Select(value => JsonValue.Create(value)).ToArray())
             },
             ["cover"] = cover.ToReport(),
             ["genre"] = new JsonObject
@@ -229,16 +270,18 @@ public sealed partial class LocalDsdProcessor
                 .Select(path => (JsonNode)JsonValue.Create(JsonPath(Path.GetFileName(path)))!).ToArray()),
             ["verification"] = new JsonObject
             {
-                ["status"] = metadata.MissingFields.Count == 0 ? "passed" : "incomplete",
+                ["status"] = requiredMetadataIncomplete ? "incomplete" : "passed",
                 ["method"] = "Two deterministic untagged extractions per reported area; per-track file-size equality; DSF/DSD probe and signal checks; unchanged DSD payload size through ID3/artwork tagging.",
                 ["independent_extraction"] = "passed",
                 ["tag_payload_size_verification"] = "passed",
                 ["audio_and_tags"] = "passed",
-                ["source_deletion_eligible"] = metadata.MissingFields.Count == 0,
+                ["source_deletion_eligible"] = !requiredMetadataIncomplete,
                 ["sources_deleted"] = false,
                 ["errors"] = new JsonArray(),
-                ["warnings"] = new JsonArray(metadata.Warnings.Select(value => JsonValue.Create(value)).ToArray()),
-                ["missing_metadata"] = new JsonArray(metadata.MissingFields.Select(value => JsonValue.Create(value)).ToArray())
+                ["warnings"] = new JsonArray(metadataWarnings.Select(value => JsonValue.Create(value)).ToArray()),
+                ["missing_metadata"] = new JsonArray(metadata.MissingFields.Select(value => JsonValue.Create(value)).ToArray()),
+                ["missing_required_metadata"] = new JsonArray(requiredMissingMetadata.Select(value => JsonValue.Create(value)).ToArray()),
+                ["missing_optional_metadata"] = new JsonArray(optionalMissingMetadata.Select(value => JsonValue.Create(value)).ToArray())
             },
             ["job"] = new JsonObject
             {
@@ -250,18 +293,22 @@ public sealed partial class LocalDsdProcessor
                 ["processor"] = "local_sacd_extract_sequential_areas"
             }
         };
-        report["work_status"] = metadata.MissingFields.Count == 0 ? "complete" : "incomplete";
-        if (metadata.MissingFields.Count > 0)
+        report["work_status"] = requiredMetadataIncomplete ? "incomplete" : "complete";
+        if (requiredMetadataIncomplete)
         {
             report["incomplete_work"] = new JsonObject
             {
-                ["reason"] = "External and local metadata sources did not resolve every desired field. Verified DSF tracks remain usable.",
+                ["reason"] = "Required metadata remains unresolved. Verified DSF tracks remain usable.",
                 ["repairable_without_source_image"] = true,
-                ["issues"] = new JsonArray(metadata.MissingFields.Select(value => JsonValue.Create($"Missing metadata: {value}")).ToArray())
+                ["issues"] = new JsonArray(requiredMissingMetadata.Select(value => JsonValue.Create($"Missing required metadata: {value}")).ToArray())
             };
         }
         await AtomicWriteAsync(reportPath, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
-        var evidence = new[] { "SACD disc text and track table", $"local artwork: {cover.Source}" }.Concat(metadata.Sources).ToArray();
+        var evidence = (layout.IdentitySources ?? [])
+            .Append($"front-cover artwork: {cover.Source}")
+            .Concat(metadata.Sources)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
         await WriteGapManifestAsync(staged.JobDirectory, metadata.MissingFields, evidence, token);
         progress.Report(Snapshot(JobPhase.Tagging, 48, $"SACD extraction and deletion-grade local verification completed for {totalTracks} tracks."));
         return new(totalTracks, reportPath, new MetadataGapResult(true, metadata.MissingFields.Count > 0, metadata.MissingFields, evidence));
@@ -431,8 +478,6 @@ public sealed partial class LocalDsdProcessor
         var albumArtist = Matches(output, "^\\s*Artist:\\s*(?<value>.+?)\\s*$").Select(match => match.Groups["value"].Value.Trim()).LastOrDefault();
         var catalog = MatchValue(output, "^\\s*Album Catalog Number:\\s*(?<value>.+?)\\s*$") ?? MatchValue(output, "^\\s*Disc Catalog Number:\\s*(?<value>.+?)\\s*$");
         var creationDate = MatchValue(output, "^\\s*Creation date:\\s*(?<value>.+?)\\s*$");
-        if (string.IsNullOrWhiteSpace(albumTitle) || string.IsNullOrWhiteSpace(albumArtist))
-            throw new InvalidDataException("The SACD disc text has no album title or artist.");
 
         var areaStarts = AreaStart().Matches(output).Cast<Match>().ToArray();
         var areas = new List<SacdArea>();
@@ -452,22 +497,171 @@ public sealed partial class LocalDsdProcessor
             var performers = Matches(block, "^\\s*Performer\\[(?<index>\\d+)\\]:\\s*(?<value>.*?)\\s*$").ToDictionary(match => int.Parse(match.Groups["index"].Value, CultureInfo.InvariantCulture), match => match.Groups["value"].Value.Trim());
             var durations = Matches(block, "^\\s*Duration:\\s*(?<value>\\d+:\\d+:\\d+)").Select(match => ParseTimeCode(match.Groups["value"].Value)).ToArray();
             var isrcs = ParseIsrcs(block);
-            if (titles.Count != trackCount || durations.Length != trackCount)
+            if (titles.Count is > 0 && titles.Count != trackCount || durations.Length != trackCount)
                 throw new InvalidDataException($"The SACD area lists {trackCount} tracks but its title/duration table is incomplete.");
-            var titleIndexes = titles.Keys.OrderBy(index => index).ToArray();
-            var firstTitleIndex = titleIndexes[0];
-            if (firstTitleIndex is not 0 and not 1 ||
-                !titleIndexes.SequenceEqual(Enumerable.Range(firstTitleIndex, trackCount)))
-                throw new InvalidDataException($"The SACD area has unsupported or noncontiguous title indexes: {string.Join(", ", titleIndexes)}.");
-            var tracks = titleIndexes.Select((sourceIndex, trackIndex) => new SacdTrack(
-                trackIndex + 1,
-                titles[sourceIndex],
-                performers.GetValueOrDefault(sourceIndex, albumArtist),
-                durations[trackIndex],
-                isrcs.GetValueOrDefault(sourceIndex))).ToArray();
+            SacdTrack[] tracks;
+            if (titles.Count == 0)
+            {
+                var sourceIndexOffset = isrcs.ContainsKey(0) ? 0 : 1;
+                tracks = Enumerable.Range(0, trackCount).Select(trackIndex => new SacdTrack(
+                    trackIndex + 1,
+                    string.Empty,
+                    performers.TryGetValue(trackIndex + sourceIndexOffset, out var performer) ? performer : albumArtist ?? string.Empty,
+                    durations[trackIndex],
+                    isrcs.GetValueOrDefault(trackIndex + sourceIndexOffset))).ToArray();
+            }
+            else
+            {
+                var titleIndexes = titles.Keys.OrderBy(index => index).ToArray();
+                var firstTitleIndex = titleIndexes[0];
+                if (firstTitleIndex is not 0 and not 1 ||
+                    !titleIndexes.SequenceEqual(Enumerable.Range(firstTitleIndex, trackCount)))
+                    throw new InvalidDataException($"The SACD area has unsupported or noncontiguous title indexes: {string.Join(", ", titleIndexes)}.");
+                tracks = titleIndexes.Select((sourceIndex, trackIndex) => new SacdTrack(
+                    trackIndex + 1,
+                    titles[sourceIndex],
+                    performers.TryGetValue(sourceIndex, out var performer) ? performer : albumArtist ?? string.Empty,
+                    durations[trackIndex],
+                    isrcs.GetValueOrDefault(sourceIndex))).ToArray();
+            }
             areas.Add(new(speakerConfig.Contains("2 Channel", StringComparison.OrdinalIgnoreCase), speakerConfig, totalPlayTime, tracks));
         }
-        return new(albumTitle, albumArtist, catalog?.Trim(), creationDate, areas);
+        return new(albumTitle ?? string.Empty, albumArtist ?? string.Empty, catalog?.Trim(), creationDate, areas);
+    }
+
+    internal static SacdLocalIdentity ResolveLocalIdentity(ScanResult scan, SacdLayout layout)
+    {
+        var checksumCandidates = scan.Media
+            .Where(item => Path.GetExtension(item.Path) is { } extension &&
+                           (extension.Equals(".md5", StringComparison.OrdinalIgnoreCase) ||
+                            extension.Equals(".sfv", StringComparison.OrdinalIgnoreCase)))
+            .Select(item => TryParseArtistAlbum(Path.GetFileNameWithoutExtension(item.Path)))
+            .Where(identity => identity is not null)
+            .Select(identity => identity!.Value)
+            .GroupBy(identity => $"{IdentityKey(identity.Artist)}\0{IdentityKey(identity.Album)}", StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+        if (checksumCandidates.Length > 1)
+            throw new InvalidDataException("Checksum filenames disagree about the album artist or title; automatic SACD identity fallback is ambiguous.");
+
+        var folderText = LeadingYearPrefix().Replace(scan.AlbumName, string.Empty).Trim();
+        while (TrailingEditionBlock().IsMatch(folderText))
+            folderText = TrailingEditionBlock().Replace(folderText, string.Empty).Trim();
+        var folderIdentity = TryParseArtistAlbum(folderText);
+        var checksum = checksumCandidates.FirstOrDefault();
+        return new(
+            checksum.Artist,
+            checksum.Album,
+            folderIdentity?.Artist,
+            folderIdentity?.Album ?? Nonempty(folderText));
+    }
+
+    internal static SacdLayout ApplyAlbumIdentity(
+        SacdLayout layout,
+        SacdLocalIdentity local,
+        ExternalAlbumIdentity? catalogIdentity)
+    {
+        if (catalogIdentity is not null &&
+            ((Nonempty(layout.AlbumTitle) is { } discTitle && !IdentityEquivalent(catalogIdentity.Album, discTitle)) ||
+             (Nonempty(layout.AlbumArtist) is { } discArtist && !IdentityEquivalent(catalogIdentity.Artist, discArtist))))
+            throw new InvalidDataException(
+                "The exact catalog-number match disagrees with SACD disc text; automatic release identification is ambiguous.");
+        if (catalogIdentity is not null && local.ChecksumArtist is not null && local.ChecksumAlbum is not null &&
+            (!IdentityEquivalent(catalogIdentity.Artist, local.ChecksumArtist) ||
+             !IdentityEquivalent(catalogIdentity.Album, local.ChecksumAlbum)))
+            throw new InvalidDataException(
+                "The exact catalog-number match disagrees with the checksum filename artist/title; automatic SACD identity fallback is ambiguous.");
+
+        var album = Nonempty(layout.AlbumTitle) ?? catalogIdentity?.Album ?? local.ChecksumAlbum ?? local.FolderAlbum ?? string.Empty;
+        var artist = Nonempty(layout.AlbumArtist) ?? catalogIdentity?.Artist ?? local.ChecksumArtist ?? local.FolderArtist ?? string.Empty;
+        var sources = new List<string>();
+        if (Nonempty(layout.AlbumTitle) is not null || Nonempty(layout.AlbumArtist) is not null)
+            sources.Add("SACD disc text");
+        if (catalogIdentity is not null &&
+            (Nonempty(layout.AlbumTitle) is null || Nonempty(layout.AlbumArtist) is null))
+            sources.Add($"exact catalog-number match: {catalogIdentity.Source}");
+        if ((Nonempty(layout.AlbumTitle) is null || Nonempty(layout.AlbumArtist) is null) &&
+            (local.ChecksumAlbum is not null || local.ChecksumArtist is not null))
+            sources.Add(catalogIdentity is null ? "checksum filename" : "checksum filename corroboration");
+        if (Nonempty(layout.AlbumTitle) is null && local.FolderAlbum is not null)
+            sources.Add(catalogIdentity is null && local.ChecksumAlbum is null
+                ? "album folder name"
+                : "album folder-name corroboration");
+        return layout with
+        {
+            AlbumTitle = album,
+            AlbumArtist = artist,
+            CatalogNumber = catalogIdentity?.CatalogNumber ?? layout.CatalogNumber,
+            IdentitySources = sources.Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+        };
+    }
+
+    internal static SacdLayout ApplyExternalTrackListing(
+        SacdLayout layout,
+        ExternalAlbumIdentity? catalogIdentity,
+        ExternalAlbumMetadata external)
+    {
+        var requiresTrackTitles = layout.Areas.Any(area => area.Tracks.Any(track => string.IsNullOrWhiteSpace(track.Title)));
+        IReadOnlyList<string> fallbackTitles = [];
+        string? listingSource = null;
+        if (requiresTrackTitles && catalogIdentity?.TrackTitles.Count > 0)
+        {
+            fallbackTitles = catalogIdentity.TrackTitles;
+            listingSource = catalogIdentity.Source;
+        }
+        else if (requiresTrackTitles && external.TrackTitles.Count > 0)
+        {
+            if (Nonempty(layout.CatalogNumber) is { } catalogNumber &&
+                !ExternalMetadataService.CatalogsEquivalent(catalogNumber, external.CatalogNumber))
+                throw new InvalidDataException(
+                    "The external track listing does not prove the exact SACD catalog number; track-title fallback was rejected.");
+            fallbackTitles = external.TrackTitles;
+            listingSource = external.Sources.FirstOrDefault(source => source.Contains("musicbrainz.org/release/", StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (requiresTrackTitles && fallbackTitles.Count == 0)
+            throw new InvalidDataException(
+                "The SACD disc text has no track titles, and no exact external release supplied a matching track listing.");
+        if (requiresTrackTitles && layout.Areas.Any(area => area.Tracks.Count != fallbackTitles.Count))
+            throw new InvalidDataException(
+                "The external track listing count does not match every SACD audio area; track-title fallback was rejected.");
+
+        var areas = layout.Areas.Select(area => area with
+        {
+            Tracks = area.Tracks.Select((track, index) => track with
+            {
+                Title = string.IsNullOrWhiteSpace(track.Title) ? fallbackTitles[index] : track.Title,
+                Performer = string.IsNullOrWhiteSpace(track.Performer) ? layout.AlbumArtist : track.Performer
+            }).ToArray()
+        }).ToArray();
+        var sources = (layout.IdentitySources ?? [])
+            .Concat(listingSource is null ? [] : [$"external track listing: {listingSource}"])
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        return layout with { Areas = areas, IdentitySources = sources };
+    }
+
+    private static (string Artist, string Album)? TryParseArtistAlbum(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var separator = value.IndexOf(" - ", StringComparison.Ordinal);
+        if (separator <= 0 || separator + 3 >= value.Length) return null;
+        var artist = Nonempty(value[..separator]);
+        var album = Nonempty(value[(separator + 3)..]);
+        return artist is null || album is null ? null : (artist, album);
+    }
+
+    private static bool IdentityEquivalent(string left, string right) =>
+        IdentityKey(left).Equals(IdentityKey(right), StringComparison.Ordinal);
+
+    private static string IdentityKey(string value)
+    {
+        var normalized = value.Normalize(NormalizationForm.FormD);
+        var builder = new StringBuilder(normalized.Length);
+        foreach (var character in normalized)
+            if (CharUnicodeInfo.GetUnicodeCategory(character) != UnicodeCategory.NonSpacingMark && char.IsLetterOrDigit(character))
+                builder.Append(char.ToLowerInvariant(character));
+        return builder.ToString();
     }
 
     private static IReadOnlyDictionary<int, string> ParseIsrcs(string block)
@@ -493,6 +687,9 @@ public sealed partial class LocalDsdProcessor
     private static IReadOnlyList<string> FindDsfFiles(string root) => Directory.EnumerateFiles(root, "*.dsf", SearchOption.AllDirectories)
         .OrderBy(path => NumericSortKey(Path.GetFileName(path)), StringComparer.OrdinalIgnoreCase).ThenBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
 
+    internal static string[] ExtractionArguments(bool isStereo, string iso, string outputRoot) =>
+        [isStereo ? "-2" : "-m", "-s", "-c", "-i", iso, "-y", outputRoot];
+
     private static string NumericSortKey(string value) => NumberAtStart().Replace(value, match => match.Value.PadLeft(8, '0'));
     private static ResolvedYears ResolveYears(string albumName, string? creationDate)
     {
@@ -506,8 +703,8 @@ public sealed partial class LocalDsdProcessor
 
     private static ResolvedDsdMetadata ResolveMetadata(string albumRoot, SacdLayout layout, ResolvedYears years, ExternalAlbumMetadata external)
     {
-        var folderGenre = InferGenreFromFolders(albumRoot);
-        var genre = folderGenre ?? external.Genre ?? "Unknown";
+        var folderGenre = LibraryFolderMetadata.InferGenre(albumRoot);
+        var genre = external.Genre ?? folderGenre ?? "Unknown";
         var catalogNumber = Nonempty(layout.CatalogNumber) ?? Nonempty(external.CatalogNumber);
         var originalDate = Nonempty(external.OriginalDate) ?? years.Original.ToString(CultureInfo.InvariantCulture);
         var releaseDate = Nonempty(external.ReleaseDate) ?? (years.Edition ?? years.Original).ToString(CultureInfo.InvariantCulture);
@@ -520,13 +717,15 @@ public sealed partial class LocalDsdProcessor
 
         var warnings = external.Warnings.ToList();
         if (genre.Equals("Unknown", StringComparison.OrdinalIgnoreCase))
-            warnings.Add("Genre remained unresolved after local-folder, Discogs, MusicBrainz, and Apple Music lookup; an explicit Unknown placeholder was written so extraction could continue.");
+            warnings.Add("Genre remained unresolved after Discogs, MusicBrainz, and Apple Music lookup; an explicit Unknown placeholder was written so extraction could continue.");
         return new(
             years.Original,
             genre,
-            folderGenre is not null ? "inferred_from_library_folder" : external.GenreSourceType ?? "unresolved_placeholder",
-            folderGenre is not null ? "high" : external.GenreConfidence ?? "none",
-            folderGenre is not null ? "Album is stored beneath the matching library genre folder." : external.GenreRationale ?? "No sufficiently exact metadata source supplied a conservative genre.",
+            external.GenreSourceType ?? (folderGenre is not null ? "recognized_library_genre_folder" : "unresolved_placeholder"),
+            external.GenreConfidence ?? (folderGenre is not null ? "high" : "none"),
+            external.GenreRationale ?? (folderGenre is not null
+                ? "A recognized library category supplied genre only; it was not used as artist metadata."
+                : "No sufficiently exact metadata source supplied a conservative genre."),
             originalDate,
             releaseDate,
             Nonempty(external.Label),
@@ -536,21 +735,6 @@ public sealed partial class LocalDsdProcessor
             external.Sources,
             warnings.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
             missing.Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
-    }
-
-    private static string? InferGenreFromFolders(string albumRoot)
-    {
-        var mappings = new (string Needle, string Genre)[]
-        {
-            ("opera", "Opera"), ("classical", "Classical"), ("jazz", "Jazz"), ("rock", "Rock"),
-            ("pop", "Pop"), ("folk", "Folk"), ("electronic", "Electronic"), ("soundtrack", "Soundtrack"),
-            ("spoken word", "Spoken Word"), ("blues", "Blues"), ("country", "Country"), ("reggae", "Reggae"),
-            ("metal", "Metal"), ("soul", "Soul"), ("funk", "Funk")
-        };
-        for (var directory = Directory.GetParent(albumRoot); directory is not null; directory = directory.Parent)
-            foreach (var mapping in mappings)
-                if (directory.Name.Contains(mapping.Needle, StringComparison.OrdinalIgnoreCase)) return mapping.Genre;
-        return null;
     }
 
     private static void SetUserText(TagLib.Id3v2.Tag tag, string name, string? value)
@@ -680,7 +864,18 @@ public sealed partial class LocalDsdProcessor
     {
         public string DisplayName => IsStereo ? "Stereo" : "Multichannel";
     }
-    internal sealed record SacdLayout(string AlbumTitle, string AlbumArtist, string? CatalogNumber, string? CreationDate, IReadOnlyList<SacdArea> Areas);
+    internal sealed record SacdLayout(
+        string AlbumTitle,
+        string AlbumArtist,
+        string? CatalogNumber,
+        string? CreationDate,
+        IReadOnlyList<SacdArea> Areas,
+        IReadOnlyList<string>? IdentitySources = null);
+    internal sealed record SacdLocalIdentity(
+        string? ChecksumArtist,
+        string? ChecksumAlbum,
+        string? FolderArtist,
+        string? FolderAlbum);
     private sealed record ResolvedYears(int Original, int? Edition);
     internal sealed record ResolvedDsdMetadata(
         int OriginalYear,
@@ -702,6 +897,10 @@ public sealed partial class LocalDsdProcessor
     private static partial Regex AreaStart();
     [GeneratedRegex("^\\d+")]
     private static partial Regex NumberAtStart();
+    [GeneratedRegex("^\\s*(?:\\(\\s*)?(?:19|20)\\d{2}(?:\\s*\\))?\\s*[-_.]+\\s*", RegexOptions.IgnoreCase)]
+    private static partial Regex LeadingYearPrefix();
+    [GeneratedRegex("\\s*(?:\\([^()]*(?:(?:19|20)\\d{2}|sacd|dsd|iso|remaster|mfsl|shm|bit|khz)[^()]*\\)|\\[[^\\[\\]]*(?:(?:19|20)\\d{2}|sacd|dsd|iso|remaster|mfsl|shm|bit|khz)[^\\[\\]]*\\])\\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex TrailingEditionBlock();
     [GeneratedRegex("(?:19|20)\\d{2}")]
     private static partial Regex Year();
     [GeneratedRegex("\\s+")]

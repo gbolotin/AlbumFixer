@@ -18,6 +18,7 @@ public partial class App : Application
         services.AddSingleton<LocalFlacProcessor>();
         services.AddSingleton<ExternalMetadataService>();
         services.AddSingleton<LocalMetadataEnrichmentService>();
+        services.AddSingleton<LocalTrackRepairProcessor>();
         services.AddSingleton<LocalDsdProcessor>();
         services.AddSingleton<HostCommitService>();
         services.AddSingleton<StartupPrerequisiteService>();

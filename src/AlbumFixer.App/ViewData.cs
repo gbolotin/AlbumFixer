@@ -16,7 +16,8 @@ public sealed record AlbumJobOutcome(
     int Tracks,
     bool SourcesDeleted,
     bool Incomplete,
-    bool AlreadyCompleted = false);
+    bool AlreadyCompleted = false,
+    CompletionIssueKind IncompleteKind = CompletionIssueKind.None);
 
 public sealed record JobUiUpdate(
     int Index,
@@ -37,11 +38,28 @@ public sealed record BatchAlbumReportEntry(
     bool SourcesDeleted,
     string? Error);
 
+public enum AlbumState
+{
+    Discovering,
+    Inventorying,
+    Inventoried,
+    Ready,
+    Blocked,
+    Queued,
+    Running,
+    Completed,
+    Incomplete,
+    Failed,
+    Canceled
+}
+
 public sealed class CheckRow : ObservableObject
 {
     private string _state;
     private string _detail;
     private CheckState _rawState;
+    private AlbumState? _albumState;
+    private JobPhase? _currentJobPhase;
 
     public CheckRow(
         string name,
@@ -68,6 +86,40 @@ public sealed class CheckRow : ObservableObject
     public string State { get => _state; set => SetProperty(ref _state, value); }
     public string Detail { get => _detail; set => SetProperty(ref _detail, value); }
     public CheckState RawState { get => _rawState; set => SetProperty(ref _rawState, value); }
+    public AlbumState? CurrentAlbumState { get => _albumState; private set => SetProperty(ref _albumState, value); }
+    public JobPhase? CurrentJobPhase { get => _currentJobPhase; private set => SetProperty(ref _currentJobPhase, value); }
+
+    public void PresentAlbumState(
+        AlbumState albumState,
+        string detail,
+        string? label = null,
+        JobPhase? jobPhase = null)
+    {
+        CurrentAlbumState = albumState;
+        CurrentJobPhase = jobPhase;
+        State = label ?? albumState switch
+        {
+            AlbumState.Discovering => "Discovering",
+            AlbumState.Inventorying => "Inventorying",
+            AlbumState.Inventoried => "Inventoried",
+            AlbumState.Ready => "Ready",
+            AlbumState.Blocked => "Blocked",
+            AlbumState.Queued => "Queued",
+            AlbumState.Running => "Running",
+            AlbumState.Completed => "Complete",
+            AlbumState.Incomplete => "Incomplete",
+            AlbumState.Failed => "Failed",
+            AlbumState.Canceled => "Canceled",
+            _ => albumState.ToString()
+        };
+        Detail = detail;
+        RawState = albumState switch
+        {
+            AlbumState.Ready or AlbumState.Completed => CheckState.Passed,
+            AlbumState.Blocked or AlbumState.Failed => CheckState.Failed,
+            _ => CheckState.Warning
+        };
+    }
 }
 
 public sealed class TimelineRow : ObservableObject

@@ -14,6 +14,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly HostStagingService _staging;
     private readonly LocalFlacProcessor _localProcessor;
     private readonly LocalMetadataEnrichmentService _metadataEnrichment;
+    private readonly LocalTrackRepairProcessor _trackRepairProcessor;
     private readonly LocalDsdProcessor _localDsdProcessor;
     private readonly HostCommitService _commit;
     private readonly StartupPrerequisiteService startupPrerequisites;
@@ -28,6 +29,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly Dictionary<int, ProgressSnapshot> _jobProgress = [];
     private readonly Dictionary<int, CheckRow> _albumCheckRows = [];
     private readonly Dictionary<int, long> _activeAlbumActivity = [];
+    private readonly Dictionary<string, int> _retryFailedAlbums = new(StringComparer.OrdinalIgnoreCase);
     private string _albumName = "No source folders selected";
     private string _workflow = "Choose one or more source folders to begin";
     private string _inventory = "—";
@@ -53,6 +55,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private int _previousOutputFileCount;
     private bool _addingSourceFolders;
     private long _albumActivitySequence;
+    private int _activeRunAdmittedCount;
+    private int _activeRunBlockedCount;
+    private bool _activeRunIsBatch;
     private bool startupChecked;
 
     public MainViewModel(
@@ -61,6 +66,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         HostStagingService staging,
         LocalFlacProcessor localProcessor,
         LocalMetadataEnrichmentService metadataEnrichment,
+        LocalTrackRepairProcessor trackRepairProcessor,
         LocalDsdProcessor localDsdProcessor,
         HostCommitService commit,
         StartupPrerequisiteService startupPrerequisites,
@@ -72,6 +78,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _staging = staging;
         _localProcessor = localProcessor;
         _metadataEnrichment = metadataEnrichment;
+        _trackRepairProcessor = trackRepairProcessor;
         _localDsdProcessor = localDsdProcessor;
         _commit = commit;
         this.startupPrerequisites = startupPrerequisites;
@@ -85,6 +92,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         OpenAlbumFolderCommand = new AsyncRelayCommand<string>(OpenAlbumFolderAsync, CanOpenAlbumFolder);
         ScanCommand = new AsyncRelayCommand(ScanAsync, () => CanBrowse && SourceFolders.Count > 0);
         StartCommand = new AsyncRelayCommand(StartAsync, () => CanStart);
+        RetryFailedCommand = new AsyncRelayCommand(RetryFailedAsync, () => CanRetryFailed);
         CancelCommand = new RelayCommand(Cancel, () => IsRunActive);
         RefreshReportCommand = new AsyncRelayCommand(LoadReportAsync, () => !Busy && SourceFolders.Count > 0);
         ClearSourceFoldersCommand = new RelayCommand(ClearSourceFolders, () => CanBrowse && SourceFolders.Count > 0);
@@ -106,6 +114,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public IAsyncRelayCommand<string> OpenAlbumFolderCommand { get; }
     public IAsyncRelayCommand ScanCommand { get; }
     public IAsyncRelayCommand StartCommand { get; }
+    public IAsyncRelayCommand RetryFailedCommand { get; }
     public IRelayCommand CancelCommand { get; }
     public IAsyncRelayCommand RefreshReportCommand { get; }
     public IRelayCommand ClearSourceFoldersCommand { get; }
@@ -129,6 +138,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             if (!SetProperty(ref _busy, value)) return;
             OnPropertyChanged(nameof(CanStart));
+            OnPropertyChanged(nameof(CanRetryFailed));
             OnPropertyChanged(nameof(CanBrowse));
             NotifyCommandStates();
         }
@@ -155,7 +165,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
     public bool CanBrowse => !Busy && !_addingSourceFolders;
-    public bool CanStart => !Busy && _scans.Count > 0 && _preflight?.CanStart == true;
+    public bool CanStart => !Busy && _retryFailedAlbums.Count == 0 && _scans.Count > 0 && _preflight?.CanStart == true;
+    public bool CanRetryFailed => !Busy && _retryFailedAlbums.Count > 0;
+    public bool HasRetryFailures => _retryFailedAlbums.Count > 0;
+    public int RetryFailedAlbumCount => _retryFailedAlbums.Count;
+    public string RetryFailedButtonLabel => $"Retry failed ({RetryFailedAlbumCount})";
     public int AlbumCount => _scans.Count;
     public int RunnableAlbumCount => _albumPreflights.Count(album => album.CanStart);
     public BatchPipelineLimits BatchPipeline => PreflightService.PipelineLimits(_albumPreflights);
@@ -164,12 +178,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public int PreviousOutputFileCount => _previousOutputFileCount;
     public bool IsBatch => AlbumCount > 1;
     public bool IsSingleSacd => AlbumCount == 1 && _scans[0].Mode == WorkflowMode.DsdExtraction;
+    public bool IsSingleTrackRepair => AlbumCount == 1 && _scans[0].Mode == WorkflowMode.ExistingTrackRepair;
     public bool HasSacdWorkflows => _scans.Any(scan => scan.Mode == WorkflowMode.DsdExtraction);
     public bool DeletesSourceAfterSuccess => DeleteOriginals && RunnableAlbumCount > 0 && _albumPreflights.Where(album => album.CanStart).All(album => album.Scan is { ImageCount: 1, TrackCount: 0 });
     public bool DeletesAnySourceAfterSuccess => DeleteOriginals && _albumPreflights.Any(album => album.CanStart && album.Scan is { ImageCount: 1, TrackCount: 0 });
     private string SourceActionDetail => IsBatch
         ? $"Hardware-aware pipeline: {BatchPipelineDescription}. Every album remains isolated, blocked albums are skipped, and SACD areas stay sequential inside each album. " +
           (DeleteOriginals ? "Failed, canceled, or artwork-incomplete albums retain their originals." : "Delete originals is off; every original will be retained.")
+        : IsSingleTrackRepair
+            ? "Existing tags and embedded artwork have highest priority; external exact-album matches and filenames fill only missing fields. Repaired FLACs replace the originals transactionally only after exact compressed-audio payload verification. Delete originals does not apply."
         : !DeleteOriginals
             ? "Delete originals is off. Verified output will be committed and every original source will be retained."
         : IsSingleSacd
@@ -332,18 +349,72 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task ScanAsync()
     {
-        Busy = true; StatusTitle = "Inventorying albums…"; StatusDetail = "Reading media, CUE references, artwork, and provenance without changing files."; Log("SCAN", "Read-only inventory started.");
+        SetRetryFailures([]);
+        Busy = true;
+        Progress = 0;
+        _runStartedAt = DateTimeOffset.UtcNow;
+        RefreshProgressTime();
+        _progressTimer.Start();
+        StatusTitle = "Inventorying albums…";
+        StatusDetail = $"Reading media, CUE references, artwork, and provenance without changing files. Report evidence and album folders use up to {AlbumScanner.InventoryWorkerLimit} concurrent inventory workers.";
+        Log("SCAN", $"Read-only inventory started with up to {AlbumScanner.InventoryWorkerLimit} concurrent inventory workers.");
         try
         {
             var sourceScans = new List<(string Folder, ScanResult RootScan, IReadOnlyList<ScanResult> Albums)>();
-            foreach (var sourceFolder in SourceFolders)
+            var sourceFolders = SourceFolders.ToArray();
+            _albumCheckRows.Clear();
+            _activeAlbumActivity.Clear();
+            PreflightChecks.Clear();
+            var sourceRows = sourceFolders.ToDictionary(
+                path => path,
+                path => CreateAlbumStateRow(Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)),
+                    path, AlbumState.Discovering, "Discovering album roots before detailed inventory."),
+                StringComparer.OrdinalIgnoreCase);
+            Replace(Albums, sourceRows.Values);
+            for (var sourceIndex = 0; sourceIndex < sourceFolders.Length; sourceIndex++)
             {
-                var rootScan = await _scanner.ScanAsync(sourceFolder);
-                var albums = rootScan.Mode == WorkflowMode.MultipleAlbums
-                    ? await _scanner.ScanAlbumsAsync(sourceFolder)
-                    : [rootScan];
+                var sourceFolder = sourceFolders[sourceIndex];
+                var currentSourceIndex = sourceIndex;
+                var sourceRow = sourceRows[sourceFolder];
+                var rootProgress = new Progress<InventoryProgress>(update =>
+                {
+                    ApplyInventoryProgress(currentSourceIndex, sourceFolders.Length, update.Percent / 100d * 0.7, update);
+                    sourceRow.PresentAlbumState(AlbumState.Discovering,
+                        $"{update.Stage}: {InventoryItemName(update.CurrentItem)}",
+                        $"Discovering · {update.Percent}%");
+                });
+                var rootScan = await _scanner.ScanAsync(sourceFolder, rootProgress, lifetimeCancellation.Token);
+                IReadOnlyList<ScanResult> albums;
+                if (rootScan.Mode == WorkflowMode.MultipleAlbums)
+                {
+                    var albumRoots = _scanner.ResolveAlbumRoots(rootScan);
+                    Albums.Remove(sourceRow);
+                    var inventoryRows = albumRoots.ToDictionary(
+                        path => path,
+                        path => CreateAlbumStateRow(Path.GetFileName(path), path, AlbumState.Inventorying,
+                            "Waiting for detailed read-only inventory."),
+                        StringComparer.OrdinalIgnoreCase);
+                    foreach (var row in inventoryRows.Values) Albums.Add(row);
+                    var albumProgress = new Progress<InventoryProgress>(update =>
+                    {
+                        ApplyInventoryProgress(currentSourceIndex, sourceFolders.Length, 0.7 + update.Percent / 100d * 0.3, update);
+                        if (update.Completed > 0 && inventoryRows.TryGetValue(update.CurrentItem, out var row))
+                            row.PresentAlbumState(AlbumState.Inventoried, "Detailed read-only inventory completed.", "Inventoried · 100%");
+                    });
+                    albums = await _scanner.ScanAlbumsAsync(rootScan, albumProgress, lifetimeCancellation.Token);
+                    foreach (var row in inventoryRows.Values)
+                        row.PresentAlbumState(AlbumState.Inventoried, "Detailed read-only inventory completed.", "Inventoried · 100%");
+                }
+                else
+                {
+                    albums = [rootScan];
+                    sourceRow.PresentAlbumState(AlbumState.Inventoried, "Detailed read-only inventory completed.", "Inventoried · 100%");
+                }
+                ApplyInventoryProgress(currentSourceIndex, sourceFolders.Length, 1,
+                    new(1, 1, "Inventory complete", rootScan.AlbumName));
                 sourceScans.Add((sourceFolder, rootScan, albums));
             }
+            Progress = 100;
             var discoveredScans = sourceScans
                 .SelectMany(source => source.Albums)
                 .GroupBy(scan => scan.AlbumRoot, StringComparer.OrdinalIgnoreCase)
@@ -363,7 +434,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 _previousOutputFileCount = 0;
                 _albumCheckRows.Clear();
                 PreflightChecks.Clear();
-                Albums.Clear();
+                Replace(Albums, completedScans.Select(scan => CreateAlbumStateRow(scan.AlbumName, scan.AlbumRoot,
+                    AlbumState.Completed, "Verified outputs and preserved provenance require no pending work.")));
                 AlbumName = completedScans.Length == 1 ? completedScans[0].AlbumName : $"{completedScans.Length} completed albums";
                 Workflow = completedScans.Length == 1 ? completedScans[0].WorkflowLabel : "Already completed — no pending work";
                 Inventory = $"{completedScans.Length} completed album{S(completedScans.Length)}  •  0 pending";
@@ -415,12 +487,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 }
                 else
                 {
+                    row.PresentAlbumState(album.CanStart ? AlbumState.Ready : AlbumState.Blocked, item.Detail);
                     albumRows.Add(row);
                     _albumCheckRows[album.Index] = row;
                 }
             }
+            albumRows.AddRange(completedScans.Select(scan => CreateAlbumStateRow(scan.AlbumName, scan.AlbumRoot,
+                AlbumState.Completed, "Already completed; verified outputs were skipped.")));
             Replace(PreflightChecks, preflightRows);
-            Replace(Albums, albumRows);
+            Replace(Albums, OrderAlbumRows(albumRows));
             NotifyAlbumStateChanged();
             var blocked = AlbumCount - RunnableAlbumCount;
             StatusTitle = _preflight.CanStart ? (IsBatch ? "Batch ready to process" : "Ready to process") : "Run blocked safely";
@@ -436,26 +511,251 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         catch (Exception error) { _scan = null; _scans = []; _albumPreflights = []; _preflight = null; _previousOutputFileCount = 0; _albumCheckRows.Clear(); PreflightChecks.Clear(); Albums.Clear(); StatusTitle = "Could not inventory this folder"; StatusDetail = error.Message; Log("ERROR", error.Message); }
         finally
         {
+            _progressTimer.Stop();
+            RefreshProgressTime();
             Busy = false;
             OnPropertyChanged(nameof(CanStart));
             StartCommand.NotifyCanExecuteChanged();
         }
     }
 
+    private void ApplyInventoryProgress(
+        int sourceIndex,
+        int sourceCount,
+        double sourceFraction,
+        InventoryProgress update)
+    {
+        var percent = (sourceIndex + Math.Clamp(sourceFraction, 0, 1)) * 100d / Math.Max(sourceCount, 1);
+        Progress = Math.Max(Progress, percent);
+        StatusTitle = "Inventorying albums…";
+        StatusDetail = $"{update.Stage}: {InventoryItemName(update.CurrentItem)} · source {sourceIndex + 1}/{sourceCount} · up to {AlbumScanner.InventoryWorkerLimit} concurrent inventory workers.";
+    }
+
+    private static CheckRow CreateAlbumStateRow(
+        string name,
+        string albumRoot,
+        AlbumState albumState,
+        string detail)
+    {
+        var row = new CheckRow(name, string.Empty, detail, CheckState.Warning, albumFolderPath: albumRoot);
+        row.PresentAlbumState(albumState, detail);
+        return row;
+    }
+
+    private static string InventoryItemName(string path) =>
+        Path.IsPathRooted(path)
+            ? Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+            : path;
+
     private async Task StartAsync()
     {
-        var runnable = _albumPreflights.Where(album => album.CanStart).ToArray();
-        if (!CanStart || runnable.Length == 0 || _preflight is null) return;
+        if (!CanStart || _preflight is null) return;
 
         var confirmation = new StartConfirmation(
             DeleteOriginals,
             IsBatch,
             IsSingleSacd,
+            IsSingleTrackRepair,
             DeletesSourceAfterSuccess,
             PreviousOutputFileCount);
         if (!_userInteraction.ConfirmStart(confirmation)) return;
+        await RunAlbumsAsync(_albumPreflights, _preflight, retryOnly: false,
+            preservedRetryFailures: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase));
+    }
+
+    private async Task RetryFailedAsync()
+    {
+        if (!CanRetryFailed) return;
+
+        var failures = _retryFailedAlbums
+            .Select(item => (Root: item.Key, Index: item.Value))
+            .OrderBy(item => item.Index)
+            .ToArray();
+        if (failures.Length == 0) return;
+
+        IReadOnlyList<AlbumPreflightResult> retryAlbums = [];
+        PreflightResult? retryPreflight = null;
+        var preservedFailures = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var canceled = false;
+
+        IsRunActive = true;
+        Busy = true;
+        Progress = 0;
+        _cancel = new();
+        _runStartedAt = DateTimeOffset.UtcNow;
+        RefreshProgressTime();
+        _progressTimer.Start();
+        StatusTitle = failures.Length == 1 ? "Refreshing failed album…" : "Refreshing failed albums…";
+        StatusDetail = $"Freshly rescanning and preflighting only {failures.Length} failed album{S(failures.Length)}. Other album rows will not be queued.";
+        Log("RETRY", StatusDetail);
+        foreach (var failure in failures)
+            if (_albumCheckRows.TryGetValue(failure.Index, out var row))
+                row.PresentAlbumState(AlbumState.Inventorying, "Fresh read-only inventory before retry.", "Inventorying · 0%");
+
+        try
+        {
+            var token = _cancel.Token;
+            var completedScans = 0;
+            IProgress<(int Completed, string Album)> scanProgress = new Progress<(int Completed, string Album)>(update =>
+            {
+                Progress = Math.Max(Progress, update.Completed * 70d / failures.Length);
+                StatusDetail = $"Fresh inventory: {update.Album} · {update.Completed}/{failures.Length} failed album{S(failures.Length)} rescanned concurrently.";
+            });
+            var scanResults = await Task.Run(() => BoundedBatchProcessor.RunAsync<(string Root, int Index), ScanResult>(
+                failures,
+                async (failure, _, ct) =>
+                {
+                    try
+                    {
+                        return await _scanner.ScanAsync(failure.Root, ct).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        scanProgress.Report((Interlocked.Increment(ref completedScans), Path.GetFileName(failure.Root)));
+                    }
+                },
+                Math.Min(AlbumScanner.InventoryWorkerLimit, failures.Length),
+                token));
+
+            var refreshed = new List<(int Index, ScanResult Scan)>();
+            foreach (var result in scanResults)
+            {
+                if (!result.Succeeded)
+                {
+                    preservedFailures[result.Item.Root] = result.Item.Index;
+                    if (_albumCheckRows.TryGetValue(result.Item.Index, out var row))
+                        row.PresentAlbumState(result.Canceled ? AlbumState.Canceled : AlbumState.Failed,
+                            result.Error?.Message ?? "Fresh inventory did not complete.");
+                    if (!result.Canceled) Log("ERROR", $"[{Path.GetFileName(result.Item.Root)}] Retry inventory failed: {result.Error?.Message}");
+                    continue;
+                }
+
+                var scan = result.Value!;
+                if (!scan.RequiresProcessing)
+                {
+                    if (_albumCheckRows.TryGetValue(result.Item.Index, out var row))
+                        row.PresentAlbumState(AlbumState.Completed, "Fresh inventory found verified completed output; no retry was needed.");
+                    Log("COMPLETE", $"[{scan.AlbumName}] Fresh inventory found verified completed output; skipped retry.");
+                    continue;
+                }
+                refreshed.Add((result.Item.Index, scan));
+                if (_albumCheckRows.TryGetValue(result.Item.Index, out var inventoriedRow))
+                    inventoriedRow.PresentAlbumState(AlbumState.Inventoried, "Fresh read-only inventory completed.", "Inventoried · 100%");
+            }
+
+            token.ThrowIfCancellationRequested();
+            StatusTitle = "Rechecking failed-album prerequisites…";
+            var checkedAlbums = 0;
+            IProgress<(int Completed, string Album)> preflightProgress = new Progress<(int Completed, string Album)>(update =>
+            {
+                Progress = Math.Max(Progress, 70 + update.Completed * 30d / Math.Max(refreshed.Count, 1));
+                StatusDetail = $"Fresh preflight: {update.Album} · {update.Completed}/{refreshed.Count} checked.";
+            });
+            var preflightResults = await Task.Run(() => BoundedBatchProcessor.RunAsync<(int Index, ScanResult Scan), PreflightResult>(
+                refreshed,
+                async (item, _, ct) =>
+                {
+                    try
+                    {
+                        return await _preflightService.CheckAsync(item.Scan, ct).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        preflightProgress.Report((Interlocked.Increment(ref checkedAlbums), item.Scan.AlbumName));
+                    }
+                },
+                Math.Min(AlbumScanner.InventoryWorkerLimit, Math.Max(refreshed.Count, 1)),
+                token));
+
+            var prepared = new List<AlbumPreflightResult>();
+            foreach (var result in preflightResults)
+            {
+                if (!result.Succeeded)
+                {
+                    preservedFailures[result.Item.Scan.AlbumRoot] = result.Item.Index;
+                    if (_albumCheckRows.TryGetValue(result.Item.Index, out var row))
+                        row.PresentAlbumState(result.Canceled ? AlbumState.Canceled : AlbumState.Blocked,
+                            result.Error?.Message ?? "Fresh preflight did not complete.");
+                    continue;
+                }
+
+                var album = new AlbumPreflightResult(result.Item.Index, result.Item.Scan, result.Value!);
+                prepared.Add(album);
+                if (_albumCheckRows.TryGetValue(album.Index, out var readyRow))
+                    readyRow.PresentAlbumState(album.CanStart ? AlbumState.Ready : AlbumState.Blocked,
+                        album.Detail, album.CanStart ? "Ready to retry" : "Blocked");
+            }
+            ReorderAlbumRows();
+
+            token.ThrowIfCancellationRequested();
+            retryAlbums = prepared;
+            foreach (var blocked in retryAlbums.Where(album => !album.CanStart))
+                preservedFailures[blocked.Scan.AlbumRoot] = blocked.Index;
+            SetRetryFailures(preservedFailures);
+            Progress = 100;
+
+            if (retryAlbums.Count == 0 || retryAlbums.All(album => !album.CanStart))
+            {
+                StatusTitle = preservedFailures.Count == 0 ? "No failed albums need retry" : "Failed-album retry is blocked safely";
+                StatusDetail = preservedFailures.Count == 0
+                    ? "Fresh inventory found completed output for every previously failed album. Other albums were unchanged."
+                    : $"Fresh inventory or preflight blocked {preservedFailures.Count} album{S(preservedFailures.Count)}. No album transaction started.";
+                Log(preservedFailures.Count == 0 ? "COMPLETE" : "BLOCKED", StatusDetail);
+                return;
+            }
+
+            retryPreflight = PreflightService.CombineBatch(retryAlbums);
+        }
+        catch (OperationCanceledException)
+        {
+            canceled = true;
+            SetRetryFailures(failures.Select(item => new KeyValuePair<string, int>(item.Root, item.Index)));
+            StatusTitle = "Failed-album refresh canceled";
+            StatusDetail = "No retry transaction started. Previously failed albums remain available to retry.";
+            Log("CANCELED", StatusDetail);
+        }
+        catch (Exception error)
+        {
+            SetRetryFailures(failures.Select(item => new KeyValuePair<string, int>(item.Root, item.Index)));
+            StatusTitle = "Could not refresh failed albums";
+            StatusDetail = error.Message;
+            Log("ERROR", error.Message);
+        }
+        finally
+        {
+            _progressTimer.Stop();
+            RefreshProgressTime();
+            _cancel?.Dispose();
+            _cancel = null;
+            IsRunActive = false;
+            Busy = false;
+        }
+
+        if (!canceled && retryPreflight is not null)
+            await RunAlbumsAsync(retryAlbums, retryPreflight, retryOnly: true, preservedRetryFailures: preservedFailures);
+    }
+
+    private async Task RunAlbumsAsync(
+        IReadOnlyList<AlbumPreflightResult> runAlbums,
+        PreflightResult runPreflight,
+        bool retryOnly,
+        IReadOnlyDictionary<string, int> preservedRetryFailures)
+    {
+        var runnable = runAlbums.Where(album => album.CanStart).ToArray();
+        if (runnable.Length == 0) return;
+
+        var runAlbumRoots = runAlbums.Select(album => album.Scan.AlbumRoot).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var preservedOutsideRun = preservedRetryFailures
+            .Where(failure => !runAlbumRoots.Contains(failure.Key))
+            .ToDictionary(failure => failure.Key, failure => failure.Value, StringComparer.OrdinalIgnoreCase);
+        var runTotal = runAlbums.Count + preservedOutsideRun.Count;
+        var runIsBatch = runTotal > 1;
+        var runBlocked = runAlbums.Count - runnable.Length + preservedOutsideRun.Count;
         var deleteOriginals = DeleteOriginals;
         IsRunActive = true; Busy = true; Progress = 1; foreach (var item in Timeline) item.State = "Pending"; _cancel = new();
+        _activeRunAdmittedCount = runnable.Length;
+        _activeRunBlockedCount = runBlocked;
+        _activeRunIsBatch = runIsBatch;
         _jobProgress.Clear();
         _activeAlbumActivity.Clear();
         _albumActivitySequence = 0;
@@ -463,11 +763,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _jobProgress[index] = new(JobPhase.Ready, 0, "pending", "Waiting for a batch worker.", DateTimeOffset.UtcNow);
         foreach (var album in runnable)
             if (_albumCheckRows.TryGetValue(album.Index, out var row))
-            {
-                row.State = "Queued · 0%";
-                row.Detail = "Waiting for an available album worker.";
-                row.RawState = CheckState.Warning;
-            }
+                row.PresentAlbumState(AlbumState.Queued, "Waiting for an available album worker.", "Queued · 0%", JobPhase.Ready);
         _lastPhase = JobPhase.Ready;
         _lastRunDetail = "Starting the safe run.";
         _runStartedAt = DateTimeOffset.UtcNow;
@@ -475,27 +771,46 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _progressTimer.Start();
         ReportStatus = "Pending"; ReportTracks = ReportSections = ReportDisposition = "—"; ReportJson = "";
         ReportHeadline = "Run in progress"; ReportDetail = "A terminal report will be preserved even if the run stops.";
-        JobDirectory = PreflightService.CreateJobDirectory(_preflight.TempRoot);
-        var pipelineLimits = PreflightService.PipelineLimits(_albumPreflights);
+        JobDirectory = PreflightService.CreateJobDirectory(runPreflight.TempRoot);
+        var pipelineLimits = PreflightService.PipelineLimits(runAlbums);
         var workerLimit = pipelineLimits.MaxInFlight;
         using var pipeline = new BatchPipelineScheduler(pipelineLimits);
-        StatusTitle = IsBatch ? "Starting parallel album workers…" : IsSingleSacd ? "Starting verified SACD extraction…" : "Starting the fast workflow…";
-        StatusDetail = IsBatch
-            ? $"{runnable.Length} admitted album{S(runnable.Length)}; {pipelineLimits.Description}. {AlbumCount - runnable.Length} blocked album{S(AlbumCount - runnable.Length)} will be skipped."
-            : SourceActionDetail;
-        Log("START", JobDirectory);
+        var singleMode = runnable.Length == 1 ? runnable[0].Scan.Mode : (WorkflowMode?)null;
+        StatusTitle = retryOnly
+            ? runIsBatch ? "Retrying failed albums…" : "Retrying failed album…"
+            : runIsBatch ? "Starting parallel album workers…"
+            : singleMode == WorkflowMode.DsdExtraction ? "Starting verified SACD extraction…"
+            : singleMode == WorkflowMode.ExistingTrackRepair ? "Starting verified track repair…"
+            : "Starting the fast workflow…";
+        StatusDetail = retryOnly
+            ? $"Fresh inventory and preflight admitted {runnable.Length} previously failed album{S(runnable.Length)}; {runBlocked} remain blocked and will not run."
+            : runIsBatch
+                ? $"{runnable.Length} admitted album{S(runnable.Length)}; {pipelineLimits.Description}. {runBlocked} blocked album{S(runBlocked)} will be skipped."
+                : SourceActionDetail;
+        Log(retryOnly ? "RETRY" : "START", JobDirectory);
         try
         {
             IProgress<JobUiUpdate> uiUpdates = new Progress<JobUiUpdate>(ApplyJobUpdate);
             var runToken = _cancel.Token;
             var results = await Task.Run(() => BoundedBatchProcessor.RunAsync<AlbumPreflightResult, AlbumJobOutcome>(
                 runnable,
-                (album, index, token) => ProcessAlbumAsync(album.Scan, index, album.Index, pipeline, uiUpdates, deleteOriginals, token),
+                (album, index, token) => ProcessAlbumAsync(album.Scan, index, album.Index, runPreflight, runIsBatch, pipeline, uiUpdates, deleteOriginals, token),
                 workerLimit,
                 runToken));
 
-            if (IsBatch)
-                await Task.Run(() => WriteBatchReportAsync(results, runToken.IsCancellationRequested, pipelineLimits, pipeline.Telemetry, deleteOriginals));
+            var retryFailures = retryOnly
+                ? preservedRetryFailures
+                    .Concat(runAlbums.Where(album => !album.CanStart)
+                        .Select(album => new KeyValuePair<string, int>(album.Scan.AlbumRoot, album.Index)))
+                    .Concat(results.Where(result => !result.Succeeded)
+                        .Select(result => new KeyValuePair<string, int>(result.Item.Scan.AlbumRoot, result.Item.Index)))
+                : results.Where(result => !result.Succeeded && !result.Canceled)
+                    .Select(result => new KeyValuePair<string, int>(result.Item.Scan.AlbumRoot, result.Item.Index));
+            SetRetryFailures(retryFailures);
+
+            if (runIsBatch)
+                await Task.Run(() => WriteBatchReportAsync(results, runAlbums, preservedOutsideRun, retryOnly,
+                    runToken.IsCancellationRequested, pipelineLimits, pipeline.Telemetry, deleteOriginals));
             await LoadReportAsync();
             var succeeded = results.Count(result => result.Succeeded);
             var alreadyCompleted = results.Count(result => result.Succeeded && result.Value!.AlreadyCompleted);
@@ -505,11 +820,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var tracks = results.Where(result => result.Succeeded && !result.Value!.AlreadyCompleted).Sum(result => result.Value!.Tracks);
             var deleted = results.Count(result => result.Succeeded && !result.Value!.AlreadyCompleted && result.Value!.SourcesDeleted);
             var incomplete = results.Count(result => result.Succeeded && !result.Value!.AlreadyCompleted && result.Value!.Incomplete);
-            var blocked = AlbumCount - runnable.Length;
+            var incompleteKinds = results
+                .Where(result => result.Succeeded && result.Value!.Incomplete)
+                .Select(result => result.Value!.IncompleteKind)
+                .Where(kind => kind != CompletionIssueKind.None)
+                .Distinct()
+                .ToArray();
+            var incompleteLabel = incompleteKinds.Length == 1
+                ? CompletionIssuePresentation.Label(incompleteKinds[0])
+                : "Required metadata or cover artwork missing";
+            var blocked = runBlocked;
 
             if (runToken.IsCancellationRequested || canceled > 0)
             {
-                var detail = IsBatch
+                var detail = runIsBatch
                     ? $"Batch canceled after {succeeded} of {runnable.Length} admitted album{S(runnable.Length)} completed. Unfinished and blocked albums retained their originals."
                     : "Run canceled. The unfinished album transaction retained its original source.";
                 Apply(new(JobPhase.Canceled, (int)Progress, "canceled", detail, DateTimeOffset.UtcNow));
@@ -517,7 +841,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
             else if (failed > 0)
             {
-                var detail = IsBatch
+                var detail = runIsBatch
                     ? $"{succeeded} of {runnable.Length} admitted album{S(runnable.Length)} completed; {failed} failed and {blocked} preflight-blocked. Other albums were not interrupted."
                     : results[0].Error?.Message ?? "The album transaction failed and retained its original source.";
                 Apply(new(JobPhase.Failed, (int)Progress, "failed", detail, DateTimeOffset.UtcNow));
@@ -526,10 +850,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             else
             {
                 var completionStatus = incomplete > 0 ? "incomplete" : blocked > 0 ? "partial_success" : "passed";
-                Apply(new(JobPhase.CleanupCompleted, 100, completionStatus, $"{delivered} album{S(delivered)} delivered; {alreadyCompleted} already completed album{S(alreadyCompleted)} skipped; {incomplete} incomplete album{S(incomplete)} retained source artwork work; {blocked} blocked album{S(blocked)} skipped.", DateTimeOffset.UtcNow));
+                Apply(new(JobPhase.CleanupCompleted, 100, completionStatus, $"{delivered} album{S(delivered)} delivered; {alreadyCompleted} already completed album{S(alreadyCompleted)} skipped; {incomplete} album{S(incomplete)} need required metadata or artwork follow-up; {blocked} blocked album{S(blocked)} skipped.", DateTimeOffset.UtcNow));
                 StatusTitle = incomplete > 0
-                    ? IsBatch ? "Batch completed with incomplete artwork" : "Tracks delivered · artwork incomplete"
-                    : IsBatch ? "Batch completed with quick checks" : "Album completed with quick checks";
+                    ? runIsBatch ? $"Batch completed · {incompleteLabel.ToLowerInvariant()}" : $"Tracks delivered · {incompleteLabel.ToLowerInvariant()}"
+                    : retryOnly ? blocked > 0 ? "Retry completed; failures remain blocked"
+                        : runIsBatch ? "Failed-album retry completed" : "Failed album completed on retry"
+                    : runIsBatch ? "Batch completed with quick checks" : "Album completed with quick checks";
                 StatusDetail = $"{tracks} track{S(tracks)} passed quick checks across {delivered} delivered album{S(delivered)}; {alreadyCompleted} already completed; {incomplete} incomplete; {blocked} blocked; {deleted} source image{S(deleted)} deleted.";
                 Log(incomplete > 0 ? "INCOMPLETE" : "DONE", $"{delivered} albums delivered, {alreadyCompleted} already completed, {incomplete} incomplete, {blocked} blocked, {tracks} tracks passed.");
             }
@@ -537,16 +863,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         catch (Exception error)
         {
             Apply(new(JobPhase.Failed, (int)Progress, "failed", error.Message, DateTimeOffset.UtcNow)); Log("ERROR", error.Message);
-            if (_scans.Count == 1) await EnsureTerminalReportAsync(false);
+            if (!retryOnly && _scans.Count == 1) await EnsureTerminalReportAsync(false);
             await LoadReportAsync();
         }
         finally
         {
-            if (_preflight is not null && !string.IsNullOrWhiteSpace(JobDirectory))
+            if (!string.IsNullOrWhiteSpace(JobDirectory))
             {
                 try
                 {
-                    var cleaned = await WorkflowCleanupService.CleanupLocalJobAsync(JobDirectory, _preflight.TempRoot);
+                    var cleaned = await WorkflowCleanupService.CleanupLocalJobAsync(JobDirectory, runPreflight.TempRoot);
                     Log("CLEANUP", cleaned ? "Removed the Album Fixer Temp job." : $"Could not remove the Album Fixer Temp job: {JobDirectory}");
                 }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException)
@@ -562,13 +888,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ScanResult scan,
         int index,
         int albumIndex,
+        PreflightResult runPreflight,
+        bool runIsBatch,
         BatchPipelineScheduler pipeline,
         IProgress<JobUiUpdate> uiUpdates,
         bool deleteOriginals,
         CancellationToken token)
     {
-        if (_preflight is null) throw new InvalidOperationException("Batch preflight is unavailable.");
-        var jobDirectory = IsBatch
+        var jobDirectory = runIsBatch
             ? Path.Combine(JobDirectory, $"album-{albumIndex + 1:000}")
             : JobDirectory;
         Directory.CreateDirectory(jobDirectory);
@@ -604,19 +931,25 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 ? "Waiting for an available NAS source-cache lane."
                 : "Waiting for an available local source-verification lane; no Temp source copy is required.", DateTimeOffset.UtcNow));
             var staged = await pipeline.RunCopyInAsync(
-                ct => _staging.StageAsync(scan, _preflight, jobDirectory, progress, ct), token);
+                ct => _staging.StageAsync(scan, runPreflight, jobDirectory, progress, ct), token);
             staged = staged with { PipelineLimits = pipeline.Limits };
-            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "SPLIT", Message: scan.Mode == WorkflowMode.DsdExtraction
-                ? "Starting sequential SACD extraction and independent DSD verification."
-                : "Starting the deterministic local CUE/FFmpeg splitter."));
+            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: scan.Mode == WorkflowMode.ExistingTrackRepair ? "REPAIR" : "SPLIT", Message: scan.Mode switch
+            {
+                WorkflowMode.DsdExtraction => "Starting sequential SACD extraction and independent DSD verification.",
+                WorkflowMode.ExistingTrackRepair => "Starting verified existing-track tag and artwork repair.",
+                _ => "Starting the deterministic local CUE/FFmpeg splitter."
+            }));
             Report(new(JobPhase.SourceCopyVerified, Math.Max(last.Percent, 17), "queued", staged.SourceCacheUsed
                 ? "Temp source cache verified; waiting for a local processing lane."
                 : "Fixed-disk source size recorded; waiting for a local processing lane.", DateTimeOffset.UtcNow));
             var localResult = await pipeline.RunProcessingAsync(scan.Mode == WorkflowMode.DsdExtraction, ct =>
-                scan.Mode == WorkflowMode.DsdExtraction
-                    ? _localDsdProcessor.ProcessAsync(scan, staged, progress, ct)
-                    : _localProcessor.ProcessAsync(scan, staged, progress, ct), token);
-            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "SPLIT", Message: $"Local processing completed: {localResult.Tracks} tracks."));
+                scan.Mode switch
+                {
+                    WorkflowMode.DsdExtraction => _localDsdProcessor.ProcessAsync(scan, staged, progress, ct),
+                    WorkflowMode.ExistingTrackRepair => _trackRepairProcessor.ProcessAsync(scan, staged, progress, ct),
+                    _ => _localProcessor.ProcessAsync(scan, staged, progress, ct)
+                }, token);
+            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: scan.Mode == WorkflowMode.ExistingTrackRepair ? "REPAIR" : "SPLIT", Message: $"Local processing completed: {localResult.Tracks} tracks."));
 
             var gaps = localResult.Metadata;
             if (gaps.RequiresResearch)
@@ -636,15 +969,31 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     else
                         uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: "Missing metadata and artwork were completed by deterministic local code."));
                 }
+                else if (scan.Mode == WorkflowMode.ExistingTrackRepair)
+                {
+                    var unresolvedRequired = gaps.MissingFields
+                        .Where(field => !field.Equals("COVER", StringComparison.OrdinalIgnoreCase))
+                        .ToArray();
+                    if (unresolvedRequired.Length > 0)
+                        throw new InvalidOperationException($"Required existing-track metadata remains unresolved after local and external lookup ({string.Join(", ", unresolvedRequired)}). Originals remain untouched; local results are preserved at {staged.AlbumRoot}.");
+                    uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA",
+                        Message: "Front artwork remains unavailable. Audio-identical repaired tracks will be delivered as incomplete work."));
+                }
                 else
                 {
+                    var unresolvedRequired = MetadataFieldPolicy.RequiredMissing(gaps.MissingFields);
+                    var unresolvedOptional = MetadataFieldPolicy.OptionalMissing(gaps.MissingFields);
                     uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA",
-                        Message: $"Catalog lookup left these SACD fields unresolved: {fields}. Verified tracks will be delivered as incomplete work and the source ISO will be retained."));
+                        Message: unresolvedRequired.Count > 0
+                            ? $"Required SACD metadata remains unresolved: {string.Join(", ", unresolvedRequired)}. The badge will identify required metadata as missing and the source ISO will be retained."
+                            : $"Optional SACD metadata was not resolved: {string.Join(", ", unresolvedOptional)}. This is informational; the album can complete and source-image deletion remains eligible."));
                 }
             }
             else
             {
-                uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: "All required metadata and artwork were found locally; no fallback process was needed."));
+                uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: scan.Mode == WorkflowMode.ExistingTrackRepair
+                    ? "Required tags and artwork were resolved using existing track evidence first, then exact external and filename fallback evidence."
+                    : "All required metadata and artwork were resolved from local evidence or an exact external fallback."));
             }
 
             Report(new(JobPhase.LocalVerificationPassed, Math.Max(last.Percent, 50), "queued", "Local processing is ready for host verification and an available NAS write-back lane.", DateTimeOffset.UtcNow));
@@ -653,20 +1002,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 var commitStaged = staged with { PipelineTelemetry = pipeline.Telemetry };
                 return _commit.CommitAsync(scan, commitStaged, progress, deleteOriginals, ct);
             }, token);
-            return new(jobDirectory, committed.ReportPath, committed.Tracks, committed.SourcesDeleted, committed.Incomplete);
+            return new(jobDirectory, committed.ReportPath, committed.Tracks, committed.SourcesDeleted,
+                committed.Incomplete, IncompleteKind: committed.IncompleteKind);
         }
         catch (OperationCanceledException error)
         {
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: new(JobPhase.Canceled, last.Percent, "canceled", error.Message, DateTimeOffset.UtcNow)));
             if (transactionLock is not null)
-                await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, true, uiUpdates, index, albumIndex);
+                await EnsureAlbumTerminalReportAsync(scan, runPreflight, jobDirectory, last with { Detail = error.Message }, true, uiUpdates, index, albumIndex);
             throw;
         }
         catch (Exception error)
         {
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: new(JobPhase.Failed, last.Percent, "failed", error.Message, DateTimeOffset.UtcNow)));
             if (transactionLock is not null)
-                await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, false, uiUpdates, index, albumIndex);
+                await EnsureAlbumTerminalReportAsync(scan, runPreflight, jobDirectory, last with { Detail = error.Message }, false, uiUpdates, index, albumIndex);
             throw;
         }
         finally
@@ -674,7 +1024,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (transactionLock is not null) await transactionLock.DisposeAsync();
             try
             {
-                var cleaned = await WorkflowCleanupService.CleanupLocalJobAsync(jobDirectory, _preflight.TempRoot);
+                var cleaned = await WorkflowCleanupService.CleanupLocalJobAsync(jobDirectory, runPreflight.TempRoot);
                 uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "CLEANUP", Message: cleaned
                     ? "Removed all transient files for this album transaction."
                     : $"Could not remove the transient album job: {jobDirectory}"));
@@ -706,26 +1056,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (update.Progress is null) return;
         _jobProgress[update.Index] = update.Progress;
         if (_albumCheckRows.TryGetValue(update.AlbumIndex, out var albumRow))
-        {
-            albumRow.State = AlbumProgressLabel(update.Progress);
-            albumRow.Detail = update.Progress.Detail;
-            albumRow.RawState = update.Progress.Phase switch
-            {
-                JobPhase.Failed => CheckState.Failed,
-                JobPhase.Canceled => CheckState.Warning,
-                JobPhase.CleanupCompleted when update.Progress.Status.Equals("incomplete", StringComparison.OrdinalIgnoreCase) => CheckState.Warning,
-                JobPhase.CleanupCompleted => CheckState.Passed,
-                _ => CheckState.Warning
-            };
-        }
+            albumRow.PresentAlbumState(AlbumStateFor(update.Progress), update.Progress.Detail,
+                AlbumProgressLabel(update.Progress, _scans[update.AlbumIndex].Mode), update.Progress.Phase);
         UpdateAlbumActivityOrder(update.AlbumIndex, update.Progress);
-        if (!IsBatch)
+        if (!_activeRunIsBatch)
         {
             Apply(update.Progress);
             return;
         }
 
-        var snapshots = Enumerable.Range(0, RunnableAlbumCount).Select(index => _jobProgress[index]).ToArray();
+        var snapshots = Enumerable.Range(0, _activeRunAdmittedCount).Select(index => _jobProgress[index]).ToArray();
         Progress = snapshots.Average(snapshot => snapshot.Percent);
         var completed = snapshots.Count(snapshot => snapshot.Phase == JobPhase.CleanupCompleted);
         var active = snapshots.Count(snapshot => snapshot.Phase is >= JobPhase.Inventoried and < JobPhase.CleanupCompleted);
@@ -736,7 +1076,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var minimumPhase = pipelinePhases.Length > 0 ? pipelinePhases.Min() : JobPhase.Ready;
         _lastPhase = minimumPhase;
         _lastRunDetail = $"{update.AlbumName}: {update.Progress.Detail}";
-        StatusTitle = $"{completed}/{RunnableAlbumCount} admitted albums complete · {active} running · {AlbumCount - RunnableAlbumCount} blocked";
+        StatusTitle = $"{completed}/{_activeRunAdmittedCount} admitted albums complete · {active} running · {_activeRunBlockedCount} blocked";
         StatusDetail = _lastRunDetail;
         var number = (int)minimumPhase;
         foreach (var item in Timeline)
@@ -749,6 +1089,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task EnsureAlbumTerminalReportAsync(
         ScanResult scan,
+        PreflightResult runPreflight,
         string jobDirectory,
         ProgressSnapshot last,
         bool canceled,
@@ -756,10 +1097,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         int index,
         int albumIndex)
     {
-        if (_preflight is null) return;
         try
         {
-            await HostReportWriter.EnsureTerminalReportAsync(scan, _preflight, jobDirectory,
+            await HostReportWriter.EnsureTerminalReportAsync(scan, runPreflight, jobDirectory,
                 canceled ? "canceled" : "failed", last.Phase, last.Percent, last.Detail);
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "REPORT", Message: "A terminal report was preserved; this album's originals remain in place."));
         }
@@ -769,17 +1109,26 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private static string AlbumProgressLabel(ProgressSnapshot snapshot)
+    private static string AlbumProgressLabel(ProgressSnapshot snapshot, WorkflowMode mode)
     {
-        if (snapshot.Status.Equals("incomplete", StringComparison.OrdinalIgnoreCase)) return $"Incomplete · {snapshot.Percent}%";
+        if (CompletionIssuePresentation.IsIncompleteStatus(snapshot.Status))
+        {
+            var issue = CompletionIssuePresentation.FromStatus(snapshot.Status);
+            var label = issue == CompletionIssueKind.None
+                ? "Required metadata/artwork missing"
+                : CompletionIssuePresentation.Label(issue);
+            return $"{label} · {snapshot.Percent}%";
+        }
         return snapshot.Phase switch
         {
             JobPhase.Ready => $"Queued · {snapshot.Percent}%",
             JobPhase.Inventoried => $"Inventoried · {snapshot.Percent}%",
             JobPhase.CopyingIn => $"Preparing source · {snapshot.Percent}%",
             JobPhase.SourceCopyVerified => $"Source verified · {snapshot.Percent}%",
-            JobPhase.Processing => $"Splitting · {snapshot.Percent}%",
-            JobPhase.Tagging => $"Tagging · {snapshot.Percent}%",
+            JobPhase.Processing => mode == WorkflowMode.ExistingTrackRepair
+                ? $"Fixing tags · {snapshot.Percent}%"
+                : $"Splitting · {snapshot.Percent}%",
+            JobPhase.Tagging => $"Fixing tags · {snapshot.Percent}%",
             JobPhase.LocalVerificationPassed => $"Locally verified · {snapshot.Percent}%",
             JobPhase.CopyingBack => $"Copying back · {snapshot.Percent}%",
             JobPhase.DestinationSizesVerified => $"Sizes verified · {snapshot.Percent}%",
@@ -793,8 +1142,24 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         };
     }
 
+    private static AlbumState AlbumStateFor(ProgressSnapshot snapshot)
+    {
+        if (CompletionIssuePresentation.IsIncompleteStatus(snapshot.Status)) return AlbumState.Incomplete;
+        return snapshot.Phase switch
+        {
+            JobPhase.Ready => AlbumState.Queued,
+            JobPhase.CleanupCompleted => AlbumState.Completed,
+            JobPhase.Failed => AlbumState.Failed,
+            JobPhase.Canceled => AlbumState.Canceled,
+            _ => AlbumState.Running
+        };
+    }
+
     private async Task WriteBatchReportAsync(
         IReadOnlyList<BatchItemResult<AlbumPreflightResult, AlbumJobOutcome>> results,
+        IReadOnlyList<AlbumPreflightResult> runAlbums,
+        IReadOnlyDictionary<string, int> preservedFailures,
+        bool retryOnly,
         bool cancellationRequested,
         BatchPipelineLimits pipelineLimits,
         BatchPipelineTelemetry pipelineTelemetry,
@@ -805,7 +1170,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var delivered = succeeded - alreadyCompleted;
         var failed = results.Count(result => !result.Succeeded && !result.Canceled);
         var canceled = results.Count(result => result.Canceled);
-        var blocked = _albumPreflights.Count(album => !album.CanStart);
+        var blocked = runAlbums.Count(album => !album.CanStart) + preservedFailures.Count;
         var incomplete = results.Count(result => result.Succeeded && !result.Value!.AlreadyCompleted && result.Value!.Incomplete);
         var status = cancellationRequested || canceled > 0
             ? "canceled"
@@ -813,8 +1178,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             : incomplete > 0 ? "incomplete"
             : blocked > 0 ? "partial_success" : "passed";
         var deleted = results.Count(result => result.Succeeded && !result.Value!.AlreadyCompleted && result.Value!.SourcesDeleted);
-        var sourceImages = _scans.Sum(scan => scan.ImageCount);
-        var albumEntries = _albumPreflights.Select(album =>
+        var sourceImages = runAlbums.Sum(album => album.Scan.ImageCount) + preservedFailures.Values
+            .Where(index => index >= 0 && index < _scans.Count)
+            .Sum(index => _scans[index].ImageCount);
+        var albumEntries = runAlbums.Select(album =>
         {
             var result = results.FirstOrDefault(candidate => candidate.Item.Index == album.Index);
             if (!album.CanStart)
@@ -828,11 +1195,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 result.Value?.JobDirectory ?? Path.Combine(JobDirectory, $"album-{album.Index + 1:000}"),
                 result.Value?.ReportPath, result.Value?.Tracks ?? 0, result.Value?.SourcesDeleted ?? false,
                 result.Error?.Message);
-        }).OrderBy(album => album.Index).ToArray();
+        }).Concat(preservedFailures.Select(failure =>
+        {
+            var scan = failure.Value >= 0 && failure.Value < _scans.Count ? _scans[failure.Value] : null;
+            var detail = _albumCheckRows.TryGetValue(failure.Value, out var row)
+                ? row.Detail
+                : "Fresh inventory or preflight did not complete; this album was not admitted to retry.";
+            return new BatchAlbumReportEntry(failure.Value + 1, scan?.AlbumName ?? Path.GetFileName(failure.Key),
+                failure.Key, "blocked", null, null, 0, false, detail);
+        })).OrderBy(album => album.Index).ToArray();
         var report = new
         {
             schema_version = "1.0",
-            workflow_mode = "parallel_album_batch",
+            workflow_mode = retryOnly ? "retry_failed_album_batch" : "parallel_album_batch",
+            retry_failed_only = retryOnly,
             source_folders = SourceFolders.ToArray(),
             created_at_utc = DateTimeOffset.UtcNow,
             status,
@@ -853,7 +1229,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 sacd_processing_workers = pipelineTelemetry.MaximumDsdProcessing,
                 copy_back_workers = pipelineTelemetry.MaximumCopyBack
             },
-            albums_total = AlbumCount,
+            albums_total = runAlbums.Count + preservedFailures.Count,
             albums_admitted = results.Count,
             albums_blocked = blocked,
             albums_succeeded = delivered,
@@ -968,11 +1344,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (active) _activeAlbumActivity[albumIndex] = ++_albumActivitySequence;
         else _activeAlbumActivity.Remove(albumIndex);
 
-        var ordered = Albums
-            .OrderBy(row => row.AlbumIndex is int index && _activeAlbumActivity.ContainsKey(index) ? 0 : 1)
+        ReorderAlbumRows();
+    }
+
+    private IEnumerable<CheckRow> OrderAlbumRows(IEnumerable<CheckRow> rows) =>
+        rows
+            .OrderBy(row => row.CurrentAlbumState == AlbumState.Blocked
+                ? 0
+                : row.AlbumIndex is int index && _activeAlbumActivity.ContainsKey(index) ? 1 : 2)
             .ThenByDescending(row => row.AlbumIndex is int index && _activeAlbumActivity.TryGetValue(index, out var activity) ? activity : long.MinValue)
-            .ThenBy(row => row.AlbumIndex ?? int.MaxValue)
-            .ToArray();
+            .ThenBy(row => row.AlbumIndex ?? int.MaxValue);
+
+    private void ReorderAlbumRows()
+    {
+        var ordered = OrderAlbumRows(Albums).ToArray();
         for (var targetIndex = 0; targetIndex < ordered.Length; targetIndex++)
         {
             var currentIndex = Albums.IndexOf(ordered[targetIndex]);
@@ -1047,6 +1432,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         if (Busy) return;
 
+        SetRetryFailures([]);
         _scan = null;
         _scans = [];
         _albumPreflights = [];
@@ -1070,6 +1456,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         };
         Workflow = "Scan to classify albums recursively";
         Inventory = SourceSize = "—";
+        Progress = 0;
+        ProgressTime = "Elapsed —";
+        _runStartedAt = default;
         StatusTitle = "Ready to scan";
         StatusDetail = "Inventory is read-only.";
 
@@ -1082,6 +1471,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private void NotifyAlbumStateChanged()
     {
         OnPropertyChanged(nameof(CanStart));
+        OnPropertyChanged(nameof(CanRetryFailed));
+        OnPropertyChanged(nameof(HasRetryFailures));
+        OnPropertyChanged(nameof(RetryFailedAlbumCount));
+        OnPropertyChanged(nameof(RetryFailedButtonLabel));
         OnPropertyChanged(nameof(AlbumCount));
         OnPropertyChanged(nameof(RunnableAlbumCount));
         OnPropertyChanged(nameof(BatchWorkerLimit));
@@ -1089,6 +1482,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(PreviousOutputFileCount));
         OnPropertyChanged(nameof(IsBatch));
         OnPropertyChanged(nameof(IsSingleSacd));
+        OnPropertyChanged(nameof(IsSingleTrackRepair));
         OnPropertyChanged(nameof(HasSacdWorkflows));
         OnPropertyChanged(nameof(DeletesSourceAfterSuccess));
         OnPropertyChanged(nameof(DeletesAnySourceAfterSuccess));
@@ -1100,9 +1494,29 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         RemoveSourceFolderCommand.NotifyCanExecuteChanged();
         ScanCommand.NotifyCanExecuteChanged();
         StartCommand.NotifyCanExecuteChanged();
+        RetryFailedCommand.NotifyCanExecuteChanged();
         CancelCommand.NotifyCanExecuteChanged();
         RefreshReportCommand.NotifyCanExecuteChanged();
         ClearSourceFoldersCommand.NotifyCanExecuteChanged();
+    }
+
+    private void SetRetryFailures(IEnumerable<KeyValuePair<string, int>> failures)
+    {
+        var replacement = failures
+            .Where(item => !string.IsNullOrWhiteSpace(item.Key))
+            .GroupBy(item => Path.GetFullPath(item.Key), StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+        _retryFailedAlbums.Clear();
+        foreach (var failure in replacement)
+            _retryFailedAlbums[failure.Key] = failure.Value;
+        OnPropertyChanged(nameof(CanStart));
+        OnPropertyChanged(nameof(CanRetryFailed));
+        OnPropertyChanged(nameof(HasRetryFailures));
+        OnPropertyChanged(nameof(RetryFailedAlbumCount));
+        OnPropertyChanged(nameof(RetryFailedButtonLabel));
+        StartCommand.NotifyCanExecuteChanged();
+        RetryFailedCommand.NotifyCanExecuteChanged();
     }
     private static string? NormalizeSourceFolder(string? folder)
     {

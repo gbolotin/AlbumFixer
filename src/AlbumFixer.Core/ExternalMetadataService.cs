@@ -12,7 +12,9 @@ public sealed record AlbumMetadataQuery(
     int TrackCount,
     int? OriginalYear = null,
     int? EditionYear = null,
-    string? CatalogNumber = null);
+    string? CatalogNumber = null,
+    bool RequireSacd = true,
+    IReadOnlyList<string>? TrackTitleHints = null);
 
 public sealed record ExternalAlbumMetadata(
     string? Genre,
@@ -33,6 +35,15 @@ public sealed record ExternalAlbumMetadata(
 {
     public bool HasMatch => Sources.Count > 0;
 }
+
+public sealed record ExternalAlbumIdentity(
+    string Album,
+    string Artist,
+    string CatalogNumber,
+    string? ReleaseDate,
+    string Source,
+    IReadOnlyList<string> TrackTitles,
+    string? MusicBrainzReleaseId = null);
 
 public sealed class ExternalMetadataService
 {
@@ -103,6 +114,81 @@ public sealed class ExternalMetadataService
         AlbumMetadataQuery query,
         CancellationToken token) => ResolveAsync(query, includeTrackTitles: false, token);
 
+    public async Task<ExternalAlbumIdentity?> ResolveIdentityByCatalogAsync(
+        string catalogNumber,
+        int trackCount,
+        int? editionYear = null,
+        bool requireSacd = true,
+        CancellationToken token = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(catalogNumber);
+        if (trackCount <= 0) throw new ArgumentOutOfRangeException(nameof(trackCount));
+
+        try
+        {
+            var lucene = $"catno:\"{EscapeLucene(catalogNumber)}\"";
+            var uri = new Uri($"https://musicbrainz.org/ws/2/release/?query={Uri.EscapeDataString(lucene)}&fmt=json&limit=100");
+            using var search = await GetMusicBrainzJsonAsync(uri, token);
+            if (!search.RootElement.TryGetProperty("releases", out var releases) || releases.ValueKind != JsonValueKind.Array)
+                return null;
+
+            var candidates = releases.EnumerateArray()
+                .Select(release =>
+                {
+                    var label = LabelInfo(release);
+                    var formats = MediaFormats(release);
+                    var releaseYear = Year(Text(release, "date"));
+                    var score = (Integer(release, "score") ?? 0) +
+                                (releaseYear == editionYear ? 40 : 0) +
+                                (HasSacdMedium(release) ? 30 : 0);
+                    return new
+                    {
+                        Release = release.Clone(),
+                        Album = Text(release, "title"),
+                        Artist = ArtistCredit(release),
+                        Catalog = label.CatalogNumber,
+                        Formats = formats,
+                        HasMatchingMedium = HasMatchingMedium(release, trackCount, requireSacd),
+                        Score = score
+                    };
+                })
+                .Where(candidate =>
+                    !string.IsNullOrWhiteSpace(candidate.Album) &&
+                    !string.IsNullOrWhiteSpace(candidate.Artist) &&
+                    CatalogsEquivalent(candidate.Catalog, catalogNumber) &&
+                    candidate.HasMatchingMedium &&
+                    (!requireSacd || candidate.Formats.Any(IsSacdMediumFormat)))
+                .ToArray();
+            if (candidates.Length == 0) return null;
+
+            var identities = candidates
+                .GroupBy(candidate => $"{IdentityKey(candidate.Artist!)}\0{IdentityKey(candidate.Album!)}", StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (identities.Length != 1) return null;
+
+            var selected = identities[0].OrderByDescending(candidate => candidate.Score).First();
+            var releaseId = Text(selected.Release, "id");
+            if (releaseId is null) return null;
+            var trackTitles = await ResolveMusicBrainzTrackTitlesAsync(releaseId, trackCount, requireSacd, token);
+            return new(
+                selected.Album!,
+                selected.Artist!,
+                selected.Catalog!,
+                Text(selected.Release, "date"),
+                $"https://musicbrainz.org/release/{releaseId}",
+                trackTitles,
+                releaseId);
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            return null;
+        }
+        catch (Exception error) when (error is HttpRequestException or JsonException or InvalidDataException)
+        {
+            return null;
+        }
+    }
+
     public async Task<DownloadedArtwork> DownloadFrontCoverAsync(
         string releaseId,
         CancellationToken token = default)
@@ -156,6 +242,17 @@ public sealed class ExternalMetadataService
             .Select(pair => pair.Key).FirstOrDefault();
     }
 
+    internal static bool CatalogsEquivalent(string? left, string? right)
+    {
+        if (Nonempty(left) is null || Nonempty(right) is null) return false;
+        var normalizedLeft = Normalize(left!);
+        var normalizedRight = Normalize(right!);
+        if (normalizedLeft.Equals(normalizedRight, StringComparison.Ordinal)) return true;
+        return Math.Min(normalizedLeft.Length, normalizedRight.Length) >= 6 &&
+               (normalizedLeft.Contains(normalizedRight, StringComparison.Ordinal) ||
+                normalizedRight.Contains(normalizedLeft, StringComparison.Ordinal));
+    }
+
     private async Task<ProviderMetadata?> ResolveMusicBrainzAsync(
         AlbumMetadataQuery query,
         bool includeTrackTitles,
@@ -172,11 +269,9 @@ public sealed class ExternalMetadataService
         {
             var title = Text(release, "title");
             var artist = ArtistCredit(release);
-            if (!Equivalent(title, query.Album) || !Equivalent(artist, query.Artist)) continue;
-            var formats = MediaFormats(release);
-            var formatMatch = formats.Any(value => value.Contains("sacd", StringComparison.OrdinalIgnoreCase));
-            var trackCount = Integer(release, "track-count") ?? MediaTrackCount(release);
-            var trackMatch = query.TrackCount <= 0 || trackCount == query.TrackCount;
+            if (!Equivalent(title, query.Album) || !EquivalentArtist(artist, query.Artist)) continue;
+            var formatMatch = !query.RequireSacd || HasSacdMedium(release);
+            var trackMatch = HasMatchingMedium(release, query.TrackCount, query.RequireSacd);
             var releaseYear = Year(Text(release, "date"));
             var catalog = LabelInfo(release).CatalogNumber;
             var score = (Integer(release, "score") ?? 0) + (formatMatch ? 40 : 0) + (trackMatch ? 25 : 0);
@@ -190,12 +285,9 @@ public sealed class ExternalMetadataService
         if (selected is null) return null;
 
         var candidate = selected.Value;
-        var candidateFormats = MediaFormats(candidate);
-        var candidateTrackCount = Integer(candidate, "track-count") ?? MediaTrackCount(candidate);
         var candidateYear = Year(Text(candidate, "date"));
         var candidateLabel = LabelInfo(candidate);
-        var exactEdition = candidateFormats.Any(value => value.Contains("sacd", StringComparison.OrdinalIgnoreCase)) &&
-                           (query.TrackCount <= 0 || candidateTrackCount == query.TrackCount) &&
+        var exactEdition = HasMatchingMedium(candidate, query.TrackCount, query.RequireSacd) &&
                            (query.EditionYear is null || candidateYear == query.EditionYear || EquivalentCatalog(candidateLabel.CatalogNumber, query.CatalogNumber));
 
         var releaseId = Text(candidate, "id");
@@ -231,8 +323,11 @@ public sealed class ExternalMetadataService
         if (exactEdition && releaseId is not null) sources.Add($"https://musicbrainz.org/release/{releaseId}");
         if (groupId is not null) sources.Add($"https://musicbrainz.org/release-group/{groupId}");
         var trackTitles = includeTrackTitles && releaseId is not null
-            ? await ResolveMusicBrainzTrackTitlesAsync(releaseId, query.TrackCount, token)
+            ? await ResolveMusicBrainzTrackTitlesAsync(releaseId, query.TrackCount, query.RequireSacd, token)
             : [];
+        if (trackTitles.Count > 0 && query.TrackTitleHints is { Count: > 0 } hints &&
+            (hints.Count != trackTitles.Count || hints.Zip(trackTitles).Count(pair => Equivalent(pair.First, pair.Second)) < Math.Max(1, trackTitles.Count * 3 / 4)))
+            trackTitles = [];
         return new(
             genre,
             exactEdition ? Text(candidate, "date") : null,
@@ -245,7 +340,7 @@ public sealed class ExternalMetadataService
             genre is null ? null : exactEdition ? "high" : "medium",
             genre is null ? null : genreRationale,
             sources,
-            releaseId,
+            exactEdition ? releaseId : null,
             groupId,
             trackTitles);
     }
@@ -253,19 +348,29 @@ public sealed class ExternalMetadataService
     private async Task<IReadOnlyList<string>> ResolveMusicBrainzTrackTitlesAsync(
         string releaseId,
         int expectedTrackCount,
+        bool requireSacd,
         CancellationToken token)
     {
         var uri = new Uri($"https://musicbrainz.org/ws/2/release/{Uri.EscapeDataString(releaseId)}?inc=recordings&fmt=json");
         using var details = await GetMusicBrainzJsonAsync(uri, token);
         if (!details.RootElement.TryGetProperty("media", out var media) || media.ValueKind != JsonValueKind.Array) return [];
-        var titles = media.EnumerateArray()
+        var matchingMedia = OrderedByPosition(media)
+            .Where(value => MediumTrackCount(value) == expectedTrackCount)
+            .Where(value => !requireSacd || IsSacdMediumFormat(Text(value, "format")))
+            .ToArray();
+        if (matchingMedia.Length == 0) return [];
+        var titleSets = matchingMedia
             .Where(value => value.TryGetProperty("tracks", out var tracks) && tracks.ValueKind == JsonValueKind.Array)
-            .SelectMany(value => value.GetProperty("tracks").EnumerateArray())
+            .Select(value => OrderedByPosition(value.GetProperty("tracks"))
             .Select(track => Text(track, "title") ?? (track.TryGetProperty("recording", out var recording) ? Text(recording, "title") : null))
             .Where(title => !string.IsNullOrWhiteSpace(title))
             .Select(title => title!)
+            .ToArray())
+            .Where(titles => titles.Length == expectedTrackCount)
+            .GroupBy(titles => string.Join('\0', titles.Select(IdentityKey)), StringComparer.Ordinal)
+            .Select(group => group.First())
             .ToArray();
-        return titles.Length == expectedTrackCount ? titles : [];
+        return titleSets.Length == 1 ? titleSets[0] : [];
     }
 
     private async Task<ProviderMetadata?> ResolveDiscogsAsync(AlbumMetadataQuery query, CancellationToken token)
@@ -273,8 +378,9 @@ public sealed class ExternalMetadataService
         var parameters = new List<KeyValuePair<string, string>>
         {
             new("type", "release"), new("artist", query.Artist), new("release_title", query.Album),
-            new("format", "SACD"), new("per_page", "50")
+            new("per_page", "50")
         };
+        if (query.RequireSacd) parameters.Add(new("format", "SACD"));
         if (query.EditionYear is not null) parameters.Add(new("year", query.EditionYear.Value.ToString(CultureInfo.InvariantCulture)));
         var searchUri = new Uri("https://api.discogs.com/database/search?" + Query(parameters));
         using var search = await GetJsonAsync(searchUri, token, discogs: true);
@@ -288,9 +394,9 @@ public sealed class ExternalMetadataService
             var artist = separator >= 0 ? combined[..separator] : string.Empty;
             var album = separator >= 0 ? combined[(separator + 3)..] : combined;
             artist = Regex.Replace(artist, "\\s*\\(\\d+\\)$", string.Empty);
-            if (!Equivalent(artist, query.Artist) || !Equivalent(album, query.Album)) continue;
+            if (!EquivalentArtist(artist, query.Artist) || !Equivalent(album, query.Album)) continue;
             var formats = StringArray(result, "format");
-            if (!formats.Any(value => value.Contains("sacd", StringComparison.OrdinalIgnoreCase))) continue;
+            if (query.RequireSacd && !formats.Any(value => value.Contains("sacd", StringComparison.OrdinalIgnoreCase))) continue;
             var year = Integer(result, "year");
             if (query.EditionYear is not null && year != query.EditionYear) continue;
             selected = result.Clone();
@@ -345,7 +451,7 @@ public sealed class ExternalMetadataService
             var artists = root.TryGetProperty("artists", out var artistNodes) && artistNodes.ValueKind == JsonValueKind.Array
                 ? string.Join(" & ", artistNodes.EnumerateArray().Select(value => Regex.Replace(Text(value, "name") ?? string.Empty, "\\s*\\(\\d+\\)$", string.Empty)))
                 : null;
-            if (!Equivalent(artists, query.Artist)) continue;
+            if (!EquivalentArtist(artists, query.Artist)) continue;
             var genre = ChooseBroadGenre(StringArray(root, "genres").Select(value => (value, 20))
                 .Concat(StringArray(root, "styles").Select(value => (value, 5))));
             return (genre, resource);
@@ -360,7 +466,7 @@ public sealed class ExternalMetadataService
         if (!document.RootElement.TryGetProperty("results", out var results) || results.ValueKind != JsonValueKind.Array) return null;
         foreach (var result in results.EnumerateArray())
         {
-            if (!Equivalent(Text(result, "artistName"), query.Artist) || !Equivalent(Text(result, "collectionName"), query.Album)) continue;
+            if (!EquivalentArtist(Text(result, "artistName"), query.Artist) || !Equivalent(Text(result, "collectionName"), query.Album)) continue;
             var trackCount = Integer(result, "trackCount");
             if (query.TrackCount > 0 && trackCount != query.TrackCount) continue;
             var releaseDate = Text(result, "releaseDate");
@@ -476,12 +582,33 @@ public sealed class ExternalMetadataService
         return media.EnumerateArray().Select(value => Text(value, "format")).Where(value => value is not null).Select(value => value!).ToArray();
     }
 
-    private static int? MediaTrackCount(JsonElement release)
+    private static bool HasSacdMedium(JsonElement release) =>
+        release.TryGetProperty("media", out var media) && media.ValueKind == JsonValueKind.Array &&
+        media.EnumerateArray().Any(value => IsSacdMediumFormat(Text(value, "format")));
+
+    private static bool HasMatchingMedium(JsonElement release, int expectedTrackCount, bool requireSacd)
     {
-        if (!release.TryGetProperty("media", out var media) || media.ValueKind != JsonValueKind.Array) return null;
-        var counts = media.EnumerateArray().Select(value => Integer(value, "track-count")).Where(value => value is not null).Select(value => value!.Value).ToArray();
-        return counts.Length == 0 ? null : counts.Sum();
+        if (!release.TryGetProperty("media", out var media) || media.ValueKind != JsonValueKind.Array) return false;
+        return media.EnumerateArray().Any(value =>
+            (!requireSacd || IsSacdMediumFormat(Text(value, "format"))) &&
+            (expectedTrackCount <= 0 || MediumTrackCount(value) == expectedTrackCount));
     }
+
+    private static int? MediumTrackCount(JsonElement medium) =>
+        Integer(medium, "track-count") ??
+        (medium.TryGetProperty("tracks", out var tracks) && tracks.ValueKind == JsonValueKind.Array
+            ? tracks.GetArrayLength()
+            : null);
+
+    private static bool IsSacdMediumFormat(string? format) =>
+        format?.Contains("sacd", StringComparison.OrdinalIgnoreCase) == true &&
+        !Regex.IsMatch(format, "(?<![A-Za-z])CD\\s+layer", RegexOptions.IgnoreCase);
+
+    private static IEnumerable<JsonElement> OrderedByPosition(JsonElement values) => values.EnumerateArray()
+        .Select((value, index) => new { Value = value, Index = index, Position = Integer(value, "position") ?? index + 1 })
+        .OrderBy(value => value.Position)
+        .ThenBy(value => value.Index)
+        .Select(value => value.Value);
 
     private static IEnumerable<(string Name, int Weight)> WeightedNames(JsonElement root, string property, int defaultWeight)
     {
@@ -517,7 +644,10 @@ public sealed class ExternalMetadataService
     }
 
     private static bool Equivalent(string? left, string? right) => left is not null && right is not null && Normalize(left).Equals(Normalize(right), StringComparison.Ordinal);
+    private static bool EquivalentArtist(string? left, string? right) => left is not null && right is not null &&
+        Normalize(WithoutLeadingThe(left)).Equals(Normalize(WithoutLeadingThe(right)), StringComparison.Ordinal);
     private static bool EquivalentCatalog(string? left, string? right) => Nonempty(left) is not null && Nonempty(right) is not null && Normalize(left!).Equals(Normalize(right!), StringComparison.Ordinal);
+    private static string IdentityKey(string value) => Normalize(WithoutLeadingThe(value));
     private static string Normalize(string value)
     {
         var normalized = value.Normalize(NormalizationForm.FormD);
@@ -526,6 +656,7 @@ public sealed class ExternalMetadataService
             if (CharUnicodeInfo.GetUnicodeCategory(character) != UnicodeCategory.NonSpacingMark && char.IsLetterOrDigit(character)) builder.Append(char.ToLowerInvariant(character));
         return builder.ToString();
     }
+    private static string WithoutLeadingThe(string value) => Regex.Replace(value, "^\\s*the\\s+", string.Empty, RegexOptions.IgnoreCase);
 
     private static int? Year(string? value) => value is not null && Regex.Match(value, "(?:19|20)\\d{2}") is { Success: true } match && int.TryParse(match.Value, CultureInfo.InvariantCulture, out var year) ? year : null;
     private static string EscapeLucene(string value) => value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);

@@ -51,7 +51,7 @@ public sealed class LocalMetadataEnrichmentService
                 $"Resolving only the missing fields in local code: {string.Join(", ", requested)}."));
             var editionYear = FindYear(scan.AlbumName);
             external = await _externalMetadata.ResolveAsync(
-                new(album, artist, tracks.Count, EditionYear: editionYear),
+                new(album, artist, tracks.Count, EditionYear: editionYear, RequireSacd: false),
                 includeTrackTitles: requested.Contains("TITLE", StringComparer.OrdinalIgnoreCase),
                 token: token);
             warnings.AddRange(external.Warnings);
@@ -103,20 +103,12 @@ public sealed class LocalMetadataEnrichmentService
         ICollection<string> warnings,
         CancellationToken token)
     {
-        if (!requested.Contains("COVER", StringComparer.OrdinalIgnoreCase) ||
-            string.IsNullOrWhiteSpace(external?.MusicBrainzReleaseId)) return null;
-
-        try
-        {
-            var downloaded = await _externalMetadata.DownloadFrontCoverAsync(external.MusicBrainzReleaseId, token);
-            return await _artwork.PrepareDownloadedAsync(downloaded, staged.FfmpegPath, staged.FfprobePath, token);
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception error) when (error is HttpRequestException or IOException or InvalidDataException or InvalidOperationException)
-        {
-            warnings.Add($"Cover Art Archive lookup did not produce usable front artwork ({error.GetType().Name}).");
-            return null;
-        }
+        if (!requested.Contains("COVER", StringComparer.OrdinalIgnoreCase)) return null;
+        var prepared = await _artwork.PrepareExternalAsync(
+            _externalMetadata, external?.MusicBrainzReleaseId, staged.FfmpegPath, staged.FfprobePath, token);
+        if (prepared.Artwork is not null) return prepared.Artwork;
+        if (prepared.Issue is not null) warnings.Add(prepared.Issue);
+        return null;
     }
 
     private static void UpdateReport(

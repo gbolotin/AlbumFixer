@@ -34,6 +34,11 @@ public sealed record ScanResult(
     public bool RequiresProcessing => Mode != WorkflowMode.Completed;
 }
 
+public sealed record InventoryProgress(int Completed, int Total, string Stage, string CurrentItem)
+{
+    public int Percent => Total <= 0 ? 0 : Math.Clamp((int)Math.Round(Completed * 100d / Total), 0, 100);
+}
+
 public sealed record PreflightCheck(string Name, CheckState State, string Detail, bool BlocksRun = false);
 public sealed record PreflightResult(
     IReadOnlyList<PreflightCheck> Checks, string TempRoot, long RequiredBytes, long AvailableBytes,
@@ -75,11 +80,60 @@ public static class SizeText
 
 public sealed partial class AlbumScanner
 {
-    public Task<ScanResult> ScanAsync(string folder, CancellationToken token = default) =>
-        Task.Run(() => Scan(folder, token), token);
+    public static int InventoryWorkerLimit => Math.Clamp(Environment.ProcessorCount, 1, 4);
 
-    public Task<IReadOnlyList<ScanResult>> ScanAlbumsAsync(string folder, CancellationToken token = default) =>
-        Task.Run<IReadOnlyList<ScanResult>>(() => ScanAlbums(folder, token), token);
+    public Task<ScanResult> ScanAsync(string folder, CancellationToken token = default) =>
+        ScanAsync(folder, progress: null, token);
+
+    public Task<ScanResult> ScanAsync(
+        string folder,
+        IProgress<InventoryProgress>? progress,
+        CancellationToken token = default) =>
+        Task.Run(() => Scan(folder, progress, token), token);
+
+    public async Task<IReadOnlyList<ScanResult>> ScanAlbumsAsync(string folder, CancellationToken token = default)
+    {
+        var scan = await ScanAsync(folder, token).ConfigureAwait(false);
+        return await ScanAlbumsAsync(scan, progress: null, token).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<ScanResult>> ScanAlbumsAsync(
+        ScanResult scan,
+        IProgress<InventoryProgress>? progress = null,
+        CancellationToken token = default)
+    {
+        if (scan.Mode != WorkflowMode.MultipleAlbums) return [scan];
+        var roots = ResolveAlbumRoots(scan);
+
+        var results = new ScanResult[roots.Count];
+        var completed = 0;
+        var progressGate = new object();
+        progress?.Report(new(0, roots.Count, $"Scanning album folders with up to {InventoryWorkerLimit} workers", roots[0]));
+        await Parallel.ForEachAsync(Enumerable.Range(0, roots.Count), new ParallelOptions
+        {
+            MaxDegreeOfParallelism = InventoryWorkerLimit,
+            CancellationToken = token
+        }, async (index, itemToken) =>
+        {
+            results[index] = await ScanAsync(roots[index], itemToken).ConfigureAwait(false);
+            lock (progressGate)
+            {
+                completed++;
+                progress?.Report(new(completed, roots.Count,
+                    $"Scanning album folders with up to {InventoryWorkerLimit} workers", roots[index]));
+            }
+        }).ConfigureAwait(false);
+        return results;
+    }
+
+    public IReadOnlyList<string> ResolveAlbumRoots(ScanResult scan)
+    {
+        if (scan.Mode != WorkflowMode.MultipleAlbums) return [scan.AlbumRoot];
+        var roots = AlbumRoots(scan.AlbumRoot, scan.Media.Where(IsAlbumRootInput));
+        if (roots.Count < 2)
+            throw new InvalidOperationException("The batch inventory did not resolve at least two disjoint album roots.");
+        return roots;
+    }
 
     public IReadOnlyList<ScanResult> ScanAlbums(string folder, CancellationToken token = default)
     {
@@ -93,6 +147,9 @@ public sealed partial class AlbumScanner
     }
 
     public ScanResult Scan(string folder, CancellationToken token = default)
+        => Scan(folder, progress: null, token);
+
+    private ScanResult Scan(string folder, IProgress<InventoryProgress>? progress, CancellationToken token)
     {
         if (string.IsNullOrWhiteSpace(folder)) throw new ArgumentException("Choose an album folder first.");
         var root = Path.GetFullPath(folder);
@@ -100,35 +157,58 @@ public sealed partial class AlbumScanner
         var warnings = new List<string>();
         var errors = new List<string>();
         string[] files;
+        progress?.Report(new(0, 0, "Discovering files", new DirectoryInfo(root).Name));
         try { files = Directory.GetFiles(root, "*", SearchOption.AllDirectories); }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         { throw new IOException($"Could not inventory this album: {error.Message}", error); }
 
-        var previousPlans = files
+        var reportPaths = files
             .Where(path => Path.GetFileName(path).Equals("conversion-report.json", StringComparison.OrdinalIgnoreCase))
-            .Select(path => PreviousOutputCleanupService.Discover(Path.GetDirectoryName(path)!))
-            .Where(plan => plan is not null)
-            .Cast<PreviousOutputPlan>()
             .ToArray();
-        var verifiedPreviousPlans = files
-            .Where(path => Path.GetFileName(path).Equals("conversion-report.json", StringComparison.OrdinalIgnoreCase))
-            .Select(path => PreviousOutputCleanupService.DiscoverVerified(Path.GetDirectoryName(path)!))
-            .Where(plan => plan is not null)
-            .Cast<VerifiedOutputPlan>()
-            .ToArray();
-        var completedPlans = files
-            .Where(path => Path.GetFileName(path).Equals("conversion-report.json", StringComparison.OrdinalIgnoreCase))
-            .Select(path => PreviousOutputCleanupService.DiscoverCompleted(Path.GetDirectoryName(path)!) ??
-                            PreviousOutputCleanupService.DiscoverRecoverableStaleFallback(Path.GetDirectoryName(path)!, token))
-            .Where(plan => plan is not null)
-            .Cast<CompletedOutputPlan>()
-            .ToArray();
+        var cues = files.Where(path => Path.GetExtension(path).Equals(".cue", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var totalSteps = reportPaths.Length * 3 + cues.Length + files.Length;
+        var completedSteps = 0;
+        var scanProgressGate = new object();
+        void Advance(string stage, string path)
+        {
+            var relative = Path.GetRelativePath(root, path);
+            lock (scanProgressGate)
+            {
+                completedSteps++;
+                progress?.Report(new(completedSteps, totalSteps, stage,
+                    relative.Equals(".", StringComparison.Ordinal) ? new DirectoryInfo(root).Name : relative));
+            }
+        }
+
+        var previousPlanResults = new PreviousOutputPlan?[reportPaths.Length];
+        var verifiedPlanResults = new VerifiedOutputPlan?[reportPaths.Length];
+        var completedPlanResults = new CompletedOutputPlan?[reportPaths.Length];
+        Parallel.For(0, reportPaths.Length, new ParallelOptions
+        {
+            MaxDegreeOfParallelism = InventoryWorkerLimit,
+            CancellationToken = token
+        }, index =>
+        {
+            token.ThrowIfCancellationRequested();
+            var reportPath = reportPaths[index];
+            var reportRoot = Path.GetDirectoryName(reportPath)!;
+
+            previousPlanResults[index] = PreviousOutputCleanupService.Discover(reportRoot);
+            Advance("Reading previous-run reports", reportRoot);
+            verifiedPlanResults[index] = PreviousOutputCleanupService.DiscoverVerified(reportRoot);
+            Advance("Checking prior output evidence", reportRoot);
+            completedPlanResults[index] = PreviousOutputCleanupService.DiscoverCompleted(reportRoot) ??
+                                          PreviousOutputCleanupService.DiscoverRecoverableStaleFallback(reportRoot, token);
+            Advance("Verifying completion evidence", reportRoot);
+        });
+        var previousPlans = previousPlanResults.OfType<PreviousOutputPlan>().ToArray();
+        var verifiedPreviousPlans = verifiedPlanResults.OfType<VerifiedOutputPlan>().ToArray();
+        var completedPlans = completedPlanResults.OfType<CompletedOutputPlan>().ToArray();
         var previousOutputs = previousPlans.SelectMany(plan => plan.Files)
             .Concat(verifiedPreviousPlans.SelectMany(plan => plan.Files))
             .Concat(completedPlans.SelectMany(plan => plan.Files))
             .Select(file => file.FullPath)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var cues = files.Where(path => Path.GetExtension(path).Equals(".cue", StringComparison.OrdinalIgnoreCase)).ToArray();
         var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var cue in cues)
         {
@@ -143,6 +223,7 @@ public sealed partial class AlbumScanner
                 }
             }
             catch (IOException error) { warnings.Add($"Could not read {Path.GetFileName(cue)}: {error.Message}"); }
+            Advance("Reading CUE references", cue);
         }
 
         var media = new List<MediaItem>();
@@ -169,17 +250,22 @@ public sealed partial class AlbumScanner
                 ".dst" => ("DST stream", "Losslessly compressed DSD; probe required"),
                 ".dsd" => ("Raw DSD", "Ambiguous extension; bit order and layout must be established"),
                 ".jpg" or ".jpeg" or ".png" when name.Contains("cover") || name.Contains("front") || name == "folder.jpg" => ("Artwork", "Local artwork candidate"),
+                ".md5" or ".sfv" => ("Provenance", "Preserved checksum manifest and album identity evidence"),
                 ".log" or ".txt" or ".pdf" or ".m3u" or ".m3u8" or ".ddp" => ("Provenance", "Preserved log, scan, or playlist"),
                 _ => (string.Empty, string.Empty)
             };
-            if (kind.Length == 0) continue;
-            long size = 0;
-            try { size = new FileInfo(path).Length; } catch (IOException) { }
-            media.Add(new MediaItem(path, Path.GetRelativePath(root, path), kind, size, note));
+            if (kind.Length > 0)
+            {
+                long size = 0;
+                try { size = new FileInfo(path).Length; } catch (IOException) { }
+                media.Add(new MediaItem(path, Path.GetRelativePath(root, path), kind, size, note));
+            }
+            Advance("Classifying media", path);
         }
 
         var images = media.Where(item => item.Kind.Contains("image", StringComparison.OrdinalIgnoreCase) || item.Kind is "DST stream" or "Raw DSD").ToArray();
         var tracks = media.Where(item => item.Kind.StartsWith("Existing", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var repairTracks = tracks.Where(item => item.Kind.Equals("Existing FLAC", StringComparison.OrdinalIgnoreCase)).ToArray();
         var completedPlan = completedPlans.FirstOrDefault(plan => plan.AlbumRoot.Equals(root, StringComparison.OrdinalIgnoreCase));
         var completedSources = completedPlan?.SourcePaths.ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
         var completed = completedPlan is not null && tracks.Length == 0 &&
@@ -193,6 +279,9 @@ public sealed partial class AlbumScanner
             warnings.Add($"Found {previousOutputs.Count} report-proven output file{(previousOutputs.Count == 1 ? "" : "s")} from an earlier Album Fixer run. Root-level outputs are replaced only after new tracks verify; inner-folder tracks are retained.");
 
         var albumRoots = AlbumRoots(root, media.Where(IsAlbumRootInput));
+        if (albumRoots.Count == 1 && !albumRoots[0].Equals(root, StringComparison.OrdinalIgnoreCase))
+            return Scan(albumRoots[0], progress, token);
+
         WorkflowMode mode;
         if (albumRoots.Count > 1)
         {
@@ -200,10 +289,20 @@ public sealed partial class AlbumScanner
             warnings.Add($"This folder contains {albumRoots.Count} independent albums. Batch mode will use a hardware-aware bounded copy/process/write-back pipeline.");
         }
         else if (completed) mode = WorkflowMode.Completed;
-        else if (tracks.Length >= 2)
+        else if (tracks.Length > 0)
         {
-            mode = WorkflowMode.ExistingTrackRepair;
-            if (images.Length > 0) warnings.Add("Separated tracks coexist with an image. Repair-only mode takes precedence; the image stays until equivalence is proven.");
+            if (repairTracks.Length >= 2 && repairTracks.Length == tracks.Length)
+            {
+                mode = WorkflowMode.ExistingTrackRepair;
+                if (images.Length > 0) warnings.Add("Separated FLAC tracks coexist with an image. Repair-only mode takes precedence; the image stays until equivalence is proven.");
+            }
+            else
+            {
+                mode = WorkflowMode.NeedsInspection;
+                errors.Add(repairTracks.Length == tracks.Length
+                    ? "Existing-track repair requires at least two standalone FLAC tracks."
+                    : "Standalone DSF or DFF tracks are not eligible for the FLAC existing-track repair workflow; report-proven SACD outputs are adopted separately.");
+            }
         }
         else if (media.Any(item => item.Kind == "FLAC image")) mode = errors.Count == 0 ? WorkflowMode.FlacCueSplit : WorkflowMode.NeedsInspection;
         else if (media.Any(item => item.Kind is "SACD / DSD image" or "DSF image" or "DFF image" or "DST stream")) mode = WorkflowMode.DsdExtraction;
@@ -211,11 +310,13 @@ public sealed partial class AlbumScanner
         else { mode = WorkflowMode.Unsupported; errors.Add("No supported FLAC, ISO, DSF, DFF, DST, or DSD source was found."); }
 
         var sourceBytes = images.Length > 0 ? images.Sum(item => item.Size) : tracks.Sum(item => item.Size);
-        return new ScanResult(root, new DirectoryInfo(root).Name, mode,
+        var result = new ScanResult(root, new DirectoryInfo(root).Name, mode,
             media.OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase).ToArray(), warnings, errors,
             sourceBytes, images.Length, tracks.Length, cues.Length,
             media.Any(item => item.Kind.Contains("FLAC", StringComparison.OrdinalIgnoreCase)),
             media.Any(item => item.Kind.Contains("DS", StringComparison.OrdinalIgnoreCase) || item.Kind.Contains("SACD", StringComparison.OrdinalIgnoreCase)));
+        progress?.Report(new(Math.Max(totalSteps, 1), Math.Max(totalSteps, 1), "Inventory complete", result.AlbumName));
+        return result;
     }
 
     private static IReadOnlyList<string> AlbumRoots(string root, IEnumerable<MediaItem> media) =>
@@ -392,11 +493,17 @@ public sealed class PreflightService
         });
         if (scan.Mode == WorkflowMode.DsdExtraction)
         {
-            var otherDsdSources = scan.Media.Count(item => item.Kind is "DSF image" or "DFF image" or "DST stream" or "Raw DSD");
+            var otherDsdSources = scan.Media.Count(item => item.Kind is "DSF image" or "DFF image" or "Existing DSF" or "Existing DFF" or "DST stream" or "Raw DSD");
             checks.Add(sacdImages.Length == 1 && otherDsdSources == 0
                 ? new("Verified write-back", CheckState.Passed, "Host-managed SACD ISO extraction, DSD verification, and transactional final placement are enabled.")
                 : new("Verified write-back", CheckState.Failed, "This release supports one SACD ISO per album. Other DSD source types remain read-only.", true));
         }
+        else if (scan.Mode == WorkflowMode.ExistingTrackRepair)
+            checks.Add(scan.CueCount == 0 && scan.ImageCount == 0 && scan.TrackCount >= 2
+                ? new("Verified write-back", CheckState.Passed,
+                    "Standalone FLAC tracks will be repaired in local staging, checked for exact compressed-audio payload equality, and replaced through destination-side rollback.")
+                : new("Verified write-back", CheckState.Failed,
+                    "Existing-track repair is enabled only when at least two standalone FLAC tracks have no CUE sheet or source image. Ambiguous mixed sources remain read-only.", true));
         else if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.MultipleAlbums and not WorkflowMode.Unsupported)
             checks.Add(new("Verified write-back", CheckState.Failed, "Host-managed final placement is enabled for FLAC + CUE and single SACD ISO workflows. Other modes stop before changing files.", true));
         checks.AddRange(scan.Errors.Select(error => new PreflightCheck("Inventory", CheckState.Failed, error, true)));
@@ -509,12 +616,26 @@ public static class ReportReader
         var json = JsonSerializer.Serialize(root, new JsonSerializerOptions { WriteIndented = true });
         var album = Get(root, "album") ?? "Album conversion"; var edition = Get(root, "edition"); var workflow = Get(root, "workflow_mode") ?? Get(root, "source_type");
         var verification = Prop(root, "verification", out var v) ? v : default; var status = verification.ValueKind == JsonValueKind.Object ? Get(verification, "status") ?? "pending" : "pending";
+        if (PreviousOutputCleanupService.IsOptionalOnlyLegacySacdCompletion(root)) status = "passed";
         var deleted = verification.ValueKind == JsonValueKind.Object && Bool(verification, "sources_deleted");
         var errors = new List<string>(); if (verification.ValueKind == JsonValueKind.Object && Prop(verification, "errors", out var e) && e.ValueKind == JsonValueKind.Array) foreach (var item in e.EnumerateArray()) errors.Add(item.ToString());
         if (verification.ValueKind == JsonValueKind.Object && Prop(verification, "warnings", out var warnings) && warnings.ValueKind == JsonValueKind.Array) foreach (var item in warnings.EnumerateArray()) errors.Add(item.ToString());
         var tracks = new HashSet<string>(StringComparer.OrdinalIgnoreCase); Files(root, tracks);
         var sections = Count(root, "discs") + Count(root, "areas") + Count(root, "audio_areas");
-        var label = status.ToLowerInvariant() switch { "passed" => "Verification passed", "incomplete" => "Tracks ready · artwork incomplete", "failed" => "Verification failed", "blocked" => "Run blocked safely", "canceled" => "Run canceled safely", _ => "Report pending" };
+        var incompleteKind = verification.ValueKind == JsonValueKind.Object
+            ? CompletionIssuePresentation.FromStatus(Get(verification, "incomplete_kind"))
+            : CompletionIssueKind.None;
+        var label = status.ToLowerInvariant() switch
+        {
+            "passed" => "Verification passed",
+            "incomplete" => incompleteKind == CompletionIssueKind.None
+                ? "Tracks ready · required metadata/artwork missing"
+                : $"Tracks ready · {CompletionIssuePresentation.Label(incompleteKind).ToLowerInvariant()}",
+            "failed" => "Verification failed",
+            "blocked" => "Run blocked safely",
+            "canceled" => "Run canceled safely",
+            _ => "Report pending"
+        };
         return new(status, $"{album} · {label}", string.Join("  •  ", new[] { edition, workflow?.Replace('_', ' '), verification.ValueKind == JsonValueKind.Object ? Get(verification, "method") : null }.Where(x => !string.IsNullOrWhiteSpace(x))), tracks.Count, sections, deleted, errors, json);
     }
     private static string? Get(JsonElement e, string n) => Prop(e, n, out var p) ? p.ValueKind == JsonValueKind.String ? p.GetString() : p.ToString() : null;

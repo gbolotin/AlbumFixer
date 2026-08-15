@@ -17,6 +17,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
           <TextBlock Text="SOURCE FOLDERS" Foreground="{StaticResource Muted}" FontSize="10" FontWeight="Bold" Margin="0,0,0,9"/>
           <Border Grid.Row="1" Background="#0E161F" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6" Padding="9" MinHeight="74"
@@ -75,11 +76,51 @@
           <CheckBox Grid.Row="5" Content="Delete originals" IsChecked="{Binding DeleteOriginals, Mode=TwoWay}" IsEnabled="{Binding CanBrowse}"
                     Margin="0,15,0,0" Foreground="{StaticResource Text}" FontWeight="SemiBold"
                     ToolTip="When selected, eligible single-image originals are deleted only after final verification. Clear this option to retain every original."/>
+          <Button Grid.Row="6" Margin="0,10,0,0" VerticalAlignment="Center">
+            <Button.Resources>
+              <DataTemplate x:Key="StartButtonContentTemplate">
+                <StackPanel Orientation="Horizontal">
+                  <Path Data="M 2,1 L 13,7.5 L 2,14 Z" Width="14" Height="14" Stretch="Uniform" Margin="0,0,8,0"
+                        Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+                  <TextBlock Text="{Binding}" VerticalAlignment="Center"
+                             Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+                </StackPanel>
+              </DataTemplate>
+              <DataTemplate x:Key="CancelButtonContentTemplate">
+                <StackPanel Orientation="Horizontal">
+                  <Path Data="M 2,2 L 13,13 M 13,2 L 2,13" Width="14" Height="14" Stretch="Uniform" Margin="0,0,8,0"
+                        Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2.25"
+                        StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                  <TextBlock Text="{Binding}" VerticalAlignment="Center"
+                             Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+                </StackPanel>
+              </DataTemplate>
+            </Button.Resources>
+            <Button.Style>
+              <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+                <Setter Property="Content" Value="Start"/>
+                <Setter Property="ContentTemplate" Value="{StaticResource StartButtonContentTemplate}"/>
+                <Setter Property="Command" Value="{Binding StartCommand}"/>
+                <Setter Property="AutomationProperties.Name" Value="Start"/>
+                <Style.Triggers>
+                  <DataTrigger Binding="{Binding IsRunActive}" Value="True">
+                    <Setter Property="Content" Value="Cancel"/>
+                    <Setter Property="ContentTemplate" Value="{StaticResource CancelButtonContentTemplate}"/>
+                    <Setter Property="Command" Value="{Binding CancelCommand}"/>
+                    <Setter Property="AutomationProperties.Name" Value="Cancel"/>
+                    <Setter Property="Background" Value="{StaticResource Red}"/>
+                    <Setter Property="Foreground" Value="#2A0808"/>
+                  </DataTrigger>
+                </Style.Triggers>
+              </Style>
+            </Button.Style>
+          </Button>
         </Grid>
       </Border>
       <Grid Grid.Column="2"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="13"/><RowDefinition/></Grid.RowDefinitions>
         <Border Style="{StaticResource CardStyle}" Padding="22">
           <Grid>
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
             <Grid.ColumnDefinitions><ColumnDefinition Width="96"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
             <Border Width="76" Height="76" CornerRadius="38" Background="{StaticResource MintDark}">
               <StackPanel VerticalAlignment="Center">
@@ -89,49 +130,40 @@
             </Border>
             <StackPanel Grid.Column="1" VerticalAlignment="Center">
               <TextBlock Text="{Binding StatusTitle}" FontSize="21" FontWeight="SemiBold"/>
-              <TextBlock Text="{Binding StatusDetail}" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,4,0,5" MaxHeight="44"/>
-              <TextBlock Text="{Binding ProgressTime}" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,0,0,7"/>
-              <ProgressBar Value="{Binding Progress, Mode=OneWay}" Maximum="100" Height="7"/>
+              <TextBlock Text="{Binding StatusDetail}"
+                         Foreground="{StaticResource Muted}"
+                         FontSize="12"
+                         Height="34"
+                         LineHeight="17"
+                         LineStackingStrategy="BlockLineHeight"
+                         TextWrapping="Wrap"
+                         TextTrimming="CharacterEllipsis"
+                         Margin="0,4,0,5"/>
+              <TextBlock Text="{Binding ProgressTime}" Foreground="{StaticResource Muted}" FontSize="11"/>
             </StackPanel>
-            <Button Grid.Column="2" MinWidth="96" Margin="22,0,0,0" VerticalAlignment="Center">
-              <Button.Resources>
-                <DataTemplate x:Key="StartButtonContentTemplate">
-                  <StackPanel Orientation="Horizontal">
-                    <Path Data="M 2,1 L 13,7.5 L 2,14 Z" Width="14" Height="14" Stretch="Uniform" Margin="0,0,8,0"
-                          Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
-                    <TextBlock Text="{Binding}" VerticalAlignment="Center"
-                               Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
-                  </StackPanel>
-                </DataTemplate>
-                <DataTemplate x:Key="CancelButtonContentTemplate">
-                  <StackPanel Orientation="Horizontal">
-                    <Path Data="M 2,2 L 13,13 M 13,2 L 2,13" Width="14" Height="14" Stretch="Uniform" Margin="0,0,8,0"
-                          Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2.25"
-                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-                    <TextBlock Text="{Binding}" VerticalAlignment="Center"
-                               Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
-                  </StackPanel>
-                </DataTemplate>
-              </Button.Resources>
-              <Button.Style>
-                <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
-                  <Setter Property="Content" Value="Start"/>
-                  <Setter Property="ContentTemplate" Value="{StaticResource StartButtonContentTemplate}"/>
-                  <Setter Property="Command" Value="{Binding StartCommand}"/>
-                  <Setter Property="AutomationProperties.Name" Value="Start"/>
-                  <Style.Triggers>
-                    <DataTrigger Binding="{Binding IsRunActive}" Value="True">
-                      <Setter Property="Content" Value="Cancel"/>
-                      <Setter Property="ContentTemplate" Value="{StaticResource CancelButtonContentTemplate}"/>
-                      <Setter Property="Command" Value="{Binding CancelCommand}"/>
-                      <Setter Property="AutomationProperties.Name" Value="Cancel"/>
-                      <Setter Property="Background" Value="{StaticResource Red}"/>
-                      <Setter Property="Foreground" Value="#2A0808"/>
-                    </DataTrigger>
-                  </Style.Triggers>
-                </Style>
-              </Button.Style>
-            </Button>
+            <StackPanel Grid.Column="2" MinWidth="112" Margin="22,0,0,0" VerticalAlignment="Center">
+              <Button Content="{Binding RetryFailedButtonLabel}"
+                      Command="{Binding RetryFailedCommand}"
+                      AutomationProperties.Name="Retry failed albums"
+                      ToolTip="Freshly rescan and preflight only albums that failed in the previous run, then retry only those that pass."
+                      Margin="0">
+                <Button.Style>
+                  <Style TargetType="Button" BasedOn="{StaticResource ButtonStyle}">
+                    <Setter Property="Visibility" Value="Collapsed"/>
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding HasRetryFailures}" Value="True">
+                        <Setter Property="Visibility" Value="Visible"/>
+                      </DataTrigger>
+                      <DataTrigger Binding="{Binding IsRunActive}" Value="True">
+                        <Setter Property="Visibility" Value="Collapsed"/>
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </Button.Style>
+              </Button>
+            </StackPanel>
+            <ProgressBar Grid.Row="1" Grid.ColumnSpan="3"
+                         Value="{Binding Progress, Mode=OneWay}" Maximum="100" Height="7" Margin="0,9,0,0"/>
           </Grid>
         </Border>
         <Border Grid.Row="2" Style="{StaticResource CardStyle}" Padding="0"><TabControl Background="Transparent" BorderThickness="0">
@@ -188,21 +220,21 @@
               </Grid>
             </DataTemplate>
           </TabControl.Resources>
-          <TabItem Header="Preflight">
-            <Grid Margin="16">
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
-              <TextBlock Text="Preflight checks" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,12"/>
-              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <ItemsControl ItemsSource="{Binding PreflightChecks}" ItemTemplate="{StaticResource StatusRowTemplate}"/>
-              </ScrollViewer>
-            </Grid>
-          </TabItem>
           <TabItem Header="Albums">
             <Grid Margin="16">
               <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
               <TextBlock Text="Albums" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,12"/>
               <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                 <ItemsControl ItemsSource="{Binding Albums}" ItemTemplate="{StaticResource StatusRowTemplate}"/>
+              </ScrollViewer>
+            </Grid>
+          </TabItem>
+          <TabItem Header="Preflight">
+            <Grid Margin="16">
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
+              <TextBlock Text="Preflight checks" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,12"/>
+              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <ItemsControl ItemsSource="{Binding PreflightChecks}" ItemTemplate="{StaticResource StatusRowTemplate}"/>
               </ScrollViewer>
             </Grid>
           </TabItem>

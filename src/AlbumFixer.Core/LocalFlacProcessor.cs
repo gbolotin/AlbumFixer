@@ -258,10 +258,11 @@ public sealed class LocalFlacProcessor
     {
         var year = FolderYear.Match(scan.AlbumName);
         var album = Nonempty(cue.AlbumTitle) ?? CleanAlbumName(scan.AlbumName);
-        var artist = Nonempty(cue.AlbumPerformer) ?? Nonempty(Directory.GetParent(scan.AlbumRoot)?.Name);
+        var artist = Nonempty(cue.AlbumPerformer);
         var date = Nonempty(cue.Date) ?? (year.Success ? year.Groups["year"].Value : null);
-        var genre = Nonempty(cue.Genre) ?? InferGenreFromFolders(scan.AlbumRoot);
-        return new(album, artist, date, genre, Nonempty(cue.Composer), cue.Genre is null && genre is not null);
+        var folderGenre = LibraryFolderMetadata.InferGenre(scan.AlbumRoot);
+        var genre = Nonempty(cue.Genre) ?? folderGenre;
+        return new(album, artist, date, genre, Nonempty(cue.Composer), cue.Genre is null && folderGenre is not null);
     }
 
     private static string CleanAlbumName(string name)
@@ -269,23 +270,6 @@ public sealed class LocalFlacProcessor
         var value = FolderYear.Replace(name, string.Empty);
         value = EditionSuffix.Replace(value, " ");
         return Regex.Replace(value, "\\s+", " ").Trim();
-    }
-
-    private static string? InferGenreFromFolders(string albumRoot)
-    {
-        var mappings = new (string Needle, string Genre)[]
-        {
-            ("opera", "Opera"), ("classical", "Classical"), ("jazz", "Jazz"), ("rock", "Rock"),
-            ("pop", "Pop"), ("folk", "Folk"), ("electronic", "Electronic"), ("soundtrack", "Soundtrack"),
-            ("spoken word", "Spoken Word"), ("blues", "Blues"), ("country", "Country"), ("reggae", "Reggae"),
-            ("metal", "Metal"), ("soul", "Soul"), ("funk", "Funk")
-        };
-        for (var directory = Directory.GetParent(albumRoot); directory is not null; directory = directory.Parent)
-        {
-            foreach (var mapping in mappings)
-                if (directory.Name.Contains(mapping.Needle, StringComparison.OrdinalIgnoreCase)) return mapping.Genre;
-        }
-        return null;
     }
 
     private static IReadOnlyList<TrackOutput> BuildOutputs(IReadOnlyList<CueTrack> tracks, string outputRoot)
@@ -498,9 +482,11 @@ public sealed class LocalFlacProcessor
             report["genre"] = new JsonObject
             {
                 ["value"] = metadata.Genre,
-                ["source_type"] = metadata.GenreInferred ? "inferred_from_library_folder" : "local_cue",
+                ["source_type"] = metadata.GenreInferred ? "recognized_library_genre_folder" : "local_cue",
                 ["confidence"] = "high",
-                ["rationale"] = metadata.GenreInferred ? "Album is stored beneath the matching library genre folder." : "Genre was read from the local CUE."
+                ["rationale"] = metadata.GenreInferred
+                    ? "A recognized library category supplied genre only; it was not used as artist metadata."
+                    : "Genre was read from the local CUE."
             };
         }
         if (cover is not null)

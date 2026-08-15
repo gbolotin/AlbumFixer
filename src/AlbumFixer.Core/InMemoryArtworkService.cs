@@ -122,6 +122,44 @@ internal sealed class InMemoryArtworkService
             token);
     }
 
+    public async Task<ArtworkPreparation> PrepareExternalAsync(
+        ExternalMetadataService externalMetadata,
+        string? musicBrainzReleaseId,
+        string ffmpeg,
+        string ffprobe,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(externalMetadata);
+        if (string.IsNullOrWhiteSpace(musicBrainzReleaseId))
+            return new(null, "No exact MusicBrainz release match was available for external front-cover lookup.");
+        try
+        {
+            var downloaded = await externalMetadata.DownloadFrontCoverAsync(musicBrainzReleaseId, token);
+            return new(await PrepareDownloadedAsync(downloaded, ffmpeg, ffprobe, token), null);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception error) when (error is HttpRequestException or IOException or InvalidDataException or InvalidOperationException)
+        {
+            return new(null, $"External front-cover lookup did not produce usable artwork ({error.GetType().Name}): {error.Message}");
+        }
+    }
+
+    public async Task<ArtworkPreparation> PrepareLocalThenExternalAsync(
+        string sourceAlbumRoot,
+        string ffmpeg,
+        string ffprobe,
+        ArtworkSelectionMode mode,
+        ExternalMetadataService externalMetadata,
+        string? musicBrainzReleaseId,
+        CancellationToken token = default)
+    {
+        var local = await PrepareLocalAsync(sourceAlbumRoot, ffmpeg, ffprobe, mode, token);
+        if (local.Artwork is not null) return local;
+        var external = await PrepareExternalAsync(externalMetadata, musicBrainzReleaseId, ffmpeg, ffprobe, token);
+        if (external.Artwork is not null) return external;
+        return new(null, string.Join(" ", new[] { local.Issue, external.Issue }.Where(value => !string.IsNullOrWhiteSpace(value))));
+    }
+
     public static TagLib.Picture CreatePicture(PreparedArtwork artwork) => new(new TagLib.ByteVector(artwork.JpegBytes))
     {
         Type = TagLib.PictureType.FrontCover,

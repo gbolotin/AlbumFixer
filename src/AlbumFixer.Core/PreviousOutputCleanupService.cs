@@ -136,8 +136,10 @@ public static class PreviousOutputCleanupService
             var workflow = Text(report, "workflow_mode");
             if (!IsCompletedWorkflow(workflow)) return null;
             var verification = Property(report, "verification", out var value) ? value : default;
-            if (verification.ValueKind != JsonValueKind.Object ||
-                !string.Equals(Text(verification, "status"), "passed", StringComparison.OrdinalIgnoreCase)) return null;
+            if (verification.ValueKind != JsonValueKind.Object) return null;
+            var verificationPassed = string.Equals(Text(verification, "status"), "passed", StringComparison.OrdinalIgnoreCase);
+            var optionalOnlyLegacySacd = IsOptionalOnlyLegacySacdCompletion(report);
+            if (!verificationPassed && !optionalOnlyLegacySacd) return null;
             var sourcesDeleted = Flag(verification, "sources_deleted");
             if (Property(report, "deletion", out var deletion) && deletion.ValueKind == JsonValueKind.Object)
                 sourcesDeleted = sourcesDeleted || Flag(deletion, "performed") ||
@@ -169,10 +171,14 @@ public static class PreviousOutputCleanupService
                 .Select(relative => HostStagingService.SafeCombine(root, NormalizeRelative(relative)))
                 .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
-            return files.All(file => File.Exists(file.FullPath) &&
-                                     (file.Size is null || new FileInfo(file.FullPath).Length == file.Size.Value))
-                ? new(root, reportPath, workflow!, files, sourcesDeleted, sourcePaths)
-                : null;
+            if (!files.All(file => File.Exists(file.FullPath) &&
+                                  (file.Size is null || new FileInfo(file.FullPath).Length == file.Size.Value))) return null;
+            if (optionalOnlyLegacySacd && !HasReportProvenDsfEvidence(root, report, files)) return null;
+            return new(root, reportPath, workflow!, files, sourcesDeleted, sourcePaths,
+                RecoveredFromStaleFallback: optionalOnlyLegacySacd,
+                RecoveryDetail: optionalOnlyLegacySacd
+                    ? "A verified SACD extraction from an older report was adopted as complete because only optional LABEL, BARCODE, or RELEASECOUNTRY metadata remains unresolved. Reported output sizes, DSF tags, numbering, and embedded artwork were rechecked."
+                    : null);
         }
         catch (JsonException)
         {
@@ -192,6 +198,8 @@ public static class PreviousOutputCleanupService
         {
             using var document = JsonDocument.Parse(File.ReadAllText(reportPath));
             var report = document.RootElement;
+            if (IsOptionalOnlyLegacySacdCompletion(report))
+                return DiscoverCompleted(albumRoot) is not null;
             if (!IsCompletedWorkflow(Text(report, "workflow_mode")) ||
                 !Property(report, "verification", out var verification) ||
                 verification.ValueKind != JsonValueKind.Object ||
@@ -255,8 +263,16 @@ public static class PreviousOutputCleanupService
         JsonElement pipeline,
         CancellationToken token)
     {
-        if (!TryGetFlacFallbackFiles(root, reportPath, report, out var sourcePath, out var tracks, out var cueIndexFrames) ||
-            !File.Exists(sourcePath)) return null;
+        if (!TryGetFlacFallbackFiles(root, reportPath, report, out var sourcePath, out var tracks, out var cueIndexFrames))
+            return null;
+
+        if (!File.Exists(sourcePath))
+        {
+            if (!string.Equals(Text(pipeline, "stopped_phase"), nameof(JobPhase.Inventoried), StringComparison.OrdinalIgnoreCase))
+                return null;
+            return CompletedPlan(root, reportPath, "flac_cue_split", tracks, true, [sourcePath],
+                "Completion was recovered from a later pre-processing fallback report after the original FLAC image had already been removed. The exact CUE-derived root track set, sequential filenames, native FLAC properties, required tags, and embedded artwork passed quick verification; decoded PCM equivalence could not be recomputed without the source image.");
+        }
 
         if (!string.Equals(Text(pipeline, "status"), "canceled", StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(Text(pipeline, "stopped_phase"), nameof(JobPhase.CopyingIn), StringComparison.OrdinalIgnoreCase)) return null;
@@ -594,6 +610,15 @@ public static class PreviousOutputCleanupService
     private static bool HasNonemptyArray(JsonElement element, string name) =>
         Property(element, name, out var value) && value.ValueKind == JsonValueKind.Array && value.GetArrayLength() != 0;
 
+    private static string[] StringArray(JsonElement element, string name) =>
+        Property(element, name, out var value) && value.ValueKind == JsonValueKind.Array
+            ? value.EnumerateArray()
+                .Where(item => item.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(item.GetString()))
+                .Select(item => item.GetString()!.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray()
+            : [];
+
     private static InventorySource[] InventorySources(JsonElement report, string type, string extension)
     {
         if (!Property(report, "sources", out var sources) || sources.ValueKind != JsonValueKind.Array) return [];
@@ -861,6 +886,59 @@ public static class PreviousOutputCleanupService
                tag.Pictures.Any(picture => picture.Data.Count > 0);
     }
 
+    internal static bool IsOptionalOnlyLegacySacdCompletion(JsonElement report)
+    {
+        if (!IsDsdWorkflow(Text(report, "workflow_mode")) ||
+            !Property(report, "verification", out var verification) || verification.ValueKind != JsonValueKind.Object ||
+            !string.Equals(Text(verification, "status"), "incomplete", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(Text(verification, "independent_extraction"), "passed", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(Text(verification, "tag_payload_size_verification"), "passed", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(Text(verification, "audio_and_tags"), "passed", StringComparison.OrdinalIgnoreCase) ||
+            HasNonemptyArray(verification, "errors")) return false;
+
+        var missing = StringArray(verification, "missing_metadata");
+        if (missing.Length == 0 || MetadataFieldPolicy.RequiredMissing(missing).Count > 0 ||
+            MetadataFieldPolicy.OptionalMissing(missing).Count != missing.Length ||
+            StringArray(verification, "missing_required_metadata").Length > 0) return false;
+
+        if (!Property(report, "commit", out var commit) || commit.ValueKind != JsonValueKind.Object ||
+            !string.Equals(Text(commit, "status"), "completed_incomplete", StringComparison.OrdinalIgnoreCase) ||
+            !Flag(commit, "destination_sizes_verified") ||
+            Text(commit, "final_path_verification") is not { } finalVerification ||
+            !finalVerification.StartsWith("passed", StringComparison.OrdinalIgnoreCase)) return false;
+        return true;
+    }
+
+    private static bool HasReportProvenDsfEvidence(
+        string root,
+        JsonElement report,
+        IReadOnlyList<PreviousOutputFile> files)
+    {
+        if (!Property(report, "areas", out var areas) || areas.ValueKind != JsonValueKind.Array || areas.GetArrayLength() == 0)
+            return false;
+        var proven = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var area in areas.EnumerateArray())
+        {
+            if (!Property(area, "tracks", out var tracks) || tracks.ValueKind != JsonValueKind.Array || tracks.GetArrayLength() == 0)
+                return false;
+            var trackCount = tracks.GetArrayLength();
+            var expectedNumber = 1;
+            foreach (var track in tracks.EnumerateArray())
+            {
+                var relative = Text(track, "file");
+                var title = Text(track, "title");
+                if (!IsOutputPath(relative) || !Path.GetExtension(relative!).Equals(".dsf", StringComparison.OrdinalIgnoreCase) ||
+                    title is null || !Property(track, "track", out var trackNode) || !trackNode.TryGetInt32(out var number) ||
+                    number != expectedNumber) return false;
+                var fullPath = HostStagingService.SafeCombine(root, NormalizeRelative(relative!));
+                if (!File.Exists(fullPath) || !HasCompleteQuickDsfEvidence(fullPath, expectedNumber, trackCount, title)) return false;
+                proven.Add(fullPath);
+                expectedNumber++;
+            }
+        }
+        return files.Count == proven.Count && files.All(file => proven.Contains(file.FullPath));
+    }
+
     private sealed record InventorySource(string Path, long Size);
     private sealed record SacdRecoveryArea(string Folder, IReadOnlyList<string> TrackTitles);
     private sealed record PcmAudioFormat(int SampleRate, int Channels);
@@ -895,8 +973,13 @@ public static class PreviousOutputCleanupService
         (workflow.Equals("sacd_iso_extract", StringComparison.OrdinalIgnoreCase) ||
          workflow.Equals(nameof(WorkflowMode.DsdExtraction), StringComparison.OrdinalIgnoreCase));
 
+    private static bool IsRepairWorkflow(string? workflow) =>
+        workflow is not null &&
+        (workflow.Equals("existing_track_repair", StringComparison.OrdinalIgnoreCase) ||
+         workflow.Equals(nameof(WorkflowMode.ExistingTrackRepair), StringComparison.OrdinalIgnoreCase));
+
     private static bool IsCompletedWorkflow(string? workflow) =>
-        IsFlacWorkflow(workflow) || IsDsdWorkflow(workflow);
+        IsFlacWorkflow(workflow) || IsDsdWorkflow(workflow) || IsRepairWorkflow(workflow);
 
     private static string? Text(JsonElement element, string name) =>
         Property(element, name, out var value)

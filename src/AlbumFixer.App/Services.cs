@@ -9,6 +9,7 @@ public sealed record StartConfirmation(
     bool DeleteOriginals,
     bool IsBatch,
     bool IsSingleSacd,
+    bool IsSingleTrackRepair,
     bool DeletesSourceAfterSuccess,
     int PreviousOutputFileCount);
 
@@ -42,9 +43,9 @@ public sealed class WpfUserInteractionService : IUserInteractionService
 
     public bool ConfirmStart(StartConfirmation confirmation)
     {
-        if (!confirmation.DeleteOriginals ||
+        if (!confirmation.DeleteOriginals && !confirmation.IsSingleTrackRepair ||
             confirmation.IsBatch ||
-            !confirmation.IsSingleSacd && confirmation.DeletesSourceAfterSuccess)
+            !confirmation.IsSingleSacd && !confirmation.IsSingleTrackRepair && confirmation.DeletesSourceAfterSuccess)
         {
             return true;
         }
@@ -53,7 +54,13 @@ public sealed class WpfUserInteractionService : IUserInteractionService
             ? $"\n\n{confirmation.PreviousOutputFileCount} report-proven track file(s) from an incomplete earlier run will be deleted before staging; the prior report will be archived."
             : "";
 
-        var message = confirmation.IsSingleSacd
+        var message = confirmation.IsSingleTrackRepair
+            ? """
+               Album Fixer will copy the existing FLAC tracks into local staging, prioritize their current tags and embedded artwork, use exact external-album matches and filenames only for missing fields, then verify that every compressed FLAC audio-frame payload is bit-for-bit unchanged. The repaired tracks will replace the originals through a rollback-capable destination transaction. Delete originals does not apply to this workflow.
+
+               Start this existing-track repair?
+               """
+            : confirmation.IsSingleSacd
             ? $"""
                Album Fixer will copy and size-check the SACD ISO in local staging, extract every reported area to DSF, repeat each extraction independently, compare extraction sizes, verify native DSD structure and tags, then recheck the committed network paths. Cryptographic hashes are not calculated. Only after every gate passes will it permanently delete the exact inventoried ISO.
                {cleanup}
@@ -74,7 +81,9 @@ public sealed class WpfUserInteractionService : IUserInteractionService
                    Start this run?
                    """;
 
-        var title = confirmation.IsSingleSacd
+        var title = confirmation.IsSingleTrackRepair
+            ? "Confirm verified track repair"
+            : confirmation.IsSingleSacd
             ? "Confirm verified SACD extraction"
             : confirmation.DeletesSourceAfterSuccess
                 ? "Confirm source deletion"

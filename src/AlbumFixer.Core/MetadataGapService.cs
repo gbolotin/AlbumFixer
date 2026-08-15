@@ -8,6 +8,30 @@ public sealed record MetadataGapResult(
     IReadOnlyList<string> MissingFields,
     IReadOnlyList<string> LocalEvidence);
 
+public static class MetadataFieldPolicy
+{
+    private static readonly HashSet<string> OptionalFields = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "LABEL",
+        "BARCODE",
+        "RELEASECOUNTRY"
+    };
+
+    public static bool IsOptional(string field) => OptionalFields.Contains(field.Trim());
+
+    public static IReadOnlyList<string> RequiredMissing(IEnumerable<string> fields) => fields
+        .Where(field => !string.IsNullOrWhiteSpace(field) && !IsOptional(field))
+        .Select(field => field.Trim())
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+
+    public static IReadOnlyList<string> OptionalMissing(IEnumerable<string> fields) => fields
+        .Where(field => !string.IsNullOrWhiteSpace(field) && IsOptional(field))
+        .Select(field => field.Trim())
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+}
+
 public static class MetadataGapService
 {
     public const string FileName = "metadata-gaps.json";
