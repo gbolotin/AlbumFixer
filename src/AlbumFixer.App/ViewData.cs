@@ -15,7 +15,8 @@ public sealed record AlbumJobOutcome(
     string ReportPath,
     int Tracks,
     bool SourcesDeleted,
-    bool Incomplete);
+    bool Incomplete,
+    bool AlreadyCompleted = false);
 
 public sealed record JobUiUpdate(
     int Index,

@@ -118,7 +118,8 @@ public sealed partial class AlbumScanner
             .ToArray();
         var completedPlans = files
             .Where(path => Path.GetFileName(path).Equals("conversion-report.json", StringComparison.OrdinalIgnoreCase))
-            .Select(path => PreviousOutputCleanupService.DiscoverCompleted(Path.GetDirectoryName(path)!))
+            .Select(path => PreviousOutputCleanupService.DiscoverCompleted(Path.GetDirectoryName(path)!) ??
+                            PreviousOutputCleanupService.DiscoverRecoverableStaleFallback(Path.GetDirectoryName(path)!, token))
             .Where(plan => plan is not null)
             .Cast<CompletedOutputPlan>()
             .ToArray();
@@ -179,8 +180,12 @@ public sealed partial class AlbumScanner
 
         var images = media.Where(item => item.Kind.Contains("image", StringComparison.OrdinalIgnoreCase) || item.Kind is "DST stream" or "Raw DSD").ToArray();
         var tracks = media.Where(item => item.Kind.StartsWith("Existing", StringComparison.OrdinalIgnoreCase)).ToArray();
-        var completed = completedPlans.Any(plan => plan.AlbumRoot.Equals(root, StringComparison.OrdinalIgnoreCase)) &&
-            images.Length == 0 && tracks.Length == 0;
+        var completedPlan = completedPlans.FirstOrDefault(plan => plan.AlbumRoot.Equals(root, StringComparison.OrdinalIgnoreCase));
+        var completedSources = completedPlan?.SourcePaths.ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
+        var completed = completedPlan is not null && tracks.Length == 0 &&
+            images.All(item => completedSources.Contains(item.Path));
+        if (completedPlan?.RecoveredFromStaleFallback == true)
+            warnings.Add(completedPlan.RecoveryDetail ?? "Completion was recovered from a verified stale fallback state.");
         if (!completed)
             foreach (var missing in references.Where(path => !File.Exists(path)))
                 errors.Add($"CUE references a missing source: {Path.GetRelativePath(root, missing)}");
@@ -194,6 +199,7 @@ public sealed partial class AlbumScanner
             mode = WorkflowMode.MultipleAlbums;
             warnings.Add($"This folder contains {albumRoots.Count} independent albums. Batch mode will use a hardware-aware bounded copy/process/write-back pipeline.");
         }
+        else if (completed) mode = WorkflowMode.Completed;
         else if (tracks.Length >= 2)
         {
             mode = WorkflowMode.ExistingTrackRepair;
@@ -202,7 +208,6 @@ public sealed partial class AlbumScanner
         else if (media.Any(item => item.Kind == "FLAC image")) mode = errors.Count == 0 ? WorkflowMode.FlacCueSplit : WorkflowMode.NeedsInspection;
         else if (media.Any(item => item.Kind is "SACD / DSD image" or "DSF image" or "DFF image" or "DST stream")) mode = WorkflowMode.DsdExtraction;
         else if (media.Any(item => item.Kind == "Raw DSD") || tracks.Length == 1) mode = WorkflowMode.NeedsInspection;
-        else if (completed) mode = WorkflowMode.Completed;
         else { mode = WorkflowMode.Unsupported; errors.Add("No supported FLAC, ISO, DSF, DFF, DST, or DSD source was found."); }
 
         var sourceBytes = images.Length > 0 ? images.Sum(item => item.Size) : tracks.Sum(item => item.Size);

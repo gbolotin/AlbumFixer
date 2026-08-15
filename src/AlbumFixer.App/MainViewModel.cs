@@ -498,11 +498,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 await Task.Run(() => WriteBatchReportAsync(results, runToken.IsCancellationRequested, pipelineLimits, pipeline.Telemetry, deleteOriginals));
             await LoadReportAsync();
             var succeeded = results.Count(result => result.Succeeded);
+            var alreadyCompleted = results.Count(result => result.Succeeded && result.Value!.AlreadyCompleted);
+            var delivered = succeeded - alreadyCompleted;
             var failed = results.Count(result => !result.Succeeded && !result.Canceled);
             var canceled = results.Count(result => result.Canceled);
-            var tracks = results.Where(result => result.Succeeded).Sum(result => result.Value!.Tracks);
-            var deleted = results.Count(result => result.Succeeded && result.Value!.SourcesDeleted);
-            var incomplete = results.Count(result => result.Succeeded && result.Value!.Incomplete);
+            var tracks = results.Where(result => result.Succeeded && !result.Value!.AlreadyCompleted).Sum(result => result.Value!.Tracks);
+            var deleted = results.Count(result => result.Succeeded && !result.Value!.AlreadyCompleted && result.Value!.SourcesDeleted);
+            var incomplete = results.Count(result => result.Succeeded && !result.Value!.AlreadyCompleted && result.Value!.Incomplete);
             var blocked = AlbumCount - runnable.Length;
 
             if (runToken.IsCancellationRequested || canceled > 0)
@@ -524,12 +526,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             else
             {
                 var completionStatus = incomplete > 0 ? "incomplete" : blocked > 0 ? "partial_success" : "passed";
-                Apply(new(JobPhase.CleanupCompleted, 100, completionStatus, $"{succeeded} album{S(succeeded)} delivered; {incomplete} incomplete album{S(incomplete)} retained source artwork work; {blocked} blocked album{S(blocked)} skipped.", DateTimeOffset.UtcNow));
+                Apply(new(JobPhase.CleanupCompleted, 100, completionStatus, $"{delivered} album{S(delivered)} delivered; {alreadyCompleted} already completed album{S(alreadyCompleted)} skipped; {incomplete} incomplete album{S(incomplete)} retained source artwork work; {blocked} blocked album{S(blocked)} skipped.", DateTimeOffset.UtcNow));
                 StatusTitle = incomplete > 0
                     ? IsBatch ? "Batch completed with incomplete artwork" : "Tracks delivered · artwork incomplete"
                     : IsBatch ? "Batch completed with quick checks" : "Album completed with quick checks";
-                StatusDetail = $"{tracks} track{S(tracks)} passed quick checks across {succeeded} album{S(succeeded)}; {incomplete} incomplete; {blocked} blocked; {deleted} source image{S(deleted)} deleted.";
-                Log(incomplete > 0 ? "INCOMPLETE" : "DONE", $"{succeeded} albums delivered, {incomplete} incomplete, {blocked} skipped, {tracks} tracks passed.");
+                StatusDetail = $"{tracks} track{S(tracks)} passed quick checks across {delivered} delivered album{S(delivered)}; {alreadyCompleted} already completed; {incomplete} incomplete; {blocked} blocked; {deleted} source image{S(deleted)} deleted.";
+                Log(incomplete > 0 ? "INCOMPLETE" : "DONE", $"{delivered} albums delivered, {alreadyCompleted} already completed, {incomplete} incomplete, {blocked} blocked, {tracks} tracks passed.");
             }
         }
         catch (Exception error)
@@ -578,9 +580,25 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         var progress = new CallbackProgress<ProgressSnapshot>(Report);
         var sourceCacheRequired = HostStagingService.RequiresSourceCache(scan.AlbumRoot);
+        AlbumTransactionLock? transactionLock = null;
 
         try
         {
+            Report(new(JobPhase.Ready, 0, "queued", "Waiting for exclusive ownership of this album transaction.", DateTimeOffset.UtcNow));
+            transactionLock = await AlbumTransactionLock.AcquireAsync(scan.AlbumRoot, token);
+            var refreshedScan = await _scanner.ScanAsync(scan.AlbumRoot, token);
+            if (refreshedScan.Mode == WorkflowMode.Completed &&
+                PreviousOutputCleanupService.DiscoverCompleted(scan.AlbumRoot) is { } completed)
+            {
+                const string detail = "Another transaction already completed this album; its verified report and outputs were preserved.";
+                uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "COMPLETE", Message: detail));
+                Report(new(JobPhase.CleanupCompleted, 100, "already_completed", detail, DateTimeOffset.UtcNow));
+                return new(jobDirectory, completed.ReportPath, 0, false, false, AlreadyCompleted: true);
+            }
+            if (!SameSourceInventory(scan, refreshedScan))
+                throw new IOException("The album source inventory changed after preflight. No files were changed; scan again before retrying.");
+            scan = refreshedScan;
+
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "START", Message: $"Isolated transaction: {jobDirectory}"));
             Report(new(JobPhase.Ready, 0, "queued", sourceCacheRequired
                 ? "Waiting for an available NAS source-cache lane."
@@ -640,17 +658,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         catch (OperationCanceledException error)
         {
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: new(JobPhase.Canceled, last.Percent, "canceled", error.Message, DateTimeOffset.UtcNow)));
-            await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, true, uiUpdates, index, albumIndex);
+            if (transactionLock is not null)
+                await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, true, uiUpdates, index, albumIndex);
             throw;
         }
         catch (Exception error)
         {
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: new(JobPhase.Failed, last.Percent, "failed", error.Message, DateTimeOffset.UtcNow)));
-            await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, false, uiUpdates, index, albumIndex);
+            if (transactionLock is not null)
+                await EnsureAlbumTerminalReportAsync(scan, jobDirectory, last with { Detail = error.Message }, false, uiUpdates, index, albumIndex);
             throw;
         }
         finally
         {
+            if (transactionLock is not null) await transactionLock.DisposeAsync();
             try
             {
                 var cleaned = await WorkflowCleanupService.CleanupLocalJobAsync(jobDirectory, _preflight.TempRoot);
@@ -663,6 +684,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "CLEANUP", Message: $"Could not remove the transient album job: {error.Message}"));
             }
         }
+    }
+
+    private static bool SameSourceInventory(ScanResult expected, ScanResult actual)
+    {
+        if (expected.Mode != actual.Mode) return false;
+        static string[] Manifest(ScanResult scan) => scan.Media
+            .Where(HostStagingService.IsSource)
+            .Select(item => $"{Path.GetFullPath(item.Path)}\0{item.Size}\0{item.Kind}")
+            .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        return Manifest(expected).SequenceEqual(Manifest(actual), StringComparer.OrdinalIgnoreCase);
     }
 
     private void ApplyJobUpdate(JobUiUpdate update)
@@ -769,16 +801,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         bool deleteOriginals)
     {
         var succeeded = results.Count(result => result.Succeeded);
+        var alreadyCompleted = results.Count(result => result.Succeeded && result.Value!.AlreadyCompleted);
+        var delivered = succeeded - alreadyCompleted;
         var failed = results.Count(result => !result.Succeeded && !result.Canceled);
         var canceled = results.Count(result => result.Canceled);
         var blocked = _albumPreflights.Count(album => !album.CanStart);
-        var incomplete = results.Count(result => result.Succeeded && result.Value!.Incomplete);
+        var incomplete = results.Count(result => result.Succeeded && !result.Value!.AlreadyCompleted && result.Value!.Incomplete);
         var status = cancellationRequested || canceled > 0
             ? "canceled"
             : failed > 0 ? succeeded == 0 ? "failed" : "partial_failure"
             : incomplete > 0 ? "incomplete"
             : blocked > 0 ? "partial_success" : "passed";
-        var deleted = results.Count(result => result.Succeeded && result.Value!.SourcesDeleted);
+        var deleted = results.Count(result => result.Succeeded && !result.Value!.AlreadyCompleted && result.Value!.SourcesDeleted);
         var sourceImages = _scans.Sum(scan => scan.ImageCount);
         var albumEntries = _albumPreflights.Select(album =>
         {
@@ -790,7 +824,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 return new BatchAlbumReportEntry(album.Index + 1, album.Scan.AlbumName, album.Scan.AlbumRoot, "canceled",
                     Path.Combine(JobDirectory, $"album-{album.Index + 1:000}"), null, 0, false, "The admitted job did not start.");
             return new BatchAlbumReportEntry(album.Index + 1, album.Scan.AlbumName, album.Scan.AlbumRoot,
-                result.Succeeded ? result.Value!.Incomplete ? "incomplete" : "passed" : result.Canceled ? "canceled" : "failed",
+                result.Succeeded ? result.Value!.AlreadyCompleted ? "already_completed" : result.Value.Incomplete ? "incomplete" : "passed" : result.Canceled ? "canceled" : "failed",
                 result.Value?.JobDirectory ?? Path.Combine(JobDirectory, $"album-{album.Index + 1:000}"),
                 result.Value?.ReportPath, result.Value?.Tracks ?? 0, result.Value?.SourcesDeleted ?? false,
                 result.Error?.Message);
@@ -822,11 +856,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             albums_total = AlbumCount,
             albums_admitted = results.Count,
             albums_blocked = blocked,
-            albums_succeeded = succeeded,
+            albums_succeeded = delivered,
+            albums_already_completed = alreadyCompleted,
             albums_incomplete = incomplete,
             albums_failed = failed,
             albums_canceled = canceled,
-            tracks = results.Where(result => result.Succeeded).Sum(result => result.Value!.Tracks),
+            tracks = results.Where(result => result.Succeeded && !result.Value!.AlreadyCompleted).Sum(result => result.Value!.Tracks),
             source_images_total = sourceImages,
             source_images_deleted = deleted,
             albums = albumEntries
@@ -854,6 +889,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     var status = root.GetProperty("status").GetString() ?? "pending";
                     var total = root.GetProperty("albums_total").GetInt32();
                     var succeeded = root.GetProperty("albums_succeeded").GetInt32();
+                    var alreadyCompleted = root.TryGetProperty("albums_already_completed", out var alreadyCompletedValue)
+                        ? alreadyCompletedValue.GetInt32()
+                        : 0;
                     var failed = root.GetProperty("albums_failed").GetInt32();
                     var canceled = root.GetProperty("albums_canceled").GetInt32();
                     var incomplete = root.TryGetProperty("albums_incomplete", out var incompleteValue) ? incompleteValue.GetInt32() : 0;
@@ -867,11 +905,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                         .Where(album => album.GetProperty("error").ValueKind == JsonValueKind.String)
                         .Select(album => $"{album.GetProperty("album").GetString()}: {album.GetProperty("error").GetString()}")
                         .ToArray();
-                    return (status, total, succeeded, failed, canceled, incomplete, blocked, tracks, sourceImages, deleted, workerLimit, prettyJson, errors);
+                    return (status, total, succeeded, alreadyCompleted, failed, canceled, incomplete, blocked, tracks, sourceImages, deleted, workerLimit, prettyJson, errors);
                 });
                 ReportStatus = batch.status;
-                ReportHeadline = $"Batch {batch.status.Replace('_', ' ')} · {batch.succeeded}/{batch.total} albums completed";
-                ReportDetail = $"{batch.tracks} tracks · {batch.incomplete} incomplete · {batch.failed} failed · {batch.blocked} blocked · {batch.canceled} canceled · worker limit {batch.workerLimit}";
+                ReportHeadline = $"Batch {batch.status.Replace('_', ' ')} · {batch.succeeded + batch.alreadyCompleted}/{batch.total} albums completed";
+                ReportDetail = $"{batch.tracks} tracks · {batch.alreadyCompleted} already completed · {batch.incomplete} incomplete · {batch.failed} failed · {batch.blocked} blocked · {batch.canceled} canceled · worker limit {batch.workerLimit}";
                 ReportJson = batch.prettyJson;
                 ReportTracks = batch.tracks.ToString();
                 ReportSections = batch.total.ToString();

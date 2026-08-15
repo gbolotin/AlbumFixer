@@ -81,6 +81,7 @@ public sealed class HostStagingService
         {
             var albumFiles = EnumerateTree(scan.AlbumRoot)
                 .Where(path => !Path.GetRelativePath(scan.AlbumRoot, path).Equals("conversion-report.json", StringComparison.OrdinalIgnoreCase))
+                .Where(path => !Path.GetFileName(path).Equals(AlbumTransactionLock.FileName, StringComparison.OrdinalIgnoreCase))
                 .Where(path => !directPreviousAudio.Contains(path))
                 .ToArray();
             var totalBytes = Math.Max(1L, albumFiles.Sum(path => new FileInfo(path).Length));
@@ -259,7 +260,7 @@ public sealed class HostStagingService
         await output.FlushAsync(token);
     }
 
-    private static bool IsSource(MediaItem item) =>
+    public static bool IsSource(MediaItem item) =>
         item.Kind.Contains("image", StringComparison.OrdinalIgnoreCase) ||
         item.Kind.StartsWith("Existing", StringComparison.OrdinalIgnoreCase) ||
         item.Kind is "DST stream" or "Raw DSD";

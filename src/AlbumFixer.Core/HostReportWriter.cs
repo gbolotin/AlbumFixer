@@ -31,7 +31,7 @@ public static class HostReportWriter
             edition = "Unresolved — run stopped before release identification completed",
             format = scan.HasFlac ? "flac" : scan.HasDsd ? "dsd" : "unknown",
             source_type = SourceType(scan.Mode),
-            workflow_mode = scan.Mode.ToString(),
+            workflow_mode = WorkflowId(scan.Mode),
             album_root = scan.AlbumRoot,
             generated_by = "Album Fixer host fallback",
             generated_at_utc = now,
@@ -86,7 +86,7 @@ public static class HostReportWriter
             },
             recovery = new
             {
-                originals_retained = true,
+                originals_retained = scan.Media.Where(HostStagingService.IsSource).All(item => File.Exists(item.Path)),
                 transient_staging_cleanup = "required_after_report_write",
                 action = "Review the reported blocker and retry; no transient staging is required for recovery"
             }
@@ -94,10 +94,15 @@ public static class HostReportWriter
 
         var json = JsonSerializer.Serialize(report, JsonOptions);
         var albumPath = Path.GetFullPath(Path.Combine(scan.AlbumRoot, "conversion-report.json"));
+        var targetPath = !PreviousOutputCleanupService.HasTerminalSuccessEvidence(scan.AlbumRoot)
+            ? albumPath
+            : Path.Combine(scan.AlbumRoot,
+                $"conversion-report.{normalizedStatus}-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.json");
         try
         {
-            await AtomicWriteAsync(albumPath, json, overwrite: true, token);
-            return albumPath;
+            await AtomicWriteAsync(targetPath, json,
+                overwrite: targetPath.Equals(albumPath, StringComparison.OrdinalIgnoreCase), token);
+            return targetPath;
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
@@ -128,6 +133,17 @@ public static class HostReportWriter
     {
         WorkflowMode.FlacCueSplit => "flac_cue",
         WorkflowMode.DsdExtraction => "dsd_image",
+        WorkflowMode.ExistingTrackRepair => "existing_track_repair",
+        WorkflowMode.MultipleAlbums => "multiple_albums",
+        WorkflowMode.NeedsInspection => "needs_inspection",
+        WorkflowMode.Completed => "completed",
+        _ => "unsupported"
+    };
+
+    private static string WorkflowId(WorkflowMode mode) => mode switch
+    {
+        WorkflowMode.FlacCueSplit => "flac_cue_split",
+        WorkflowMode.DsdExtraction => "sacd_iso_extract",
         WorkflowMode.ExistingTrackRepair => "existing_track_repair",
         WorkflowMode.MultipleAlbums => "multiple_albums",
         WorkflowMode.NeedsInspection => "needs_inspection",

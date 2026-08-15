@@ -425,7 +425,7 @@ public sealed partial class LocalDsdProcessor
             throw new InvalidDataException($"The final DSF embedded artwork differs from local staging: {path}");
     }
 
-    private static SacdLayout ParseLayout(string output)
+    internal static SacdLayout ParseLayout(string output)
     {
         var albumTitle = Matches(output, "^\\s*Title:\\s*(?<value>.+?)\\s*$").Select(match => match.Groups["value"].Value.Trim()).LastOrDefault();
         var albumArtist = Matches(output, "^\\s*Artist:\\s*(?<value>.+?)\\s*$").Select(match => match.Groups["value"].Value.Trim()).LastOrDefault();
@@ -446,18 +446,48 @@ public sealed partial class LocalDsdProcessor
             var trackCountText = MatchValue(block, "^\\s*Track Count:\\s*(?<value>\\d+)\\s*$")
                 ?? throw new InvalidDataException("A SACD area has no track count.");
             var trackCount = int.Parse(trackCountText, CultureInfo.InvariantCulture);
+            if (trackCount <= 0) throw new InvalidDataException("A SACD area has no playable tracks.");
             var totalPlayTime = MatchValue(block, "^\\s*Total play time:\\s*(?<value>[^\\r\\n]+)") ?? string.Empty;
             var titles = Matches(block, "^\\s*Title\\[(?<index>\\d+)\\]:\\s*(?<value>.*?)\\s*$").ToDictionary(match => int.Parse(match.Groups["index"].Value, CultureInfo.InvariantCulture), match => match.Groups["value"].Value.Trim());
             var performers = Matches(block, "^\\s*Performer\\[(?<index>\\d+)\\]:\\s*(?<value>.*?)\\s*$").ToDictionary(match => int.Parse(match.Groups["index"].Value, CultureInfo.InvariantCulture), match => match.Groups["value"].Value.Trim());
             var durations = Matches(block, "^\\s*Duration:\\s*(?<value>\\d+:\\d+:\\d+)").Select(match => ParseTimeCode(match.Groups["value"].Value)).ToArray();
-            var isrcs = Matches(block, "^\\s*ISRC Track \\[(?<index>\\d+)\\]:\\s*\\r?\\n\\s*Country:\\s*(?<country>[^,]+),\\s*Owner:\\s*(?<owner>[^,]+),\\s*Year:\\s*(?<year>[^,]+),\\s*Designation:\\s*(?<designation>\\S+)")
-                .ToDictionary(match => int.Parse(match.Groups["index"].Value, CultureInfo.InvariantCulture), match => string.Concat(match.Groups["country"].Value, match.Groups["owner"].Value, match.Groups["year"].Value, match.Groups["designation"].Value).Replace(" ", string.Empty));
+            var isrcs = ParseIsrcs(block);
             if (titles.Count != trackCount || durations.Length != trackCount)
                 throw new InvalidDataException($"The SACD area lists {trackCount} tracks but its title/duration table is incomplete.");
-            var tracks = Enumerable.Range(0, trackCount).Select(index => new SacdTrack(index + 1, titles[index], performers.GetValueOrDefault(index, albumArtist), durations[index], isrcs.GetValueOrDefault(index))).ToArray();
+            var titleIndexes = titles.Keys.OrderBy(index => index).ToArray();
+            var firstTitleIndex = titleIndexes[0];
+            if (firstTitleIndex is not 0 and not 1 ||
+                !titleIndexes.SequenceEqual(Enumerable.Range(firstTitleIndex, trackCount)))
+                throw new InvalidDataException($"The SACD area has unsupported or noncontiguous title indexes: {string.Join(", ", titleIndexes)}.");
+            var tracks = titleIndexes.Select((sourceIndex, trackIndex) => new SacdTrack(
+                trackIndex + 1,
+                titles[sourceIndex],
+                performers.GetValueOrDefault(sourceIndex, albumArtist),
+                durations[trackIndex],
+                isrcs.GetValueOrDefault(sourceIndex))).ToArray();
             areas.Add(new(speakerConfig.Contains("2 Channel", StringComparison.OrdinalIgnoreCase), speakerConfig, totalPlayTime, tracks));
         }
         return new(albumTitle, albumArtist, catalog?.Trim(), creationDate, areas);
+    }
+
+    private static IReadOnlyDictionary<int, string> ParseIsrcs(string block)
+    {
+        var values = new Dictionary<int, string>();
+        foreach (var match in Matches(block, "^\\s*ISRC Track \\[(?<index>\\d+)\\]:\\s*\\r?\\n\\s*Country:\\s*(?<country>[^,]+),\\s*Owner:\\s*(?<owner>[^,]+),\\s*Year:\\s*(?<year>[^,]+),\\s*Designation:\\s*(?<designation>\\S+)"))
+        {
+            var index = int.Parse(match.Groups["index"].Value, CultureInfo.InvariantCulture);
+            values[index] = string.Concat(
+                match.Groups["country"].Value,
+                match.Groups["owner"].Value,
+                match.Groups["year"].Value,
+                match.Groups["designation"].Value).Replace(" ", string.Empty);
+        }
+        foreach (var match in Matches(block, "^\\s*ISRC\\[(?<index>\\d+)\\]:\\s*(?<value>[A-Z0-9]{12})(?:\\s|$)"))
+        {
+            var index = int.Parse(match.Groups["index"].Value, CultureInfo.InvariantCulture);
+            values[index] = match.Groups["value"].Value;
+        }
+        return values;
     }
 
     private static IReadOnlyList<string> FindDsfFiles(string root) => Directory.EnumerateFiles(root, "*.dsf", SearchOption.AllDirectories)

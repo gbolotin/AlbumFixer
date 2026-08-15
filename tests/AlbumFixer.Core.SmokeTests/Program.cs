@@ -16,6 +16,10 @@ try
     await ScannerAcceptsMultipleImagesInOneAlbumFolder(root);
     await ScannerRecognizesAndCleansIncompletePreviousOutput(root);
     await ScannerSkipsCompletedAlbumsWithDeletedSources(root);
+    await ScannerRejectsMissingSourceFallbackCompletion(root);
+    await ScannerRecoversRetainedEquivalentFlacAfterCanceledFallback(root);
+    await ScannerRecoversCompletedSacdAfterCanceledFallback(root);
+    await AlbumTransactionLockSerializesOwners(root);
     BatchPreflightSkipsBlockedAlbums();
     await BoundedBatchRunsConcurrentlyAndIsolatesFailures();
     PipelineLimitsScaleWithHardwareAndCapacity();
@@ -33,7 +37,9 @@ try
     await HostCommitsIncompleteFlacWithoutArtwork(root);
     await HostCommitFailureRetainsSource(root);
     await FailureCleanupRemovesLocalAndDestinationStages(root);
+    SacdLayoutParserSupportsToolIndexConventions();
     await FailureReportIsAlwaysWritten(root);
+    await FailureReportPreservesCompletedReport(root);
     await MetadataHandoffIsConditional(root);
     await ExternalMetadataResolvesExactSacdRelease();
     await ExternalMetadataUsesAppleGenreFallback();
@@ -189,8 +195,12 @@ static async Task ScannerSkipsCompletedAlbumsWithDeletedSources(string root)
     var batch = Path.Combine(root, "completed-album-batch");
     var completed = Path.Combine(batch, "Completed Album");
     var pending = Path.Combine(batch, "Pending Album");
+    var pendingTwo = Path.Combine(batch, "Pending Album 2");
+    var pendingThree = Path.Combine(batch, "Pending Album 3");
     Directory.CreateDirectory(completed);
     Directory.CreateDirectory(pending);
+    Directory.CreateDirectory(pendingTwo);
+    Directory.CreateDirectory(pendingThree);
 
     await File.WriteAllBytesAsync(Path.Combine(completed, "01.flac"), [1, 2, 3]);
     await File.WriteAllBytesAsync(Path.Combine(completed, "02.flac"), [4, 5, 6]);
@@ -198,7 +208,7 @@ static async Task ScannerSkipsCompletedAlbumsWithDeletedSources(string root)
     await File.WriteAllTextAsync(Path.Combine(completed, "conversion-report.json"), """
     {
       "workflow_mode": "flac_cue_split",
-      "discs": [{ "tracks": [{ "file": "01.flac" }, { "file": "02.flac" }] }],
+      "discs": [{ "source": "album.flac", "tracks": [{ "file": "01.flac" }, { "file": "02.flac" }] }],
       "verification": { "status": "passed", "sources_deleted": true },
       "commit": { "status": "completed" },
       "deletion": { "status": "completed", "performed": true }
@@ -207,6 +217,10 @@ static async Task ScannerSkipsCompletedAlbumsWithDeletedSources(string root)
 
     await File.WriteAllBytesAsync(Path.Combine(pending, "album.flac"), [7, 8, 9]);
     await File.WriteAllTextAsync(Path.Combine(pending, "album.cue"), "FILE \"album.flac\" WAVE");
+    await File.WriteAllBytesAsync(Path.Combine(pendingTwo, "album.flac"), [10, 11, 12]);
+    await File.WriteAllTextAsync(Path.Combine(pendingTwo, "album.cue"), "FILE \"album.flac\" WAVE");
+    await File.WriteAllBytesAsync(Path.Combine(pendingThree, "album.flac"), [13, 14, 15]);
+    await File.WriteAllTextAsync(Path.Combine(pendingThree, "album.cue"), "FILE \"album.flac\" WAVE");
 
     var completedScan = await new AlbumScanner().ScanAsync(completed);
     Assert(completedScan.Mode == WorkflowMode.Completed && !completedScan.RequiresProcessing,
@@ -236,13 +250,34 @@ static async Task ScannerSkipsCompletedAlbumsWithDeletedSources(string root)
     Assert(completedSacdScan.Media.Count(item => item.Kind == "Previous Album Fixer output") == 2 && completedSacdScan.TrackCount == 0,
         "Report-proven DSF outputs must not be misclassified as an existing-track repair job.");
 
+    var retained = Path.Combine(batch, "Completed With Retained Source");
+    Directory.CreateDirectory(retained);
+    await File.WriteAllBytesAsync(Path.Combine(retained, "album.flac"), [17, 18, 19]);
+    await File.WriteAllTextAsync(Path.Combine(retained, "album.cue"), "FILE \"album.flac\" WAVE");
+    await File.WriteAllBytesAsync(Path.Combine(retained, "01.flac"), [20, 21]);
+    await File.WriteAllBytesAsync(Path.Combine(retained, "02.flac"), [22, 23]);
+    await File.WriteAllTextAsync(Path.Combine(retained, "conversion-report.json"), """
+    {
+      "workflow_mode": "flac_cue_split",
+      "discs": [{ "source": "album.flac", "tracks": [{ "file": "01.flac" }, { "file": "02.flac" }] }],
+      "verification": { "status": "passed", "sources_deleted": false },
+      "commit": { "status": "completed" },
+      "deletion": { "status": "retained", "performed": false }
+    }
+    """);
+    var retainedScan = await new AlbumScanner().ScanAsync(retained);
+    Assert(retainedScan.Mode == WorkflowMode.Completed && File.Exists(Path.Combine(retained, "album.flac")),
+        "A verified completed album must be skipped even when its source was intentionally retained.");
+
     var batchScan = await new AlbumScanner().ScanAsync(batch);
     Assert(batchScan.Mode == WorkflowMode.MultipleAlbums,
         "A completed album and a pending sibling must remain independently discoverable.");
     var discovered = await new AlbumScanner().ScanAlbumsAsync(batch);
     var pendingScans = discovered.Where(scan => scan.RequiresProcessing).ToArray();
-    Assert(discovered.Count == 3 && pendingScans.Length == 1 && pendingScans[0].AlbumRoot == pending,
-        "Completed albums must be omitted from the pending set before preflight.");
+    Assert(discovered.Count == 6 && pendingScans.Length == 3 &&
+           pendingScans.Select(scan => scan.AlbumRoot).ToHashSet(StringComparer.OrdinalIgnoreCase)
+               .SetEquals([pending, pendingTwo, pendingThree]),
+        "A mixed six-folder batch must expose exactly its three pending albums before preflight.");
 
     var unsafeCompleted = Path.Combine(root, "completed-report-with-unexpected-missing-source");
     Directory.CreateDirectory(unsafeCompleted);
@@ -259,6 +294,258 @@ static async Task ScannerSkipsCompletedAlbumsWithDeletedSources(string root)
     var unsafeScan = await new AlbumScanner().ScanAsync(unsafeCompleted);
     Assert(unsafeScan.Mode != WorkflowMode.Completed && unsafeScan.Errors.Any(error => error.Contains("missing source", StringComparison.OrdinalIgnoreCase)),
         "A missing source must remain a blocker unless the completed report confirms intentional deletion.");
+}
+
+static async Task AlbumTransactionLockSerializesOwners(string root)
+{
+    var folder = Path.Combine(root, "album-transaction-lock");
+    Directory.CreateDirectory(folder);
+    await using (var first = await AlbumTransactionLock.AcquireAsync(folder))
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(400));
+        Exception? blocked = null;
+        try { await using var second = await AlbumTransactionLock.AcquireAsync(folder, cancellation.Token); }
+        catch (Exception error) { blocked = error; }
+        Assert(blocked is OperationCanceledException,
+            "A second transaction must wait while another process owns the album lock.");
+    }
+
+    await using var acquiredAfterRelease = await AlbumTransactionLock.AcquireAsync(folder);
+    Assert(File.Exists(Path.Combine(folder, AlbumTransactionLock.FileName)),
+        "The released album lock must be reusable by the next transaction.");
+}
+
+static async Task ScannerRejectsMissingSourceFallbackCompletion(string root)
+{
+    var tools = await new PreflightService().FindToolsAsync();
+    if (tools["ffmpeg"] is not { } ffmpeg) return;
+    var folder = Path.Combine(root, "recover-stale-fallback");
+    Directory.CreateDirectory(folder);
+    var cover = Path.Combine(folder, "cover.jpg");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=blue:s=64x64",
+        "-frames:v", "1", "-update", "1", cover);
+    for (var number = 1; number <= 2; number++)
+    {
+        var track = Path.Combine(folder, $"{number:00} - Track {number}.flac");
+        await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", $"sine=frequency={400 + number * 100}:duration=0.1", "-i", cover,
+            "-map", "0:a:0", "-map", "1:v:0", "-c:a", "flac", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic",
+            "-metadata", $"TITLE=Track {number}", "-metadata", "ALBUM=Recovered Album", "-metadata", "ARTIST=Tester", "-metadata", "ALBUMARTIST=Tester",
+            "-metadata", $"TRACKNUMBER={number}/2", "-metadata", "DISCNUMBER=1/1", "-metadata", "DATE=2026", "-metadata", "GENRE=Rock", track);
+    }
+    await File.WriteAllTextAsync(Path.Combine(folder, "album.cue"), """
+    FILE "album.flac" WAVE
+      TRACK 01 AUDIO
+        TITLE "Track 1"
+        INDEX 01 00:00:00
+      TRACK 02 AUDIO
+        TITLE "Track 2"
+        INDEX 01 00:00:01
+    """);
+    var missingSource = Path.Combine(folder, "album.flac");
+    await File.WriteAllTextAsync(Path.Combine(folder, "conversion-report.json"), $$"""
+    {
+      "workflow_mode": "FlacCueSplit",
+      "generated_by": "Album Fixer host fallback",
+      "sources": [{ "path": "album.flac", "type": "FLAC image", "size": 12345 }],
+      "pipeline": { "status": "failed", "stopped_phase": "Inventoried", "detail": "Could not find file '{{missingSource.Replace("\\", "\\\\")}}'." },
+      "discs": [],
+      "verification": { "status": "failed", "sources_deleted": false },
+      "commit": { "status": "not_completed" },
+      "deletion": { "performed": false }
+    }
+    """);
+
+    var rejected = await new AlbumScanner().ScanAsync(folder);
+    Assert(rejected.Mode != WorkflowMode.Completed && rejected.RequiresProcessing &&
+           rejected.Errors.Any(error => error.Contains("missing source", StringComparison.OrdinalIgnoreCase)),
+        "A fallback report must fail closed when the source image is absent and output equivalence cannot be recomputed.");
+
+    File.Copy(Path.Combine(folder, "02 - Track 2.flac"), Path.Combine(folder, "03 - Unexpected.flac"));
+    var unsafeRecovery = await new AlbumScanner().ScanAsync(folder);
+    Assert(unsafeRecovery.Mode != WorkflowMode.Completed && unsafeRecovery.Errors.Any(error => error.Contains("missing source", StringComparison.OrdinalIgnoreCase)),
+        "Recovery must fail closed when an unexpected or incomplete track set is present.");
+}
+
+static async Task ScannerRecoversRetainedEquivalentFlacAfterCanceledFallback(string root)
+{
+    var tools = await new PreflightService().FindToolsAsync();
+    if (tools["ffmpeg"] is not { } ffmpeg) return;
+    var folder = Path.Combine(root, "recover-retained-flac");
+    Directory.CreateDirectory(folder);
+    var cover = Path.Combine(folder, "cover.jpg");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=green:s=64x64",
+        "-frames:v", "1", "-update", "1", cover);
+    var tracks = new List<string>();
+    for (var number = 1; number <= 2; number++)
+    {
+        var track = Path.Combine(folder, $"{number:00} - Track {number}.flac");
+        tracks.Add(track);
+        await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", $"sine=frequency={500 + number * 100}:duration=0.08", "-i", cover,
+            "-map", "0:a:0", "-map", "1:v:0", "-c:a", "flac", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic",
+            "-metadata", $"TITLE=Track {number}", "-metadata", "ALBUM=Retained Album", "-metadata", "ARTIST=Tester", "-metadata", "ALBUMARTIST=Tester",
+            "-metadata", $"TRACKNUMBER={number}/2", "-metadata", "DISCNUMBER=1/1", "-metadata", "DATE=2026", "-metadata", "GENRE=Rock", track);
+    }
+    var source = Path.Combine(folder, "album.flac");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-i", tracks[0], "-i", tracks[1],
+        "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a]", "-map", "[a]", "-c:a", "flac", source);
+    var cuePath = Path.Combine(folder, "album.cue");
+    const string cue = """
+    FILE "album.flac" WAVE
+      TRACK 01 AUDIO
+        TITLE "Track 1"
+        INDEX 01 00:00:00
+      TRACK 02 AUDIO
+        TITLE "Track 2"
+        INDEX 01 00:00:06
+    """;
+    await File.WriteAllTextAsync(cuePath, cue);
+    var reportPath = Path.Combine(folder, "conversion-report.json");
+    var report = $$"""
+    {
+      "workflow_mode": "FlacCueSplit",
+      "generated_by": "Album Fixer host fallback",
+      "sources": [{ "path": "album.flac", "type": "FLAC image", "size": {{new FileInfo(source).Length}} }],
+      "pipeline": { "status": "canceled", "stopped_phase": "CopyingIn", "detail": "A task was canceled." },
+      "discs": [],
+      "verification": { "status": "canceled", "sources_deleted": false },
+      "commit": { "status": "not_completed" },
+      "deletion": { "performed": false }
+    }
+    """;
+    await File.WriteAllTextAsync(reportPath, report);
+
+    var recovered = await new AlbumScanner().ScanAsync(folder);
+    Assert(recovered.Mode == WorkflowMode.Completed &&
+           recovered.Warnings.Any(warning => warning.Contains("CUE boundaries", StringComparison.OrdinalIgnoreCase)),
+        "A retained FLAC image must be skipped only after per-track decoded PCM equality at the current CUE boundaries is recomputed.");
+
+    await File.WriteAllTextAsync(cuePath, cue.Replace("00:00:06", "00:00:03", StringComparison.Ordinal));
+    var wrongBoundary = await new AlbumScanner().ScanAsync(folder);
+    Assert(wrongBoundary.Mode != WorkflowMode.Completed,
+        "Concatenated PCM equality must not recover tracks whose individual boundaries disagree with the CUE.");
+    await File.WriteAllTextAsync(cuePath, cue);
+    await File.WriteAllTextAsync(reportPath, report);
+
+    await RunToolAsync(ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=990:duration=0.1", "-i", cover,
+        "-map", "0:a:0", "-map", "1:v:0", "-c:a", "flac", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic",
+        "-metadata", "TITLE=Track 2", "-metadata", "ALBUM=Retained Album", "-metadata", "ARTIST=Tester", "-metadata", "ALBUMARTIST=Tester",
+        "-metadata", "TRACKNUMBER=2/2", "-metadata", "DISCNUMBER=1/1", "-metadata", "DATE=2026", "-metadata", "GENRE=Rock", tracks[1]);
+    await File.WriteAllTextAsync(reportPath, report);
+    var mismatched = await new AlbumScanner().ScanAsync(folder);
+    Assert(mismatched.Mode != WorkflowMode.Completed,
+        "A retained FLAC image must fail closed when the ordered tracks no longer reconstruct its decoded PCM exactly.");
+}
+
+static async Task ScannerRecoversCompletedSacdAfterCanceledFallback(string root)
+{
+    var folder = Path.Combine(root, "recover-completed-sacd");
+    var stereo = Path.Combine(folder, "Stereo");
+    Directory.CreateDirectory(stereo);
+    CreateTaggedDsfFixture(Path.Combine(stereo, "01 - First.dsf"), "First", 1, 2, 0x55);
+    CreateTaggedDsfFixture(Path.Combine(stereo, "02 - Second.dsf"), "Second", 2, 2, 0xAA);
+    const long sourceSize = 123456;
+    await File.WriteAllTextAsync(Path.Combine(folder, "album.md5"), "0123456789abcdef0123456789abcdef *album.iso");
+    await File.WriteAllTextAsync(Path.Combine(folder, "sacd_extract-layout.txt"), $$"""
+    The size of sacd is ok
+    Size is: {{sourceSize}} bytes
+    Area count: 1
+    Area Information [0]:
+      Track Count: 2
+      Speaker config: 2 Channel
+      Track list of area[0]:
+        Title[1]: First
+        Title[2]: Second
+    """);
+    var successfulLog = """
+    Processed 100 audioframes. Duration specified: 100 (00:01:25 [mins:secs:frames])
+    Processed 200 audioframes. Duration specified: 200 (00:02:50 [mins:secs:frames])
+    We are done exporting DSF...
+    Program terminates!
+    """;
+    var primaryLog = Path.Combine(folder, "sacd_extract-stereo.log");
+    var independentLog = Path.Combine(folder, "sacd_extract-stereo-independent.log");
+    await File.WriteAllTextAsync(primaryLog, successfulLog);
+    await File.WriteAllTextAsync(independentLog, successfulLog);
+    var reportPath = Path.Combine(folder, "conversion-report.json");
+    var report = $$"""
+    {
+      "workflow_mode": "DsdExtraction",
+      "generated_by": "Album Fixer host fallback",
+      "sources": [{ "path": "album.iso", "type": "SACD / DSD image", "size": {{sourceSize}} }],
+      "pipeline": { "status": "canceled", "stopped_phase": "Inventoried", "detail": "The operation was canceled." },
+      "discs": [],
+      "verification": { "status": "canceled", "sources_deleted": false },
+      "commit": { "status": "not_completed" },
+      "deletion": { "performed": false }
+    }
+    """;
+    await File.WriteAllTextAsync(reportPath, report);
+
+    var recovered = await new AlbumScanner().ScanAsync(folder);
+    Assert(recovered.Mode == WorkflowMode.Completed && recovered.TrackCount == 0 &&
+           recovered.Media.Count(item => item.Kind == "Previous Album Fixer output") == 2 &&
+           recovered.Warnings.Any(warning => warning.Contains("independent extraction", StringComparison.OrdinalIgnoreCase)),
+        "A completed SACD extraction with a deleted ISO must be recovered from exact layout, dual-log, DSF, tag, and artwork evidence.");
+
+    await File.WriteAllTextAsync(independentLog, successfulLog.Replace("Processed 200", "Processed 201", StringComparison.Ordinal));
+    await File.WriteAllTextAsync(reportPath, report);
+    var mismatched = await new AlbumScanner().ScanAsync(folder);
+    Assert(mismatched.Mode != WorkflowMode.Completed,
+        "SACD fallback recovery must fail closed when primary and independent extraction frame evidence differs.");
+}
+
+static void CreateTaggedDsfFixture(string path, string title, uint track, uint trackCount, byte sample)
+{
+    const uint channels = 2;
+    const uint sampleRate = 2_822_400;
+    const uint blockSize = 4096;
+    const ulong sampleCount = blockSize * 8;
+    using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+    using (var writer = new BinaryWriter(stream, System.Text.Encoding.ASCII, leaveOpen: true))
+    {
+        writer.Write(System.Text.Encoding.ASCII.GetBytes("DSD "));
+        writer.Write((ulong)28);
+        writer.Write((ulong)0);
+        writer.Write((ulong)0);
+        writer.Write(System.Text.Encoding.ASCII.GetBytes("fmt "));
+        writer.Write((ulong)52);
+        writer.Write((uint)1);
+        writer.Write((uint)0);
+        writer.Write((uint)2);
+        writer.Write(channels);
+        writer.Write(sampleRate);
+        writer.Write((uint)1);
+        writer.Write(sampleCount);
+        writer.Write(blockSize);
+        writer.Write((uint)0);
+        writer.Write(System.Text.Encoding.ASCII.GetBytes("data"));
+        writer.Write((ulong)(12 + channels * blockSize));
+        writer.Write(Enumerable.Repeat(sample, checked((int)(channels * blockSize))).ToArray());
+        writer.Flush();
+        stream.Position = 12;
+        writer.Write((ulong)stream.Length);
+    }
+    using var file = TagLib.File.Create(path);
+    file.Tag.Title = title;
+    file.Tag.Album = "Recovered SACD";
+    file.Tag.Performers = ["Tester"];
+    file.Tag.AlbumArtists = ["Tester"];
+    file.Tag.Track = track;
+    file.Tag.TrackCount = trackCount;
+    file.Tag.Disc = 1;
+    file.Tag.DiscCount = 1;
+    file.Tag.Year = 2026;
+    file.Tag.Genres = ["Rock"];
+    file.Tag.Pictures =
+    [
+        new TagLib.Picture(new TagLib.ByteVector([0xFF, 0xD8, 0xFF, 0xD9]))
+        {
+            Type = TagLib.PictureType.FrontCover,
+            MimeType = "image/jpeg",
+            Description = "Front cover"
+        }
+    ];
+    file.Save();
 }
 
 static void BatchPreflightSkipsBlockedAlbums()
@@ -1034,6 +1321,62 @@ static async Task FailureCleanupRemovesLocalAndDestinationStages(string root)
     Assert(File.Exists(source), "Failure cleanup must retain the original source.");
 }
 
+static void SacdLayoutParserSupportsToolIndexConventions()
+{
+    const string currentOutput = """
+    Album Information:
+        Album Catalog Number: UIGY-9519
+        Title: Communique
+        Artist: Dire Straits
+    Disc Information:
+        Creation date: 2011-12-15
+    Area count: 1
+        Area Information [0]:
+        Track Count: 2
+        Total play time: 09:36:48 [mins:secs:frames]
+        Speaker config: 2 Channel
+        Title[1]: Once Upon A Time In The West
+        Performer[1]: Dire Straits
+        ISRC[1]: GBF087900658 (country:GB, owner:F08, year:79, designation:00658)
+        Duration: 05:24:40 [mins:secs:frames]
+        Title[2]: News
+        Performer[2]: Dire Straits
+        ISRC[2]: GBF087900659 (country:GB, owner:F08, year:79, designation:00659)
+        Duration: 04:12:08 [mins:secs:frames]
+    """;
+    var current = LocalDsdProcessor.ParseLayout(currentOutput);
+    Assert(current.CatalogNumber == "UIGY-9519" && current.Areas.Count == 1 && current.Areas[0].Tracks.Count == 2,
+        "The current sacd_extract one-based layout must parse as one two-track area.");
+    Assert(current.Areas[0].Tracks[0].Number == 1 && current.Areas[0].Tracks[0].Title == "Once Upon A Time In The West" &&
+           current.Areas[0].Tracks[0].Isrc == "GBF087900658" && current.Areas[0].Tracks[1].Isrc == "GBF087900659",
+        "One-based SACD titles, performers, and current-format ISRC values must retain their track association.");
+
+    const string legacyOutput = """
+    Title: Legacy Album
+    Artist: Legacy Artist
+    Area Information [0]:
+    Track Count: 1
+    Total play time: 03:00:00 [mins:secs:frames]
+    Speaker config: 2 Channel
+    Title[0]: Legacy Track
+    Performer[0]: Legacy Performer
+    ISRC Track [0]:
+        Country: GB, Owner: ABC, Year: 79, Designation: 00001
+    Duration: 03:00:00 [mins:secs:frames]
+    """;
+    var legacy = LocalDsdProcessor.ParseLayout(legacyOutput);
+    Assert(legacy.Areas[0].Tracks[0].Title == "Legacy Track" &&
+           legacy.Areas[0].Tracks[0].Performer == "Legacy Performer" &&
+           legacy.Areas[0].Tracks[0].Isrc == "GBABC7900001",
+        "Legacy zero-based title indexes and multiline ISRC values must remain supported.");
+
+    Exception? invalidIndexes = null;
+    try { LocalDsdProcessor.ParseLayout(currentOutput.Replace("Title[2]", "Title[3]", StringComparison.Ordinal)); }
+    catch (Exception error) { invalidIndexes = error; }
+    Assert(invalidIndexes is InvalidDataException && invalidIndexes.Message.Contains("noncontiguous", StringComparison.OrdinalIgnoreCase),
+        "A gapped SACD title table must produce a clear validation error instead of a dictionary exception.");
+}
+
 static async Task RunToolAsync(string tool, params string[] arguments)
 {
     var info = new ProcessStartInfo(tool) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
@@ -1057,9 +1400,44 @@ static async Task FailureReportIsAlwaysWritten(string root)
     var report = await ReportReader.LoadAsync(path);
     Assert(report.Status == "failed" && !report.Deleted && report.Errors.Count == 1, "Failure report status or retention state is wrong.");
     using var document = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(path));
+    Assert(document.RootElement.GetProperty("workflow_mode").GetString() == "flac_cue_split",
+        "Fallback reports must use the same canonical workflow identifier as completion readers.");
     Assert(document.RootElement.GetProperty("job").GetProperty("staging_preserved").GetBoolean() == false &&
            document.RootElement.GetProperty("job").GetProperty("cleanup_policy").GetString() == "always_remove_after_terminal_report",
         "A terminal failure report must require transient cleanup instead of promising a preserved Temp job.");
+}
+
+static async Task FailureReportPreservesCompletedReport(string root)
+{
+    var folder = Path.Combine(root, "completed-report-preservation");
+    Directory.CreateDirectory(folder);
+    await File.WriteAllBytesAsync(Path.Combine(folder, "01.flac"), [1, 2, 3]);
+    var canonicalPath = Path.Combine(folder, "conversion-report.json");
+    const string canonical = """
+    {
+      "workflow_mode": "flac_cue_split",
+      "discs": [{ "tracks": [{ "file": "01.flac" }] }],
+      "verification": { "status": "passed", "sources_deleted": false },
+      "commit": { "status": "completed", "files": [{ "file": "01.flac", "size": 3 }] },
+      "deletion": { "status": "retained", "performed": false }
+    }
+    """;
+    await File.WriteAllTextAsync(canonicalPath, canonical);
+    var scan = new ScanResult(folder, "Completed report preservation", WorkflowMode.FlacCueSplit,
+        [], [], [], 0, 0, 0, 0, true, false);
+    var tools = new Dictionary<string, string?> { ["ffmpeg"] = "ffmpeg.exe", ["ffprobe"] = "ffprobe.exe", ["sacd_extract"] = null };
+    var preflight = new PreflightResult([], Path.GetTempPath(), 0, long.MaxValue, tools);
+    var failurePath = await HostReportWriter.EnsureTerminalReportAsync(scan, preflight,
+        Path.Combine(root, "completed-report-preservation-job"), "failed", JobPhase.Inventoried, 1, "A stale attempt failed.");
+
+    Assert(await File.ReadAllTextAsync(canonicalPath) == canonical,
+        "A later failed attempt must never overwrite a completed canonical report.");
+    Assert(!failurePath.Equals(canonicalPath, StringComparison.OrdinalIgnoreCase) &&
+           Path.GetFileName(failurePath).StartsWith("conversion-report.failed-", StringComparison.OrdinalIgnoreCase),
+        "A failure after completion must be written as a separate timestamped report.");
+    var completedScan = await new AlbumScanner().ScanAsync(folder);
+    Assert(completedScan.Mode == WorkflowMode.Completed && !completedScan.RequiresProcessing,
+        "A preserved completed report must keep the album out of the candidate list.");
 }
 
 static async Task MetadataHandoffIsConditional(string root)

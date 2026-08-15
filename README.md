@@ -55,7 +55,7 @@ The WPF application uses MVVM. `MainViewModel` owns presentation state and expos
 ## Build and test
 
 ```powershell
-dotnet build AlbumFixer.release.slnx -c Release
+dotnet build AlbumFixer.slnx -c Release
 dotnet run --project tests\AlbumFixer.Core.SmokeTests\AlbumFixer.Core.SmokeTests.csproj -c Release
 ```
 
