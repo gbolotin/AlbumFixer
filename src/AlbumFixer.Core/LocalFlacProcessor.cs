@@ -262,7 +262,27 @@ public sealed class LocalFlacProcessor
         var date = Nonempty(cue.Date) ?? (year.Success ? year.Groups["year"].Value : null);
         var folderGenre = LibraryFolderMetadata.InferGenre(scan.AlbumRoot);
         var genre = Nonempty(cue.Genre) ?? folderGenre;
-        return new(album, artist, date, genre, Nonempty(cue.Composer), cue.Genre is null && folderGenre is not null);
+        var sheetComposer = Nonempty(cue.Composer);
+        if (sheetComposer is null)
+        {
+            var inferred = LocalTrackRepairProcessor.InferClassicalTrackComposers(
+                album, scan.AlbumName, genre,
+                cue.Tracks.Select(track => (track.Title, track.Title ?? string.Empty)).ToArray(),
+                ClassicalMetadataPolicy.IsCompilationArtist(artist));
+            for (var index = 0; index < cue.Tracks.Count; index++)
+                if (Nonempty(cue.Tracks[index].Composer) is null && Nonempty(inferred[index]) is { } composer)
+                    cue.Tracks[index].Composer = composer;
+            var distinct = cue.Tracks
+                .Where(track => ClassicalMetadataPolicy.RequiresComposer(
+                    genre, track.Title, ClassicalMetadataPolicy.IsCompilationArtist(artist)))
+                .Select(track => Nonempty(track.Composer))
+                .Where(value => value is not null)
+                .Select(value => value!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (distinct.Length == 1) sheetComposer = distinct[0];
+        }
+        return new(album, artist, date, genre, sheetComposer, cue.Genre is null && folderGenre is not null);
     }
 
     private static string CleanAlbumName(string name)
@@ -381,8 +401,11 @@ public sealed class LocalFlacProcessor
         if (Nonempty(metadata.AlbumArtist) is null) missing.Add("ALBUMARTIST");
         if (Nonempty(metadata.Date) is null) missing.Add("DATE");
         if (Nonempty(metadata.Genre) is null) missing.Add("GENRE");
-        if ((metadata.Genre?.Contains("classical", StringComparison.OrdinalIgnoreCase) == true || metadata.Genre?.Contains("opera", StringComparison.OrdinalIgnoreCase) == true) &&
-            tracks.Any(track => Nonempty(track.Composer) is null && Nonempty(metadata.Composer) is null)) missing.Add("COMPOSER");
+        if (tracks.Any(track => ClassicalMetadataPolicy.RequiresComposer(
+                                    metadata.Genre, track.Title,
+                                    ClassicalMetadataPolicy.IsCompilationArtist(metadata.AlbumArtist)) &&
+                                Nonempty(track.Composer) is null && Nonempty(metadata.Composer) is null))
+            missing.Add("COMPOSER");
         if (!hasCover) missing.Add("COVER");
         return missing.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }

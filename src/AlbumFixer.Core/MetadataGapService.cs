@@ -6,7 +6,20 @@ public sealed record MetadataGapResult(
     bool SplitCompleted,
     bool RequiresResearch,
     IReadOnlyList<string> MissingFields,
-    IReadOnlyList<string> LocalEvidence);
+    IReadOnlyList<string> LocalEvidence)
+{
+    public IReadOnlyList<string> LookupWarnings { get; init; } = [];
+}
+
+public sealed class MetadataResolutionException : InvalidOperationException
+{
+    public MetadataResolutionException(string message, IReadOnlyList<string> diagnostics) : base(message)
+    {
+        Diagnostics = diagnostics ?? [];
+    }
+
+    public IReadOnlyList<string> Diagnostics { get; }
+}
 
 public static class MetadataFieldPolicy
 {

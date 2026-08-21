@@ -54,7 +54,7 @@ public sealed partial class LocalDsdProcessor
         var layoutOutput = await RunProcessAsync(staged.SacdExtractPath, ["-P", "-i", iso], workingDirectory, null, token);
         var layoutPath = Path.Combine(staged.AlbumRoot, "sacd_extract-layout.txt");
         await File.WriteAllTextAsync(layoutPath, layoutOutput, new UTF8Encoding(false), token);
-        var structuralLayout = ParseLayout(layoutOutput);
+        var structuralLayout = ApplyFolderCatalog(ParseLayout(layoutOutput), scan.AlbumName);
         if (structuralLayout.Areas.Count == 0) throw new InvalidDataException("sacd_extract reported no playable SACD areas.");
 
         var years = ResolveYears(scan.AlbumName, structuralLayout.CreationDate);
@@ -66,6 +66,7 @@ public sealed partial class LocalDsdProcessor
         if (Nonempty(structuralLayout.CatalogNumber) is { } catalogNumber)
             catalogIdentity = await _externalMetadata.ResolveIdentityByCatalogAsync(
                 catalogNumber, trackCount, years.Edition, requireSacd: true, token);
+        catalogIdentity = ReconcileCatalogIdentity(structuralLayout, catalogIdentity);
         var identifiedLayout = ApplyAlbumIdentity(structuralLayout, localIdentity, catalogIdentity);
         if (string.IsNullOrWhiteSpace(identifiedLayout.AlbumTitle) || string.IsNullOrWhiteSpace(identifiedLayout.AlbumArtist))
             throw new InvalidDataException(
@@ -100,7 +101,7 @@ public sealed partial class LocalDsdProcessor
         var requiredMetadataIncomplete = requiredMissingMetadata.Count > 0;
         var coverReleaseId = external.MusicBrainzReleaseId ?? catalogIdentity?.MusicBrainzReleaseId;
         var preparedCover = await new InMemoryArtworkService().PrepareLocalThenExternalAsync(
-            staged.InputAlbumRoot,
+            DsdArtworkRoot(scan.AlbumRoot),
             staged.FfmpegPath,
             staged.FfprobePath,
             ArtworkSelectionMode.Dsd,
@@ -312,6 +313,13 @@ public sealed partial class LocalDsdProcessor
         await WriteGapManifestAsync(staged.JobDirectory, metadata.MissingFields, evidence, token);
         progress.Report(Snapshot(JobPhase.Tagging, 48, $"SACD extraction and deletion-grade local verification completed for {totalTracks} tracks."));
         return new(totalTracks, reportPath, new MetadataGapResult(true, metadata.MissingFields.Count > 0, metadata.MissingFields, evidence));
+    }
+
+    private static string DsdArtworkRoot(string albumRoot)
+    {
+        var root = Path.GetFullPath(albumRoot);
+        if (!Path.GetFileName(root).Equals("ISO", StringComparison.OrdinalIgnoreCase)) return root;
+        return Directory.GetParent(root)?.FullName ?? root;
     }
 
     internal static async Task<long> DsfPayloadLengthAsync(string path, CancellationToken token = default)
@@ -561,20 +569,16 @@ public sealed partial class LocalDsdProcessor
         SacdLocalIdentity local,
         ExternalAlbumIdentity? catalogIdentity)
     {
-        if (catalogIdentity is not null &&
-            ((Nonempty(layout.AlbumTitle) is { } discTitle && !IdentityEquivalent(catalogIdentity.Album, discTitle)) ||
-             (Nonempty(layout.AlbumArtist) is { } discArtist && !IdentityEquivalent(catalogIdentity.Artist, discArtist))))
-            throw new InvalidDataException(
-                "The exact catalog-number match disagrees with SACD disc text; automatic release identification is ambiguous.");
+        catalogIdentity = ReconcileCatalogIdentity(layout, catalogIdentity);
         if (catalogIdentity is not null && local.ChecksumArtist is not null && local.ChecksumAlbum is not null &&
-            (!IdentityEquivalent(catalogIdentity.Artist, local.ChecksumArtist) ||
-             !IdentityEquivalent(catalogIdentity.Album, local.ChecksumAlbum)))
+            (!ArtistIdentityEquivalent(catalogIdentity.Artist, local.ChecksumArtist) ||
+             !ChecksumAlbumIdentityEquivalent(catalogIdentity.Album, local.ChecksumAlbum, layout.AlbumTitle)))
             throw new InvalidDataException(
                 "The exact catalog-number match disagrees with the checksum filename artist/title; automatic SACD identity fallback is ambiguous.");
 
         var album = Nonempty(layout.AlbumTitle) ?? catalogIdentity?.Album ?? local.ChecksumAlbum ?? local.FolderAlbum ?? string.Empty;
         var artist = Nonempty(layout.AlbumArtist) ?? catalogIdentity?.Artist ?? local.ChecksumArtist ?? local.FolderArtist ?? string.Empty;
-        var sources = new List<string>();
+        var sources = (layout.IdentitySources ?? []).ToList();
         if (Nonempty(layout.AlbumTitle) is not null || Nonempty(layout.AlbumArtist) is not null)
             sources.Add("SACD disc text");
         if (catalogIdentity is not null &&
@@ -593,6 +597,42 @@ public sealed partial class LocalDsdProcessor
             AlbumArtist = artist,
             CatalogNumber = catalogIdentity?.CatalogNumber ?? layout.CatalogNumber,
             IdentitySources = sources.Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+        };
+    }
+
+    internal static ExternalAlbumIdentity? ReconcileCatalogIdentity(
+        SacdLayout layout,
+        ExternalAlbumIdentity? catalogIdentity)
+    {
+        if (catalogIdentity is null) return null;
+        var disagrees =
+            (Nonempty(layout.AlbumTitle) is { } discTitle && !AlbumIdentityEquivalent(catalogIdentity.Album, discTitle)) ||
+            (Nonempty(layout.AlbumArtist) is { } discArtist && !ArtistIdentityEquivalent(catalogIdentity.Artist, discArtist));
+        if (!disagrees) return catalogIdentity;
+        if ((layout.IdentitySources ?? []).Contains("catalog number in album folder", StringComparer.OrdinalIgnoreCase))
+            return null;
+        throw new InvalidDataException(
+            "The exact catalog-number match disagrees with SACD disc text; automatic release identification is ambiguous.");
+    }
+
+    internal static SacdLayout ApplyFolderCatalog(SacdLayout layout, string folderName)
+    {
+        var match = FolderCatalog().Match(folderName);
+        if (!match.Success) return layout;
+        var folderCatalog = match.Groups["catalog"].Value.Trim();
+        if (Nonempty(layout.CatalogNumber) is { } discCatalog)
+        {
+            if (!ExternalMetadataService.CatalogsEquivalent(discCatalog, folderCatalog))
+                throw new InvalidDataException("The catalog number in the album folder disagrees with SACD disc text.");
+            return layout;
+        }
+        return layout with
+        {
+            CatalogNumber = folderCatalog,
+            IdentitySources = (layout.IdentitySources ?? [])
+                .Append("catalog number in album folder")
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray()
         };
     }
 
@@ -651,8 +691,41 @@ public sealed partial class LocalDsdProcessor
         return artist is null || album is null ? null : (artist, album);
     }
 
-    private static bool IdentityEquivalent(string left, string right) =>
-        IdentityKey(left).Equals(IdentityKey(right), StringComparison.Ordinal);
+    private static bool AlbumIdentityEquivalent(string left, string right) =>
+        ExternalMetadataService.AlbumTitlesEquivalent(left, right);
+
+    private static bool ChecksumAlbumIdentityEquivalent(
+        string catalogAlbum,
+        string checksumAlbum,
+        string discAlbum)
+    {
+        if (AlbumIdentityEquivalent(catalogAlbum, checksumAlbum)) return true;
+        var match = ChecksumDiscTitle().Match(checksumAlbum);
+        if (!match.Success || Nonempty(discAlbum) is null) return false;
+        var stem = IdentityKey(match.Groups["stem"].Value);
+        if (stem.Length < 5) return false;
+        return IdentityKey(catalogAlbum).StartsWith(stem, StringComparison.Ordinal) &&
+               IdentityKey(discAlbum).StartsWith(stem, StringComparison.Ordinal);
+    }
+
+    private static bool ArtistIdentityEquivalent(string left, string right) =>
+        ExternalMetadataService.ArtistCreditsEquivalent(left, right) ||
+        ArtistInitialismEquivalent(left, right) ||
+        ArtistInitialismEquivalent(right, left);
+
+    private static bool ArtistInitialismEquivalent(string abbreviation, string fullName)
+    {
+        var abbreviationKey = IdentityKey(abbreviation);
+        if (abbreviationKey.Length is < 3 or > 6) return false;
+        var fullTokens = Regex.Matches(fullName, @"[\p{L}\p{M}\p{Nd}]+")
+            .Select(match => IdentityKey(match.Value))
+            .Where(token => token.Length > 0)
+            .ToArray();
+        if (fullTokens.Length != abbreviationKey.Length || IdentityKey(fullName).Length <= abbreviationKey.Length)
+            return false;
+        var initials = string.Concat(fullTokens.Select(token => token[0]));
+        return abbreviationKey.Equals(initials, StringComparison.Ordinal);
+    }
 
     private static string IdentityKey(string value)
     {
@@ -903,6 +976,10 @@ public sealed partial class LocalDsdProcessor
     private static partial Regex TrailingEditionBlock();
     [GeneratedRegex("(?:19|20)\\d{2}")]
     private static partial Regex Year();
+    [GeneratedRegex(@"^(?<stem>.+?)\s*[\(\[]?\s*(?:disc|cd)\s*\d+(?:\s*(?:of|/)\s*\d+)?\s*[\)\]]?\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex ChecksumDiscTitle();
+    [GeneratedRegex("[\\{\\[]\\s*(?<catalog>[A-Z]{2,10}[ -]?\\d{2,10})\\s*[\\}\\]]", RegexOptions.IgnoreCase)]
+    private static partial Regex FolderCatalog();
     [GeneratedRegex("\\s+")]
     private static partial Regex Whitespace();
     [GeneratedRegex("Total:\\s*(?<value>\\d+)%", RegexOptions.IgnoreCase)]

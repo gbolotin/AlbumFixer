@@ -55,11 +55,17 @@ public sealed class WpfUserInteractionService : IUserInteractionService
             : "";
 
         var message = confirmation.IsSingleTrackRepair
-            ? """
-               Album Fixer will copy the existing FLAC tracks into local staging, prioritize their current tags and embedded artwork, use exact external-album matches and filenames only for missing fields, then verify that every compressed FLAC audio-frame payload is bit-for-bit unchanged. The repaired tracks will replace the originals through a rollback-capable destination transaction. Delete originals does not apply to this workflow.
+            ? confirmation.DeletesSourceAfterSuccess
+                ? """
+                   Album Fixer will copy the existing DSF or DFF tracks into local staging, prioritize their current tags and embedded artwork, use exact external-album matches and filenames only for missing fields, then verify that every native DSD audio payload is bit-for-bit unchanged. The repaired tracks will replace the originals through a rollback-capable destination transaction. Only after every final track, tag, and embedded cover passes verification will it permanently delete the single retained SACD ISO. The repaired DSF or DFF tracks are never deletion targets.
 
-               Start this existing-track repair?
-               """
+                   Start this verified repair and retained-ISO deletion?
+                   """
+                : """
+                   Album Fixer will copy the existing FLAC, DSF, or DFF tracks into local staging, prioritize their current tags and embedded artwork, use exact external-album matches and filenames only for missing fields, then verify that every compressed or native audio payload is bit-for-bit unchanged. The repaired tracks will replace the originals through a rollback-capable destination transaction. A coexisting SACD ISO is retained when Delete originals is off; source deletion otherwise does not apply.
+
+                   Start this existing-track repair?
+                   """
             : confirmation.IsSingleSacd
             ? $"""
                Album Fixer will copy and size-check the SACD ISO in local staging, extract every reported area to DSF, repeat each extraction independently, compare extraction sizes, verify native DSD structure and tags, then recheck the committed network paths. Cryptographic hashes are not calculated. Only after every gate passes will it permanently delete the exact inventoried ISO.

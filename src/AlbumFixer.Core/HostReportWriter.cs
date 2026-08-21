@@ -19,7 +19,8 @@ public static class HostReportWriter
         JobPhase stoppedPhase,
         int percent,
         string detail,
-        CancellationToken token = default)
+        CancellationToken token = default,
+        IReadOnlyList<string>? diagnostics = null)
     {
         var normalizedStatus = status.Equals("canceled", StringComparison.OrdinalIgnoreCase) ? "canceled" : "failed";
         var now = DateTimeOffset.UtcNow;
@@ -63,6 +64,10 @@ public static class HostReportWriter
                 percent = Math.Clamp(percent, 0, 100),
                 detail,
                 updated_at_utc = now
+            },
+            diagnostics = new
+            {
+                external_lookup_warnings = (diagnostics ?? []).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
             },
             discs = Array.Empty<object>(),
             verification = new

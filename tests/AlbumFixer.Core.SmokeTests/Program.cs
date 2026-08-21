@@ -1,9 +1,48 @@
 using System.Diagnostics;
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using AlbumFixer.Core;
 
 if (args is ["--process-sacd", var sacdAlbum])
     return await ProcessSacdAlbum(sacdAlbum);
+if (args is ["--scan", var scanAlbum])
+{
+    var scan = await new AlbumScanner().ScanAsync(scanAlbum);
+    var preflight = await new PreflightService().CheckAsync(scan);
+    Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new
+    {
+        scan.AlbumRoot,
+        Mode = scan.Mode.ToString(),
+        preflight.CanStart,
+        scan.ImageCount,
+        scan.TrackCount,
+        Media = scan.Media.Select(item => new { item.RelativePath, item.Kind }),
+        scan.Warnings,
+        scan.Errors,
+        BlockingChecks = preflight.Checks.Where(check => check.BlocksRun && check.State == CheckState.Failed)
+            .Select(check => new { check.Name, check.Detail })
+    }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+if (args is ["--prepare-artwork", var artworkAlbum])
+{
+    var scan = await new AlbumScanner().ScanAsync(artworkAlbum);
+    var preflight = await new PreflightService().CheckAsync(scan);
+    if (preflight.Tools["ffmpeg"] is not { } ffmpeg || preflight.Tools["ffprobe"] is not { } ffprobe)
+        return 2;
+    var mode = scan.HasDsd ? ArtworkSelectionMode.Dsd : ArtworkSelectionMode.Flac;
+    var result = await new InMemoryArtworkService().PrepareLocalAsync(artworkAlbum, ffmpeg, ffprobe, mode);
+    Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new
+    {
+        Prepared = result.Artwork is not null,
+        result.Issue,
+        Source = result.Artwork?.Source,
+        result.Artwork?.Width,
+        result.Artwork?.Height,
+        result.Artwork?.ByteSize
+    }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return result.Artwork is null ? 1 : 0;
+}
 
 var root = Path.Combine(Path.GetTempPath(), "album-fixer-tests", Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(root);
@@ -14,11 +53,17 @@ try
     await ScannerInventoriesChecksumIdentitySidecars(root);
     await ScannerDescendsIntoSingleNestedAlbum(root);
     await ScannerPrefersExistingTracks(root);
+    await ScannerAcceptsVerifiedLegacySplitCue(root);
+    await ScannerSkipsCompleteTaggedMultiDiscTracksWithMissingHistoricalCueSources(root);
+    await ScannerSkipsCompleteTaggedDsdTracksAndAreas(root);
     await ScannerPlansMultipleAlbums(root);
+    await ScannerRoutesTrackPerFileCuesAndScopesNestedAlbums(root);
     await ScannerAcceptsMultipleImagesInOneAlbumFolder(root);
     await ScannerRecognizesAndCleansIncompletePreviousOutput(root);
     await ScannerSkipsCompletedAlbumsWithDeletedSources(root);
     await ScannerAdoptsOptionalOnlyVerifiedSacdCompletion(root);
+    await ScannerRoutesStandaloneDsfAndReusableIncompleteSacd(root);
+    await ArchivedSacdArtifactsAreTransactionallyReplaceable(root);
     await ScannerRecoversVerifiedMissingSourceFallbackCompletion(root);
     await ScannerRecoversRetainedEquivalentFlacAfterCanceledFallback(root);
     await ScannerRecoversCompletedSacdAfterCanceledFallback(root);
@@ -29,11 +74,22 @@ try
     await StageAwarePipelineBoundsEveryLane();
     await HostStagesAndChecksSourceSize(root);
     await LocalSplitterRunsLocally(root);
+    await LocalClassicalCueInfersComposer(root);
     await LocalMetadataEnrichmentRunsInCode(root);
     await ExternalArtworkFallbackSupportsSacdAndPreservesLocalPriority(root);
     await ExistingTracksRepairUsesPrioritizedEvidenceAndTransactionalCommit(root);
+    await ExistingCompilationUsesDiscogsTrackArtistsAndPrimaryCover(root);
+    await ExistingTrackCorruptionNamesTheExactFile(root);
+    await TrackPerFileCueRepairsTransactionally(root);
+    await StandaloneDsfRepairPreservesNativePayloadAndDeletesRetainedIso(root);
+    await StandaloneDffRepairPreservesNativePayloadAndDeletesRetainedIso(root);
+    await ExactDuplicateExistingTracksAreCollapsedTransactionally(root);
     DuplicateTaggedBonusTrackUsesFilenameAnchor();
     RecognizedGenreFoldersAreNotArtistEvidence();
+    ClassicalComposerUsesCorroboratedAlbumIdentity();
+    ClassicalTrackComposersUseReviewedAlbumAndWorkEvidence();
+    CompilationIdentityAndClassicalTrackEvidenceAreConservative();
+    ExternalAlbumTitleQualifiersRemainEquivalent();
     await ExistingTracksRepairSupportsMultipleDiscs(root);
     await LocalSplitterCropsAndNormalizesBookletFront(root);
     await LocalSplitterCreatesCdFoldersForMultipleImages(root);
@@ -53,6 +109,11 @@ try
     await FailureReportPreservesCompletedReport(root);
     await MetadataHandoffIsConditional(root);
     await ExternalMetadataResolvesExactSacdRelease();
+    await ExternalMetadataImportsExactTrackComposersAndCuratedGenre();
+    await ExternalMetadataReadsEmbeddedDiscogsComposerCredits();
+    await ExternalMetadataAlignsAbbreviatedOperaTitlesWithCredits();
+    await ExternalMetadataFallsBackFromFolderTitleToLinkedDiscogsTrackCredits();
+    await ExternalMetadataAlignsPartialMixedCompilation();
     await ExternalMetadataUsesAppleGenreFallback();
     await ExternalMetadataFailuresAreNonblocking();
     await ExternalCoverDownloadIsMemoryOnlyAndBounded();
@@ -152,6 +213,197 @@ static async Task ScannerPrefersExistingTracks(string root)
         "A mixed CUE/image plus existing-track folder must remain blocked as ambiguous.");
 }
 
+static async Task ScannerAcceptsVerifiedLegacySplitCue(string root)
+{
+    var folder = Path.Combine(root, "verified-legacy-split-cue");
+    Directory.CreateDirectory(folder);
+    await File.WriteAllBytesAsync(Path.Combine(folder, "01. Angel.flac"), [1]);
+    await File.WriteAllBytesAsync(Path.Combine(folder, "02. Risingson.flac"), [2]);
+    await File.WriteAllBytesAsync(Path.Combine(folder, "03.  Inertia Creeps.flac"), [3]);
+    var cue = Path.Combine(folder, "album.cue");
+    await File.WriteAllTextAsync(cue, """
+    FILE "Range.wav" WAVE
+      TRACK 01 AUDIO
+        TITLE "Angel"
+        INDEX 01 00:00:00
+      TRACK 02 AUDIO
+        TITLE "Risingson"
+        INDEX 00 06:19:20
+        INDEX 01 06:19:40
+      TRACK 03 AUDIO
+        TITLE " Inertia Creeps"
+        INDEX 01 11:18:27
+    """);
+
+    var accepted = await new AlbumScanner().ScanAsync(folder);
+    Assert(accepted.Mode == WorkflowMode.ExistingTrackRepair && accepted.TrackCount == 3 &&
+           accepted.Errors.All(error => !error.Contains("missing source", StringComparison.OrdinalIgnoreCase)) &&
+           accepted.Warnings.Any(warning => warning.Contains("historical provenance", StringComparison.OrdinalIgnoreCase)),
+        "A complete sequential FLAC set whose normalized filename titles match a missing-image CUE must proceed to structural and metadata repair.");
+
+    File.Move(Path.Combine(folder, "02. Risingson.flac"), Path.Combine(folder, "02. Different Song.flac"));
+    var titleMismatch = await new AlbumScanner().ScanAsync(folder);
+    Assert(titleMismatch.Errors.Any(error => error.Contains("missing source", StringComparison.OrdinalIgnoreCase)),
+        "A split FLAC title mismatch must keep the missing CUE image as a blocking inventory error.");
+
+    File.Move(Path.Combine(folder, "02. Different Song.flac"), Path.Combine(folder, "02. Risingson.flac"));
+    await File.WriteAllBytesAsync(Path.Combine(folder, "04. Unexpected.flac"), [4]);
+    var extraTrack = await new AlbumScanner().ScanAsync(folder);
+    Assert(extraTrack.Errors.Any(error => error.Contains("missing source", StringComparison.OrdinalIgnoreCase)),
+        "An extra FLAC outside the exact CUE track set must fail closed.");
+
+    var perTrackFolder = Path.Combine(root, "verified-legacy-per-track-wav-cue");
+    Directory.CreateDirectory(perTrackFolder);
+    await File.WriteAllBytesAsync(Path.Combine(perTrackFolder, "01 - Angel.flac"), [1]);
+    await File.WriteAllBytesAsync(Path.Combine(perTrackFolder, "02 - Risingson.flac"), [2]);
+    await File.WriteAllBytesAsync(Path.Combine(perTrackFolder, "03 - Teardrop.flac"), [3]);
+    var perTrackCueText = """
+    FILE "01 - Angel.wav" WAVE
+      TRACK 01 AUDIO
+        TITLE "Angel"
+        INDEX 01 00:00:00
+      TRACK 02 AUDIO
+        TITLE "Risingson"
+        INDEX 00 06:19:20
+    FILE "02 - Risingson.wav" WAVE
+        INDEX 01 00:00:00
+      TRACK 03 AUDIO
+        TITLE "Teardrop"
+        INDEX 00 04:57:70
+    FILE "03 - Teardrop.wav" WAVE
+        INDEX 01 00:00:00
+    """;
+    await File.WriteAllTextAsync(Path.Combine(perTrackFolder, "album.cue"), perTrackCueText);
+    await File.WriteAllTextAsync(Path.Combine(perTrackFolder, "album-no-data-track.cue"), perTrackCueText + Environment.NewLine + """
+      TRACK 04 MODEx/2xxx
+        TITLE "Data Track"
+        INDEX 00 10:00:00
+    """);
+
+    var perTrackAccepted = await new AlbumScanner().ScanAsync(perTrackFolder);
+    Assert(perTrackAccepted.Mode == WorkflowMode.ExistingTrackRepair && perTrackAccepted.Errors.Count == 0 &&
+           perTrackAccepted.Warnings.Any(warning => warning.Contains("historical provenance", StringComparison.OrdinalIgnoreCase)),
+        $"Equivalent legacy CUE variants with one missing WAV per audio track must proceed when every source name, FLAC name, number, and title agrees. Mode={perTrackAccepted.Mode}; Errors={string.Join(" | ", perTrackAccepted.Errors)}; Warnings={string.Join(" | ", perTrackAccepted.Warnings)}");
+
+    var mismatchedCue = perTrackCueText.Replace("02 - Risingson.wav", "02 - Wrong Source.wav", StringComparison.Ordinal);
+    await File.WriteAllTextAsync(Path.Combine(perTrackFolder, "album-no-data-track.cue"), mismatchedCue);
+    var sourceNameMismatch = await new AlbumScanner().ScanAsync(perTrackFolder);
+    Assert(sourceNameMismatch.Errors.Any(error => error.Contains("missing source", StringComparison.OrdinalIgnoreCase)),
+        "A missing per-track source filename that disagrees with the CUE title and split FLAC must remain blocked.");
+}
+
+static async Task ScannerSkipsCompleteTaggedMultiDiscTracksWithMissingHistoricalCueSources(string root)
+{
+    var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var toolCheck = await new PreflightService().CheckAsync(seed);
+    if (toolCheck.Tools["ffmpeg"] is not { } ffmpeg) return;
+
+    var album = Path.Combine(root, "complete-multidisc-missing-cue-sources");
+    var discFolders = new[] { Path.Combine(album, "CD1"), Path.Combine(album, "CD2") };
+    foreach (var folder in discFolders) Directory.CreateDirectory(folder);
+    var coverPath = Path.Combine(album, "cover.jpg");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=maroon:s=96x96", "-frames:v", "1", "-update", "1", coverPath);
+    var coverBytes = await File.ReadAllBytesAsync(coverPath);
+
+    for (var disc = 1; disc <= 2; disc++)
+    for (var track = 1; track <= 2; track++)
+    {
+        var path = Path.Combine(discFolders[disc - 1], $"{track:00} - Scene {disc}-{track}.flac");
+        await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+            $"sine=frequency={500 + disc * 100 + track * 20}:duration=0.08", "-c:a", "flac", path);
+        using var file = TagLib.File.Create(path);
+        file.Tag.Title = $"Scene {disc}-{track}";
+        file.Tag.Album = "Complete Test Opera";
+        file.Tag.Performers = ["Test Cast"];
+        file.Tag.AlbumArtists = ["Test Cast"];
+        file.Tag.Composers = ["Test Composer"];
+        file.Tag.Track = (uint)track;
+        file.Tag.TrackCount = 2;
+        file.Tag.Disc = (uint)disc;
+        file.Tag.DiscCount = 2;
+        file.Tag.Year = 1960;
+        file.Tag.Genres = ["Opera"];
+        file.Tag.Pictures =
+        [
+            new TagLib.Picture(new TagLib.ByteVector(coverBytes))
+            {
+                Type = TagLib.PictureType.FrontCover,
+                MimeType = "image/jpeg",
+                Description = "Front cover"
+            }
+        ];
+        file.Save();
+    }
+    await File.WriteAllTextAsync(Path.Combine(album, "disc-1.cue"), """
+    FILE "missing-disc-1.flac" WAVE
+      TRACK 01 AUDIO
+        TITLE "Scene 1-1"
+        INDEX 01 00:00:00
+      TRACK 02 AUDIO
+        TITLE "Scene 1-2"
+        INDEX 01 03:00:00
+    """);
+    await File.WriteAllTextAsync(Path.Combine(album, "disc-2.cue"), """
+    FILE "missing-disc-2.flac" WAVE
+      TRACK 01 AUDIO
+        TITLE "Scene 2-1"
+        INDEX 01 00:00:00
+      TRACK 02 AUDIO
+        TITLE "Scene 2-2"
+        INDEX 01 03:00:00
+    """);
+
+    var complete = await new AlbumScanner().ScanAsync(album);
+    Assert(complete.Mode == WorkflowMode.Completed && !complete.RequiresProcessing && complete.Errors.Count == 0 &&
+           complete.Warnings.Any(warning => warning.Contains("historical provenance", StringComparison.OrdinalIgnoreCase)),
+        "A complete tagged multi-disc FLAC set with embedded artwork must be skipped even when preserved CUE sheets name missing historical images.");
+
+    var incompletePath = Path.Combine(discFolders[1], "02 - Scene 2-2.flac");
+    using (var file = TagLib.File.Create(incompletePath))
+    {
+        file.Tag.Pictures = [];
+        file.Save();
+    }
+    var incomplete = await new AlbumScanner().ScanAsync(album);
+    Assert(incomplete.Mode == WorkflowMode.ExistingTrackRepair &&
+           incomplete.Errors.Any(error => error.Contains("missing source", StringComparison.OrdinalIgnoreCase)),
+        "Missing artwork must prevent current-state completion and keep missing CUE sources blocked.");
+}
+
+static async Task ScannerSkipsCompleteTaggedDsdTracksAndAreas(string root)
+{
+    var dsfAlbum = Path.Combine(root, "complete-dsf-areas", "ERA - The Mass (2003) SACD [DSD] 2.0+5.0");
+    foreach (var area in new[] { "Stereo", "Multichannel" })
+    {
+        var areaRoot = Path.Combine(dsfAlbum, area);
+        Directory.CreateDirectory(areaRoot);
+        for (var index = 1; index <= 2; index++)
+            CreateTaggedDsfFixture(Path.Combine(areaRoot, $"{index:00} - Track {index}.dsf"),
+                $"Track {index}", (uint)index, 2, (byte)(index + (area == "Stereo" ? 0x20 : 0x40)));
+    }
+
+    var dsf = await new AlbumScanner().ScanAsync(dsfAlbum);
+    Assert(dsf.Mode == WorkflowMode.Completed && !dsf.RequiresProcessing && dsf.TrackCount == 4 &&
+           dsf.Warnings.Any(warning => warning.Contains("no repair or external lookup", StringComparison.OrdinalIgnoreCase)),
+        "Complete standalone DSF Stereo/Multichannel areas must be skipped before staging or external lookup.");
+
+    var dffAlbum = Path.Combine(root, "complete-dff", "Tester - Complete DFF Album");
+    Directory.CreateDirectory(dffAlbum);
+    for (var index = 1; index <= 2; index++)
+    {
+        var path = Path.Combine(dffAlbum, $"{index:00} - Track {index}.dff");
+        CreateDffFixture(path, (byte)(0x60 + index));
+        await DffMetadata.SaveAsync(path, new(
+            $"Track {index}", "Complete DFF Album", "Tester", "Tester",
+            (uint)index, 2, 1, 1, 2020, "Rock", null, [0xFF, 0xD8, 0xFF, 0xD9]));
+    }
+
+    var dff = await new AlbumScanner().ScanAsync(dffAlbum);
+    Assert(dff.Mode == WorkflowMode.Completed && !dff.RequiresProcessing && dff.TrackCount == 2,
+        "Complete standalone DFF tracks must be skipped before staging or external lookup.");
+}
+
 static async Task ScannerPlansMultipleAlbums(string root)
 {
     var folder = Path.Combine(root, "artist");
@@ -181,6 +433,50 @@ static async Task ScannerPlansMultipleAlbums(string root)
     Assert(albums.All(album => album.Mode == WorkflowMode.FlacCueSplit), "Every discovered FLAC+CUE album must be independently runnable.");
     Assert(albums.Select(album => album.AlbumRoot).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 2, "Batch album roots must be disjoint.");
     Assert(albums.All(album => !album.AlbumName.Equals("Covers", StringComparison.OrdinalIgnoreCase)), "Artwork-only folders must not become blocked batch albums.");
+}
+
+static async Task ScannerRoutesTrackPerFileCuesAndScopesNestedAlbums(string root)
+{
+    var discAlbum = Path.Combine(root, "track-per-file-cue-album");
+    var discOne = Path.Combine(discAlbum, "CD 1 - First works");
+    var discTwo = Path.Combine(discAlbum, "CD 2 - Second works");
+    Directory.CreateDirectory(discOne);
+    Directory.CreateDirectory(discTwo);
+    for (var disc = 1; disc <= 2; disc++)
+    {
+        var folder = disc == 1 ? discOne : discTwo;
+        await File.WriteAllBytesAsync(Path.Combine(folder, "01 - First.flac"), [1]);
+        await File.WriteAllBytesAsync(Path.Combine(folder, "02 - Second.flac"), [2]);
+        await File.WriteAllTextAsync(Path.Combine(folder, $"disc{disc}.cue"), """
+        FILE "01 - First.flac" WAVE
+          TRACK 01 AUDIO
+            INDEX 01 00:00:00
+        FILE "02 - Second.flac" WAVE
+          TRACK 02 AUDIO
+            INDEX 01 00:00:00
+        """);
+    }
+    var stale = Path.Combine(discAlbum, ".album-fixer-commit-resume-old", "TRACKS");
+    Directory.CreateDirectory(stale);
+    await File.WriteAllBytesAsync(Path.Combine(stale, "01 - stale.dsf"), [3]);
+
+    var discScan = await new AlbumScanner().ScanAsync(discAlbum);
+    Assert(discScan.Mode == WorkflowMode.ExistingTrackRepair && discScan.AlbumRoot == discAlbum &&
+           discScan.TrackCount == 4 && discScan.CueCount == 2 && discScan.ImageCount == 0 &&
+           discScan.Media.All(item => !item.Path.Contains(".album-fixer-", StringComparison.OrdinalIgnoreCase)),
+        "Suffixed CD folders must form one repair album, one-file-per-track CUEs must remain provenance, and stale internal recovery folders must be ignored.");
+
+    var mixedRoot = Path.Combine(root, "album-with-unrelated-nested-album");
+    var nested = Path.Combine(mixedRoot, "Unrelated Nested Album");
+    Directory.CreateDirectory(nested);
+    await File.WriteAllBytesAsync(Path.Combine(mixedRoot, "01 - Root.flac"), [1]);
+    await File.WriteAllBytesAsync(Path.Combine(mixedRoot, "02 - Root.flac"), [2]);
+    await File.WriteAllBytesAsync(Path.Combine(nested, "01 - Nested.flac"), [3]);
+    await File.WriteAllBytesAsync(Path.Combine(nested, "02 - Nested.flac"), [4]);
+    var scoped = await new AlbumScanner().ScanAsync(mixedRoot);
+    Assert(scoped.Mode == WorkflowMode.ExistingTrackRepair && scoped.TrackCount == 2 &&
+           scoped.Media.All(item => !item.Path.StartsWith(nested, StringComparison.OrdinalIgnoreCase)),
+        "An album with its own root tracks must be scoped independently from an unrelated nested album instead of remaining blocked as MultipleAlbums.");
 }
 
 static async Task ScannerAcceptsMultipleImagesInOneAlbumFolder(string root)
@@ -430,13 +726,147 @@ static async Task ScannerAdoptsOptionalOnlyVerifiedSacdCompletion(string root)
 
     await File.WriteAllTextAsync(reportPath, Report("CATALOGNUMBER", "passed"));
     var requiredMissing = await new AlbumScanner().ScanAsync(folder);
-    Assert(requiredMissing.Mode == WorkflowMode.NeedsInspection && requiredMissing.Mode != WorkflowMode.ExistingTrackRepair,
-        "A SACD extraction with required metadata missing must fail closed without entering FLAC repair mode.");
+    Assert(requiredMissing.Mode == WorkflowMode.DsdExtraction && requiredMissing.Mode != WorkflowMode.ExistingTrackRepair,
+        "A SACD extraction with required metadata missing must reuse its retained exact ISO instead of entering standalone-track repair.");
 
     await File.WriteAllTextAsync(reportPath, Report("LABEL", "failed"));
     var failedAudioProof = await new AlbumScanner().ScanAsync(folder);
-    Assert(failedAudioProof.Mode == WorkflowMode.NeedsInspection && failedAudioProof.Mode != WorkflowMode.ExistingTrackRepair,
-        "Optional metadata cannot make a SACD extraction complete when its audio/tag verification did not pass.");
+    Assert(failedAudioProof.Mode == WorkflowMode.DsdExtraction && failedAudioProof.Mode != WorkflowMode.ExistingTrackRepair,
+        "A failed prior SACD audio/tag verification must rerun from the retained exact ISO instead of adopting or repairing its outputs.");
+}
+
+static async Task ScannerRoutesStandaloneDsfAndReusableIncompleteSacd(string root)
+{
+    var standalone = Path.Combine(root, "Jazz", "Standalone Artist - Standalone DSD64");
+    Directory.CreateDirectory(standalone);
+    for (var index = 1; index <= 3; index++)
+        await File.WriteAllBytesAsync(Path.Combine(standalone, $"{index:00} - Track {index}.dsf"), [(byte)index]);
+    await File.WriteAllBytesAsync(Path.Combine(standalone, "front.jpg"), [0xFF, 0xD8, 0xFF, 0xD9]);
+    var standaloneScan = await new AlbumScanner().ScanAsync(standalone);
+    Assert(standaloneScan.Mode == WorkflowMode.ExistingTrackRepair && standaloneScan.TrackCount == 3 &&
+           standaloneScan.Media.Count(item => item.Kind == "Existing DSF") == 3,
+        "Multiple standalone DSF tracks must route to verified existing-track repair.");
+
+    var mixed = Path.Combine(root, "mixed-flac-dsf-repair");
+    Directory.CreateDirectory(mixed);
+    await File.WriteAllBytesAsync(Path.Combine(mixed, "01.flac"), [1]);
+    await File.WriteAllBytesAsync(Path.Combine(mixed, "02.dsf"), [2]);
+    var mixedScan = await new AlbumScanner().ScanAsync(mixed);
+    Assert(mixedScan.Mode == WorkflowMode.NeedsInspection,
+        "Mixed standalone FLAC and DSF files must remain read-only instead of entering one repair transaction.");
+
+    var reusable = Path.Combine(root, "Jazz", "Kazumi & The Gentle Thoughts - Mermaid Boulevard [SACD ISO] {DYCP-70131} 2011");
+    var stereo = Path.Combine(reusable, "Stereo");
+    Directory.CreateDirectory(stereo);
+    var iso = Path.Combine(reusable, "album.iso");
+    var priorDsf = Path.Combine(stereo, "01 - Mermaid Boulevard.dsf");
+    await File.WriteAllBytesAsync(iso, [1, 2, 3, 4]);
+    await File.WriteAllBytesAsync(priorDsf, [5, 6, 7]);
+    await File.WriteAllTextAsync(Path.Combine(reusable, "conversion-report.json"), $$"""
+    {
+      "workflow_mode": "sacd_iso_extract",
+      "source": { "file": "album.iso", "size": 4 },
+      "areas": [{ "area": "stereo", "tracks": [{ "track": 1, "title": "Mermaid Boulevard", "file": "Stereo/01 - Mermaid Boulevard.dsf" }] }],
+      "verification": { "status": "incomplete", "missing_required_metadata": ["CATALOGNUMBER"] },
+      "commit": { "status": "completed_incomplete", "files": [{ "file": "Stereo/01 - Mermaid Boulevard.dsf", "size": {{new FileInfo(priorDsf).Length}} }] }
+    }
+    """);
+    var reusableScan = await new AlbumScanner().ScanAsync(reusable);
+    Assert(reusableScan.Mode == WorkflowMode.DsdExtraction && reusableScan.ImageCount == 1 && reusableScan.TrackCount == 0 &&
+           reusableScan.Media.Count(item => item.Kind == "Previous Album Fixer output") == 1,
+        "An incomplete report-proven SACD extraction must yield to its still-present exact ISO for a safe rerun.");
+
+    var layout = new LocalDsdProcessor.SacdLayout("Mermaid Boulevard", "Kazumi & The Gentle Thoughts", null, null, []);
+    var cataloged = LocalDsdProcessor.ApplyFolderCatalog(layout,
+        "Kazumi & The Gentle Thoughts - Mermaid Boulevard [SACD ISO] {DYCP-70131} 2011");
+    Assert(cataloged.CatalogNumber == "DYCP-70131" &&
+           cataloged.IdentitySources!.Contains("catalog number in album folder"),
+        "A braced catalog token in the album folder must supply missing SACD catalog metadata.");
+    var incorrectExternal = new ExternalAlbumIdentity("Unrelated Album", "Unrelated Artist", "DYCP-70131", "2011",
+        "https://musicbrainz.org/release/incorrect", []);
+    Assert(LocalDsdProcessor.ReconcileCatalogIdentity(cataloged, incorrectExternal) is null,
+        "An external exact-catalog candidate that contradicts complete SACD disc text must be rejected when the catalog came from the folder.");
+
+    var ymoLayout = new LocalDsdProcessor.SacdLayout(
+        "UC YMO [Ultimate Collection of Yellow Magic Orchestra]", "YMO", "MHGL1", "2003-06-10", []);
+    var ymoCatalogIdentity = new ExternalAlbumIdentity(
+        "UC YMO: Ultimate Collection of Yellow Magic Orchestra", "Yellow Magic Orchestra", "MHGL-1", "2003-08-06",
+        "https://musicbrainz.org/release/9be3a543-59d9-33e5-8469-057a90d10cc5", []);
+    Assert(LocalDsdProcessor.ReconcileCatalogIdentity(ymoLayout, ymoCatalogIdentity) == ymoCatalogIdentity,
+        "An exact embedded SACD catalog and equivalent album title must accept the disc-text artist acronym YMO for Yellow Magic Orchestra.");
+
+    var ymoChecksumIdentity = new LocalDsdProcessor.SacdLocalIdentity(
+        "Yellow Magic Orchestra", "UC YMO (Disc 1)", null, null);
+    var identifiedYmo = LocalDsdProcessor.ApplyAlbumIdentity(ymoLayout, ymoChecksumIdentity, ymoCatalogIdentity);
+    Assert(identifiedYmo.AlbumTitle == ymoLayout.AlbumTitle && identifiedYmo.AlbumArtist == "YMO" &&
+           identifiedYmo.CatalogNumber == "MHGL-1",
+        "A checksum filename may use a shortened disc-qualified title only when its stem agrees with both the exact catalog title and complete SACD disc title.");
+
+    var unrelatedChecksumIdentity = ymoChecksumIdentity with { ChecksumAlbum = "Unrelated Album (Disc 1)" };
+    Exception? unrelatedChecksumConflict = null;
+    try { LocalDsdProcessor.ApplyAlbumIdentity(ymoLayout, unrelatedChecksumIdentity, ymoCatalogIdentity); }
+    catch (Exception error) { unrelatedChecksumConflict = error; }
+    Assert(unrelatedChecksumConflict is InvalidDataException,
+        "A disc-qualified checksum filename with an unrelated album stem must remain a blocking identity conflict.");
+
+    var nonInitialismIdentity = ymoCatalogIdentity with { Artist = "Young Marble Giants" };
+    Exception? nonInitialismConflict = null;
+    try { LocalDsdProcessor.ReconcileCatalogIdentity(ymoLayout, nonInitialismIdentity); }
+    catch (Exception error) { nonInitialismConflict = error; }
+    Assert(nonInitialismConflict is InvalidDataException,
+        "A same-length artist name that does not expand the embedded acronym must remain a strict catalog/disc-text conflict.");
+
+    Exception? discCatalogConflict = null;
+    try
+    {
+        LocalDsdProcessor.ReconcileCatalogIdentity(layout with { CatalogNumber = "DYCP-70131" }, incorrectExternal);
+    }
+    catch (Exception error) { discCatalogConflict = error; }
+    Assert(discCatalogConflict is InvalidDataException,
+        "A catalog embedded in SACD disc data must retain strict conflict handling when external identity disagrees.");
+}
+
+static async Task ArchivedSacdArtifactsAreTransactionallyReplaceable(string root)
+{
+    var folder = Path.Combine(root, "archived-sacd-artifacts");
+    Directory.CreateDirectory(folder);
+    var artifacts = new[]
+    {
+        "sacd_extract-layout.txt",
+        "sacd_extract-stereo.log",
+        "sacd_extract-stereo-independent.log"
+    };
+    foreach (var artifact in artifacts)
+        await File.WriteAllTextAsync(Path.Combine(folder, artifact), $"report-proven {artifact}");
+    var files = string.Join(",", artifacts.Select(artifact =>
+        $$"""{"file":"{{artifact}}","size":{{new FileInfo(Path.Combine(folder, artifact)).Length}}}"""));
+    var artifactValues = string.Join(",", artifacts.Select(artifact => $"\"{artifact}\""));
+    await File.WriteAllTextAsync(Path.Combine(folder, "conversion-report.previous-20260815-000000-test.json"), $$"""
+    {
+      "workflow_mode": "sacd_iso_extract",
+      "artifacts": [{{artifactValues}}],
+      "verification": { "status": "incomplete" },
+      "commit": { "status": "completed_incomplete", "files": [{{files}}] }
+    }
+    """);
+    await File.WriteAllTextAsync(Path.Combine(folder, "conversion-report.json"), """
+    {
+      "workflow_mode": "sacd_iso_extract",
+      "verification": { "status": "failed" },
+      "pipeline": { "status": "failed", "stopped_phase": "CopyingBack" }
+    }
+    """);
+
+    var plan = PreviousOutputCleanupService.DiscoverArchivedDsdArtifacts(folder);
+    Assert(plan is not null && plan.Files.Select(file => file.RelativePath)
+               .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+               .SequenceEqual(artifacts.OrderBy(path => path, StringComparer.OrdinalIgnoreCase), StringComparer.OrdinalIgnoreCase),
+        "An archived incomplete SACD report must prove its exact existing layout/log artifacts for transactional replacement after a later fallback failure.");
+    PreviousOutputCleanupService.VerifyDirectFileSizes(plan);
+
+    await File.AppendAllTextAsync(Path.Combine(folder, artifacts[0]), "changed");
+    Assert(PreviousOutputCleanupService.DiscoverArchivedDsdArtifacts(folder) is null,
+        "An archived SACD report must not authorize replacement after an existing provenance artifact changes size.");
 }
 
 static async Task AlbumTransactionLockSerializesOwners(string root)
@@ -713,6 +1143,50 @@ static void CreateTaggedDsfFixture(string path, string title, uint track, uint t
     file.Save();
 }
 
+static void CreateDffFixture(string path, byte sample)
+{
+    using var chunks = new MemoryStream();
+    WriteDffChunk(chunks, "FVER", [0x01, 0x05, 0x00, 0x00]);
+
+    using var properties = new MemoryStream();
+    properties.Write("SND "u8);
+    var sampleRate = new byte[4];
+    BinaryPrimitives.WriteUInt32BigEndian(sampleRate, 2_822_400);
+    WriteDffChunk(properties, "FS  ", sampleRate);
+    var channels = new byte[10];
+    BinaryPrimitives.WriteUInt16BigEndian(channels, 2);
+    "SLFT"u8.CopyTo(channels.AsSpan(2, 4));
+    "SRGT"u8.CopyTo(channels.AsSpan(6, 4));
+    WriteDffChunk(properties, "CHNL", channels);
+    var compression = new byte[20];
+    "DSD "u8.CopyTo(compression);
+    compression[4] = 14;
+    System.Text.Encoding.ASCII.GetBytes("not compressed").CopyTo(compression, 5);
+    WriteDffChunk(properties, "CMPR", compression);
+    WriteDffChunk(properties, "LSCO", [0x00, 0x00]);
+    WriteDffChunk(chunks, "PROP", properties.ToArray());
+    WriteDffChunk(chunks, "DSD ", Enumerable.Repeat(sample, 128 * 1024).ToArray());
+
+    using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+    output.Write("FRM8"u8);
+    var size = new byte[8];
+    BinaryPrimitives.WriteUInt64BigEndian(size, checked((ulong)chunks.Length + 4));
+    output.Write(size);
+    output.Write("DSD "u8);
+    chunks.Position = 0;
+    chunks.CopyTo(output);
+}
+
+static void WriteDffChunk(Stream output, string id, byte[] payload)
+{
+    output.Write(System.Text.Encoding.ASCII.GetBytes(id));
+    var size = new byte[8];
+    BinaryPrimitives.WriteUInt64BigEndian(size, checked((ulong)payload.Length));
+    output.Write(size);
+    output.Write(payload);
+    if ((payload.Length & 1) != 0) output.WriteByte(0);
+}
+
 static void BatchPreflightSkipsBlockedAlbums()
 {
     var readyScan = new ScanResult("C:\\Ready", "Ready", WorkflowMode.FlacCueSplit, [], [], [], 1, 1, 0, 1, true, false);
@@ -890,6 +1364,45 @@ static async Task LocalSplitterRunsLocally(string root)
         "The report must prove the bounded in-memory artwork embedded in every FLAC track.");
 }
 
+static async Task LocalClassicalCueInfersComposer(string root)
+{
+    var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var preflight = await new PreflightService().CheckAsync(seed);
+    if (preflight.Tools["ffmpeg"] is not { } ffmpeg || preflight.Tools["ffprobe"] is not { } ffprobe) return;
+
+    var album = Path.Combine(root, "Classical", "Chopin - Piano Concertos - Fliter");
+    Directory.CreateDirectory(album);
+    var source = Path.Combine(album, "Chopin - Piano Concertos.flac");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "sine=frequency=440:duration=0.25", "-c:a", "flac", source);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=blue:s=700x700", "-frames:v", "1", "-update", "1", Path.Combine(album, "Chopin - sleeve.png"));
+    await File.WriteAllTextAsync(Path.Combine(album, "Chopin - Piano Concertos.cue"), """
+    REM GENRE Classical
+    REM DATE 2014
+    PERFORMER "Ingrid Fliter, Scottish Chamber Orchestra, Jun Markl"
+    TITLE "Chopin - Piano Concertos"
+    FILE "Chopin - Piano Concertos.flac" WAVE
+      TRACK 01 AUDIO
+        TITLE "Piano Concerto No. 1 in E minor, Op. 11 - I. Allegro maestoso"
+        INDEX 01 00:00:00
+    """);
+    var scan = await new AlbumScanner().ScanAsync(album);
+    var job = Path.Combine(root, "classical-cue-job");
+    var stagedAlbum = Path.Combine(job, "album");
+    Directory.CreateDirectory(stagedAlbum);
+    var staged = new StagedJob(job, stagedAlbum, ffmpeg, ffprobe, Path.Combine(job, "host-manifest.json"), [],
+        SourceAlbumRoot: album, SourceCacheUsed: false);
+    var result = await new LocalFlacProcessor().ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+
+    Assert(!result.Metadata.RequiresResearch && result.Tracks == 1,
+        "A classical FLAC+CUE release whose exact album and folder name the composer must not remain blocked on COMPOSER.");
+    using var track = TagLib.File.Create(Path.Combine(stagedAlbum,
+        "01 - Piano Concerto No. 1 in E minor, Op. 11 - I. Allegro maestoso.flac"));
+    Assert(track.Tag.Composers.SequenceEqual(["Frédéric Chopin"]) && track.Tag.Pictures.Length == 1,
+        "The inferred canonical Chopin composer and locally named sleeve artwork must be embedded in the split FLAC.");
+}
+
 static async Task LocalMetadataEnrichmentRunsInCode(string root)
 {
     var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
@@ -996,6 +1509,113 @@ static async Task ExternalArtworkFallbackSupportsSacdAndPreservesLocalPriority(s
         albumWithArt, ffmpeg, ffprobe, ArtworkSelectionMode.Dsd, external, "release-sacd-cover");
     Assert(local.Artwork is not null && local.Artwork.Source.Contains("cover.jpg", StringComparison.OrdinalIgnoreCase) && coverRequests == 1,
         "A usable local SACD cover must retain priority and suppress external cover download.");
+
+    var albumWithSleeve = Path.Combine(root, "flac-sleeve-cover");
+    Directory.CreateDirectory(albumWithSleeve);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=purple:s=700x700", "-frames:v", "1", "-update", "1", Path.Combine(albumWithSleeve, "album sleeve.png"));
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=gray:s=700x700", "-frames:v", "1", "-update", "1", Path.Combine(albumWithSleeve, "album inlay.png"));
+    var sleeve = await artwork.PrepareLocalAsync(albumWithSleeve, ffmpeg, ffprobe, ArtworkSelectionMode.Flac);
+    Assert(sleeve.Artwork is not null && sleeve.Artwork.Source.Contains("sleeve.png", StringComparison.OrdinalIgnoreCase),
+        "A square sleeve scan must be accepted as front artwork ahead of an inlay scan.");
+
+    var albumWithCatalogPair = Path.Combine(root, "flac-catalog-front-inlay-pair");
+    Directory.CreateDirectory(albumWithCatalogPair);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=purple:s=700x700", "-frames:v", "1", "-update", "1", Path.Combine(albumWithCatalogPair, "CKD 455.jpg"));
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=gray:s=1400x700", "-frames:v", "1", "-update", "1", Path.Combine(albumWithCatalogPair, "CKD 455-inlay.jpg"));
+    var catalogPair = await artwork.PrepareLocalAsync(albumWithCatalogPair, ffmpeg, ffprobe, ArtworkSelectionMode.Flac);
+    Assert(catalogPair.Artwork is not null && catalogPair.Artwork.Source.Contains("CKD 455.jpg", StringComparison.OrdinalIgnoreCase),
+        "A catalog-named scan must be accepted as the front when its same-base companion is explicitly named as an inlay.");
+
+    var albumWithSoleImage = Path.Combine(root, "flac-sole-arbitrary-cover");
+    Directory.CreateDirectory(albumWithSoleImage);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=yellow:s=619x625", "-frames:v", "1", "-update", "1", Path.Combine(albumWithSoleImage, "CarminaBuranaJochum.jpg"));
+    var soleImage = await artwork.PrepareLocalAsync(albumWithSoleImage, ffmpeg, ffprobe, ArtworkSelectionMode.Flac);
+    Assert(soleImage.Artwork is not null && soleImage.Artwork.Source.Contains("CarminaBuranaJochum.jpg", StringComparison.OrdinalIgnoreCase),
+        "A sole, near-square, non-negative image must be accepted as unambiguous front artwork.");
+
+    var numberedScans = Path.Combine(root, "flac-subject-delta-scans");
+    Directory.CreateDirectory(numberedScans);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=red:s=640x620", "-frames:v", "1", "-update", "1", Path.Combine(numberedScans, "SubjectDelta 01.jpg"));
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=black:s=640x620", "-frames:v", "1", "-update", "1", Path.Combine(numberedScans, "SubjectDelta 02.jpg"));
+    var numbered = await artwork.PrepareLocalAsync(numberedScans, ffmpeg, ffprobe, ArtworkSelectionMode.Flac);
+    Assert(numbered.Artwork is not null && numbered.Artwork.Source.Contains("SubjectDelta 01.jpg", StringComparison.OrdinalIgnoreCase),
+        "A SubjectDelta scan set must use its explicitly numbered first scan instead of rejecting the multi-image folder.");
+
+    var pdfAlbum = Path.Combine(root, "flac-single-image-cover-pdf");
+    Directory.CreateDirectory(pdfAlbum);
+    var pdfHeader = System.Text.Encoding.ASCII.GetBytes($$"""
+        %PDF-1.4
+        1 0 obj <</Count 1/Kids[2 0 R]/Type/Pages>> endobj
+        2 0 obj <</Type/Page/Parent 1 0 R/Resources<</XObject<</Im0 3 0 R>>>>>> endobj
+        3 0 obj <</Type/XObject/Subtype/Image/Filter/DCTDecode/Width 1000/Height 800/Length {{downloadedBytes.Length}}>>stream
+        """);
+    var pdfFooter = System.Text.Encoding.ASCII.GetBytes("\nendstream\nendobj\n%%EOF\n");
+    await using (var pdf = new FileStream(Path.Combine(pdfAlbum, "Album artwork.pdf"), FileMode.CreateNew, FileAccess.Write))
+    {
+        await pdf.WriteAsync(pdfHeader);
+        await pdf.WriteAsync(downloadedBytes);
+        await pdf.WriteAsync(pdfFooter);
+    }
+    var fromPdf = await artwork.PrepareLocalAsync(pdfAlbum, ffmpeg, ffprobe, ArtworkSelectionMode.Flac);
+    Assert(fromPdf.Artwork is not null && fromPdf.Artwork.Source.Contains("one-page cover PDF", StringComparison.OrdinalIgnoreCase),
+        "A one-page PDF containing exactly one DCT JPEG image must supply cover artwork without a raster sidecar.");
+
+    var volumeParent = Path.Combine(root, "flac-volume-parent");
+    var volumeChild = Path.Combine(volumeParent, "Volume 1");
+    Directory.CreateDirectory(volumeChild);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=purple:s=600x600", "-frames:v", "1", "-update", "1", Path.Combine(volumeParent, "album sleeve.jpg"));
+    var parentRoot = LocalTrackRepairProcessor.ParentVolumeArtworkRoot(volumeChild);
+    var parentArtwork = parentRoot is null
+        ? null
+        : await artwork.PrepareLocalAsync(parentRoot, ffmpeg, ffprobe, ArtworkSelectionMode.Flac);
+    Assert(parentArtwork?.Artwork is not null && parentArtwork.Artwork.Source.Contains("sleeve.jpg", StringComparison.OrdinalIgnoreCase) &&
+           LocalTrackRepairProcessor.ParentVolumeArtworkRoot(Path.Combine(volumeParent, "Ordinary Album")) is null,
+        "Only explicitly numbered volume/disc subfolders may inherit a dedicated sleeve from their parent album folder.");
+
+    var sacdAreaParent = Path.Combine(root, "sacd-area-parent");
+    var sacdAreaArtwork = Path.Combine(sacdAreaParent, "Artwork");
+    var stereoArea = Path.Combine(sacdAreaParent, "Album Name");
+    var multichannelArea = Path.Combine(sacdAreaParent, "Album Name Multi-ch");
+    Directory.CreateDirectory(sacdAreaArtwork);
+    Directory.CreateDirectory(stereoArea);
+    Directory.CreateDirectory(multichannelArea);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=purple:s=600x600", "-frames:v", "1", "-update", "1", Path.Combine(sacdAreaArtwork, "01..BookletF.jpg"));
+    Assert(LocalTrackRepairProcessor.SiblingSacdAreaRoot(multichannelArea) == stereoArea &&
+           LocalTrackRepairProcessor.ParentVolumeArtworkRoot(multichannelArea) == sacdAreaParent &&
+           LocalTrackRepairProcessor.ParentVolumeArtworkRoot(Path.Combine(sacdAreaParent, "Unrelated Child")) is null,
+        "A named SACD stereo/multichannel area may inherit its exact-base sibling and a dedicated parent Artwork folder; ordinary child albums remain isolated.");
+
+    var albumWithEmbeddedArt = Path.Combine(root, "sacd-embedded-cover");
+    Directory.CreateDirectory(albumWithEmbeddedArt);
+    var retainedAudio = Path.Combine(albumWithEmbeddedArt, "retained.flac");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "sine=frequency=880:duration=0.25", "-c:a", "flac", retainedAudio);
+    using (var file = TagLib.File.Create(retainedAudio))
+    {
+        file.Tag.Pictures =
+        [
+            new TagLib.Picture(new TagLib.ByteVector(downloadedBytes))
+            {
+                Type = TagLib.PictureType.FrontCover,
+                MimeType = "image/jpeg",
+                Description = "Front cover"
+            }
+        ];
+        file.Save();
+    }
+    var embedded = await artwork.PrepareLocalThenExternalAsync(
+        albumWithEmbeddedArt, ffmpeg, ffprobe, ArtworkSelectionMode.Dsd, external, "release-sacd-cover");
+    Assert(embedded.Artwork is not null && embedded.Artwork.Source.Contains("embedded artwork", StringComparison.OrdinalIgnoreCase) && coverRequests == 1,
+        "SACD must reuse embedded art from retained local audio before requesting an external cover.");
 }
 
 static async Task ExistingTracksRepairUsesPrioritizedEvidenceAndTransactionalCommit(string root)
@@ -1117,6 +1737,459 @@ static async Task ExistingTracksRepairUsesPrioritizedEvidenceAndTransactionalCom
         "A successfully committed existing-track repair must inventory as already completed.");
 }
 
+static async Task ExistingTrackCorruptionNamesTheExactFile(string root)
+{
+    var album = Path.Combine(root, "corrupt-existing-flac");
+    Directory.CreateDirectory(album);
+    await File.WriteAllBytesAsync(Path.Combine(album, "01 - Corrupt Source.flac"), new byte[4096]);
+    await File.WriteAllBytesAsync(Path.Combine(album, "02 - Also Corrupt.flac"), new byte[4096]);
+    var scan = await new AlbumScanner().ScanAsync(album);
+    var preflight = await new PreflightService().CheckAsync(scan);
+    if (!preflight.CanStart) return;
+    var job = PreflightService.CreateJobDirectory(preflight.TempRoot);
+    var staged = await new HostStagingService().StageAsync(scan, preflight, job, new Progress<ProgressSnapshot>());
+    Exception? failure = null;
+    try
+    {
+        await new LocalTrackRepairProcessor(new ExternalMetadataService()).ProcessAsync(
+            scan, staged, new Progress<ProgressSnapshot>());
+    }
+    catch (Exception error) { failure = error; }
+    Assert(failure is InvalidDataException &&
+           failure.Message.Contains("01 - Corrupt Source.flac", StringComparison.OrdinalIgnoreCase) &&
+           failure.Message.Contains("corrupt", StringComparison.OrdinalIgnoreCase),
+        "A malformed existing FLAC must stop safely and identify the exact corrupt source filename.");
+}
+
+static async Task ExistingCompilationUsesDiscogsTrackArtistsAndPrimaryCover(string root)
+{
+    var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var toolCheck = await new PreflightService().CheckAsync(seed);
+    if (toolCheck.Tools["ffmpeg"] is not { } ffmpeg || toolCheck.Tools["ffprobe"] is not { } ffprobe) return;
+
+    var album = Path.Combine(root, "Jazz", "Various Artists - Discogs Compilation");
+    Directory.CreateDirectory(album);
+    var paths = new[] { Path.Combine(album, "01 - First.flac"), Path.Combine(album, "02 - Second.flac") };
+    for (var index = 0; index < paths.Length; index++)
+    {
+        await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+            $"sine=frequency={700 + index * 100}:duration=0.15", "-c:a", "flac", paths[index]);
+        using var file = TagLib.File.Create(paths[index]);
+        file.Tag.Title = index == 0 ? "First" : "Second";
+        file.Tag.Album = "Discogs Compilation";
+        file.Tag.Performers = ["Various Artists"];
+        file.Tag.AlbumArtists = ["Various Artists"];
+        file.Tag.Track = (uint)(index + 1);
+        file.Tag.TrackCount = 2;
+        file.Tag.Disc = 1;
+        file.Tag.DiscCount = 1;
+        file.Tag.Year = 2020;
+        file.Tag.Genres = ["Jazz"];
+        file.Save();
+    }
+    var coverFixture = Path.Combine(root, "discogs-primary-cover.jpg");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=purple:s=96x96", "-frames:v", "1", "-update", "1", coverFixture);
+    var coverBytes = await File.ReadAllBytesAsync(coverFixture);
+
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("api.discogs.com/database/search", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[{"id":4242,"title":"Various - Discogs Compilation","year":"2020","format":["Compilation"]}]}""");
+        if (uri.Contains("api.discogs.com/releases/4242", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""
+            {
+              "title":"Discogs Compilation",
+              "artists":[{"name":"Various"}],
+              "genres":["Jazz"],
+              "images":[{"type":"primary","uri":"https://i.discogs.com/primary-cover.jpeg"}],
+              "tracklist":[
+                {"position":"1","type_":"track","title":"First","artists":[{"name":"First Artist"}]},
+                {"position":"2","type_":"track","title":"Second","artists":[{"name":"Second Artist (2)"}]}
+              ]
+            }
+            """);
+        if (uri.Contains("musicbrainz.org", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"releases":[]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[]}""");
+        if (request.RequestUri?.Host.Equals("i.discogs.com", StringComparison.OrdinalIgnoreCase) == true)
+            return StubHttpHandler.Bytes(coverBytes, "image/jpeg");
+        throw new InvalidOperationException($"Unexpected compilation repair request: {uri}");
+    }));
+    var external = new ExternalMetadataService(client, musicBrainzMinimumInterval: TimeSpan.Zero,
+        discogsMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var scan = await new AlbumScanner().ScanAsync(album);
+    var preflight = await new PreflightService().CheckAsync(scan);
+    Assert(preflight.CanStart, "The Discogs compilation repair fixture must pass preflight.");
+    var job = PreflightService.CreateJobDirectory(preflight.TempRoot);
+    var staged = await new HostStagingService().StageAsync(scan, preflight, job, new Progress<ProgressSnapshot>());
+    var local = await new LocalTrackRepairProcessor(external).ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+
+    using (var original = TagLib.File.Create(paths[0]))
+        Assert(original.Tag.FirstPerformer == "Various Artists" && original.Tag.Pictures.Length == 0,
+            "The local repair transaction must not modify the original compilation track before commit.");
+    using (var first = TagLib.File.Create(Path.Combine(staged.AlbumRoot, "01 - First.flac")))
+        Assert(first.Tag.FirstPerformer == "First Artist" && first.Tag.FirstAlbumArtist == "Various Artists" && first.Tag.Pictures.Length == 1,
+            "A verified Discogs track artist must replace the Various Artists track placeholder while preserving the compilation album artist and embedding the primary cover.");
+    using (var second = TagLib.File.Create(Path.Combine(staged.AlbumRoot, "02 - Second.flac")))
+        Assert(second.Tag.FirstPerformer == "Second Artist" && second.Tag.FirstAlbumArtist == "Various Artists" && second.Tag.Pictures.Length == 1,
+            "Discogs numeric artist disambiguators must be removed from the repaired track credit.");
+    using var report = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(local.ReportPath));
+    var evidence = report.RootElement.GetProperty("metadata_sources").EnumerateArray()
+        .Select(value => value.GetString() ?? string.Empty).ToArray();
+    var reportTracks = report.RootElement.GetProperty("discs")[0].GetProperty("tracks");
+    Assert(evidence.Any(value => value.Contains("per-track artist credits", StringComparison.OrdinalIgnoreCase)) &&
+           reportTracks[0].GetProperty("artist").GetString() == "First Artist" &&
+           reportTracks[0].GetProperty("artist_source").GetString() == "discogs_exact_release_track_artist_credit" &&
+           reportTracks[0].GetProperty("album_artist").GetString() == "Various Artists" &&
+           report.RootElement.GetProperty("cover").GetProperty("source").GetString()!
+               .Contains("i.discogs.com", StringComparison.OrdinalIgnoreCase),
+        "The repair report must identify Discogs track-artist evidence and the in-memory Discogs cover source.");
+}
+
+static async Task TrackPerFileCueRepairsTransactionally(string root)
+{
+    var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var toolCheck = await new PreflightService().CheckAsync(seed);
+    if (toolCheck.Tools["ffmpeg"] is not { } ffmpeg || toolCheck.Tools["ffprobe"] is null) return;
+
+    var album = Path.Combine(root, "Rock", "Track Per File Artist - Track Per File Album");
+    Directory.CreateDirectory(album);
+    var paths = new[]
+    {
+        Path.Combine(album, "01 - First.flac"),
+        Path.Combine(album, "02 - Second.flac"),
+        Path.Combine(album, "03 - Third.flac")
+    };
+    for (var index = 0; index < paths.Length; index++)
+    {
+        await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+            $"sine=frequency={650 + index * 100}:duration=0.15", "-c:a", "flac", paths[index]);
+        using var file = TagLib.File.Create(paths[index]);
+        file.Tag.Title = index switch { 0 => "First", 1 => "Second", _ => "Third" };
+        file.Tag.Album = "Track Per File Album";
+        file.Tag.Performers = ["Track Per File Artist"];
+        file.Tag.AlbumArtists = ["Track Per File Artist"];
+        file.Tag.Track = (uint)(index + 1);
+        file.Tag.TrackCount = 3;
+        file.Tag.Disc = 1;
+        file.Tag.DiscCount = 1;
+        file.Tag.Year = 2020;
+        file.Tag.Genres = ["Rock"];
+        file.Save();
+    }
+    await File.WriteAllTextAsync(Path.Combine(album, "album.cue"), """
+    FILE "01 - First.flac" WAVE
+      TRACK 01 AUDIO
+        INDEX 01 00:00:00
+    FILE "02 - Second.flac" WAVE
+      TRACK 02 AUDIO
+        INDEX 01 00:00:00
+    FILE "03 - Third.flac" WAVE
+      TRACK 03 AUDIO
+        INDEX 01 00:00:00
+    """);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=green:s=96x96", "-frames:v", "1", "-update", "1", Path.Combine(album, "folder.jpg"));
+
+    var scan = await new AlbumScanner().ScanAsync(album);
+    Assert(scan.Mode == WorkflowMode.ExistingTrackRepair && scan.CueCount == 1 && scan.TrackCount == 3,
+        "A one-file-per-track CUE must route to verified existing-track repair.");
+    var preflight = await new PreflightService().CheckAsync(scan);
+    Assert(preflight.CanStart, "A verified one-file-per-track CUE repair must pass preflight.");
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("musicbrainz.org", StringComparison.Ordinal)) return StubHttpHandler.Json("""{"releases":[]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal)) return StubHttpHandler.Json("""{"results":[]}""");
+        throw new InvalidOperationException($"Unexpected track-per-file metadata request: {uri}");
+    }));
+    var external = new ExternalMetadataService(client, discogsToken: null,
+        musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var job = PreflightService.CreateJobDirectory(preflight.TempRoot);
+    var staged = await new HostStagingService().StageAsync(scan, preflight, job, new Progress<ProgressSnapshot>());
+    var local = await new LocalTrackRepairProcessor(external).ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+    var committed = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>(), deleteOriginals: true);
+
+    Assert(local.Tracks == 3 && committed.Tracks == 3 && File.Exists(Path.Combine(album, "album.cue")) &&
+           paths.All(File.Exists),
+        "Track-per-file repair must replace only the FLACs transactionally and retain the CUE as provenance.");
+    var completed = await new AlbumScanner().ScanAsync(album);
+    Assert(completed.Mode == WorkflowMode.Completed && !completed.RequiresProcessing,
+        "A committed one-file-per-track-CUE repair must inventory as complete.");
+}
+
+static async Task StandaloneDsfRepairPreservesNativePayloadAndDeletesRetainedIso(string root)
+{
+    var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var toolCheck = await new PreflightService().CheckAsync(seed);
+    if (toolCheck.Tools["ffmpeg"] is not { } ffmpeg || toolCheck.Tools["ffprobe"] is null) return;
+
+    var album = Path.Combine(root, "Jazz", "Tester - Standalone DSF Album [DSD64]");
+    Directory.CreateDirectory(album);
+    var paths = Enumerable.Range(1, 3)
+        .Select(index => Path.Combine(album, $"{index:00} - Track {index}.dsf"))
+        .ToArray();
+    for (var index = 0; index < paths.Length; index++)
+    {
+        CreateTaggedDsfFixture(paths[index], $"Track {index + 1}", (uint)(index + 1), 3, (byte)(0x30 + index));
+        using var file = TagLib.File.Create(paths[index]);
+        file.Tag.Album = "Standalone DSF Album";
+        file.Tag.Performers = ["Tester"];
+        file.Tag.AlbumArtists = [];
+        file.Tag.Genres = [];
+        file.Tag.Pictures = [];
+        file.Save();
+    }
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=navy:s=900x700", "-frames:v", "1", "-update", "1", Path.Combine(album, "front.jpg"));
+    var retainedIso = Path.Combine(album, "retained-sacd.iso");
+    await File.WriteAllBytesAsync(retainedIso, Enumerable.Range(0, 2048).Select(index => (byte)(index % 241)).ToArray());
+    var payloadsBefore = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var path in paths) payloadsBefore[path] = await DsfAudioPayload.Sha256Async(path);
+
+    var scan = await new AlbumScanner().ScanAsync(album);
+    Assert(scan.Mode == WorkflowMode.ExistingTrackRepair && scan.TrackCount == 3 && scan.ImageCount == 1 && scan.HasDsd,
+        "A standalone DSF album with one retained SACD ISO must enter existing-track repair.");
+    var preflight = await new PreflightService().CheckAsync(scan);
+    Assert(preflight.CanStart, "A same-format standalone DSF album must pass verified write-back preflight.");
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("musicbrainz.org", StringComparison.Ordinal)) return StubHttpHandler.Json("""{"releases":[]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal)) return StubHttpHandler.Json("""{"results":[]}""");
+        throw new InvalidOperationException($"Unexpected standalone-DSF metadata request: {uri}");
+    }));
+    var external = new ExternalMetadataService(client, discogsToken: null,
+        musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var job = PreflightService.CreateJobDirectory(preflight.TempRoot);
+    var staged = await new HostStagingService().StageAsync(scan, preflight, job, new Progress<ProgressSnapshot>());
+    var local = await new LocalTrackRepairProcessor(external).ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+    var committed = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>(), deleteOriginals: true);
+
+    Assert(local.Tracks == 3 && committed.Tracks == 3 && committed.SourcesDeleted && !committed.Incomplete,
+        "Standalone DSF repair must commit all tracks and delete only the verified retained ISO when requested.");
+    Assert(!File.Exists(retainedIso),
+        "A coexisting SACD ISO must be deleted after complete final-path DSF payload, tag, and artwork verification.");
+    foreach (var path in paths)
+    {
+        Assert(await DsfAudioPayload.Sha256Async(path) == payloadsBefore[path],
+            "Standalone DSF repair must preserve the exact native DSD data chunk.");
+        using var file = TagLib.File.Create(path);
+        Assert(file.Tag.FirstAlbumArtist == "Tester" && file.Tag.FirstGenre == "Jazz" && file.Tag.Disc == 1 &&
+               file.Tag.Pictures.Length > 0,
+            "Standalone DSF repair must fill album artist, library genre, disc numbering, and embedded artwork.");
+    }
+    using var report = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(committed.ReportPath));
+    Assert(report.RootElement.GetProperty("format").GetString() == "dsf" &&
+           report.RootElement.GetProperty("verification").GetProperty("audio_payload_equivalence").GetString() == "passed" &&
+           report.RootElement.GetProperty("verification").GetProperty("sources_deleted").GetBoolean() &&
+           report.RootElement.GetProperty("deletion").GetProperty("files").GetArrayLength() == 1,
+        "The standalone DSF repair report must record payload equivalence and the exact retained-ISO deletion.");
+    var completed = await new AlbumScanner().ScanAsync(album);
+    Assert(completed.Mode == WorkflowMode.Completed && !completed.RequiresProcessing,
+        "A verified standalone DSF repair must inventory as complete on the next scan.");
+}
+
+static async Task StandaloneDffRepairPreservesNativePayloadAndDeletesRetainedIso(string root)
+{
+    var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var toolCheck = await new PreflightService().CheckAsync(seed);
+    if (toolCheck.Tools["ffmpeg"] is not { } ffmpeg || toolCheck.Tools["ffprobe"] is not { } ffprobe) return;
+
+    var album = Path.Combine(root, "Jazz", "Tester - Standalone DFF Album (SACD-R)");
+    var covers = Path.Combine(album, "covers");
+    Directory.CreateDirectory(covers);
+    var paths = Enumerable.Range(1, 3)
+        .Select(index => Path.Combine(album, $"{index:00} - Tester - Track {index}.dff"))
+        .ToArray();
+    for (var index = 0; index < paths.Length; index++)
+    {
+        CreateDffFixture(paths[index], (byte)(0x40 + index));
+        await DffMetadata.SaveAsync(paths[index], new(
+            $"Track {index + 1}", "Standalone DFF Album", "Tester", null,
+            (uint)(index + 1), 3, 0, 0, 2006, "Jazz", null, null));
+    }
+    var iso = Path.Combine(album, "retained-sacd.iso");
+    await File.WriteAllBytesAsync(iso, Enumerable.Range(0, 4096).Select(index => (byte)(index % 251)).ToArray());
+    var coverPath = Path.Combine(covers, "01.tif");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=teal:s=900x700", "-frames:v", "1", "-c:v", "tiff", coverPath);
+    var missingRowsPerStrip = CreateRgbTiffWithoutRowsPerStrip();
+    var repairedRowsPerStrip = InMemoryArtworkService.RepairMissingTiffRowsPerStrip(missingRowsPerStrip);
+    Assert(repairedRowsPerStrip is not null &&
+           InMemoryArtworkService.RepairMissingTiffRowsPerStrip(repairedRowsPerStrip) is null,
+        "The TIFF fallback must add one RowsPerStrip directory entry in memory without altering the source scan.");
+
+    var payloadsBefore = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var path in paths) payloadsBefore[path] = await DffMetadata.AudioSha256Async(path);
+
+    var scan = await new AlbumScanner().ScanAsync(album);
+    Assert(scan.Mode == WorkflowMode.ExistingTrackRepair && scan.TrackCount == 3 && scan.ImageCount == 1 &&
+           scan.Media.Count(item => item.Kind == "Existing DFF") == 3,
+        "Standalone DFF tracks with one retained SACD ISO must enter existing-track repair.");
+    var preflight = await new PreflightService().CheckAsync(scan);
+    Assert(preflight.CanStart, "Same-format standalone DFF tracks with one retained ISO must pass preflight.");
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("musicbrainz.org", StringComparison.Ordinal)) return StubHttpHandler.Json("""{"releases":[]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal)) return StubHttpHandler.Json("""{"results":[]}""");
+        throw new InvalidOperationException($"Unexpected standalone-DFF metadata request: {uri}");
+    }));
+    var external = new ExternalMetadataService(client, discogsToken: null,
+        musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var job = PreflightService.CreateJobDirectory(preflight.TempRoot);
+    var staged = await new HostStagingService().StageAsync(scan, preflight, job, new Progress<ProgressSnapshot>());
+    var retainedLocal = await new LocalTrackRepairProcessor(external).ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+    var retainedCommit = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>(), deleteOriginals: false);
+
+    Assert(retainedLocal.Tracks == 3 && retainedCommit.Tracks == 3 && !retainedCommit.SourcesDeleted && File.Exists(iso),
+        "Clearing Delete originals must retain the coexisting SACD ISO after DFF repair.");
+    using (var retainedReport = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(retainedCommit.ReportPath)))
+        Assert(retainedReport.RootElement.GetProperty("deletion").GetProperty("policy").GetString() ==
+               "retained_sacd_iso_by_user_request_after_existing_dsd_track_repair",
+            "A user-retained ISO must receive an explicit terminal policy instead of the legacy non-deletion policy.");
+    Assert((await new AlbumScanner().ScanAsync(album)).Mode == WorkflowMode.Completed,
+        "A new report that explicitly retains the ISO by user request must remain completed.");
+
+    var legacyReport = System.Text.Json.Nodes.JsonNode.Parse(await File.ReadAllTextAsync(retainedCommit.ReportPath))!.AsObject();
+    legacyReport["deletion"]!["policy"] = "transactional_existing_track_replacement_without_source_deletion";
+    await File.WriteAllTextAsync(retainedCommit.ReportPath,
+        legacyReport.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    scan = await new AlbumScanner().ScanAsync(album);
+    Assert(scan.Mode == WorkflowMode.ExistingTrackRepair,
+        "A legacy completed DFF repair with one still-retained ISO must be readmitted for verified source disposition.");
+    preflight = await new PreflightService().CheckAsync(scan);
+    Assert(preflight.CanStart, "A readmitted legacy retained-ISO repair must pass preflight.");
+    job = PreflightService.CreateJobDirectory(preflight.TempRoot);
+    staged = await new HostStagingService().StageAsync(scan, preflight, job, new Progress<ProgressSnapshot>());
+    var local = await new LocalTrackRepairProcessor(external).ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+    var committed = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>(), deleteOriginals: true);
+
+    Assert(local.Tracks == 3 && committed.Tracks == 3 && committed.SourcesDeleted && !committed.Incomplete,
+        "Standalone DFF repair must commit all tracks and delete only the verified retained ISO when requested.");
+    Assert(!File.Exists(iso),
+        "A coexisting SACD ISO must be deleted after complete final-path DFF payload, tag, and artwork verification.");
+    foreach (var path in paths)
+    {
+        Assert(await DffMetadata.AudioSha256Async(path) == payloadsBefore[path],
+            "Standalone DFF repair must preserve the exact native DSD chunk.");
+        var tag = DffMetadata.Read(path);
+        Assert(tag.AlbumArtist == "Tester" && tag.Genre == "Jazz" && tag.Disc == 1 &&
+               tag.Picture is { Length: > 0 } && tag.SampleRate == 2_822_400 && tag.Channels == 2,
+            "Standalone DFF repair must fill tags and embed normalized TIFF-derived artwork.");
+    }
+    using var report = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(committed.ReportPath));
+    Assert(report.RootElement.GetProperty("format").GetString() == "dff" &&
+           report.RootElement.GetProperty("verification").GetProperty("audio_payload_equivalence").GetString() == "passed" &&
+           report.RootElement.GetProperty("verification").GetProperty("sources_deleted").GetBoolean() &&
+           report.RootElement.GetProperty("deletion").GetProperty("files").GetArrayLength() == 1 &&
+           report.RootElement.GetProperty("deletion").GetProperty("files")[0].GetString() == "retained-sacd.iso",
+        "The standalone DFF repair report must record payload equivalence and only the retained-ISO deletion target.");
+    var completed = await new AlbumScanner().ScanAsync(album);
+    Assert(completed.Mode == WorkflowMode.Completed && !completed.RequiresProcessing,
+        "A verified DFF repair after retained-ISO deletion must inventory as complete on the next scan.");
+}
+
+static async Task ExactDuplicateExistingTracksAreCollapsedTransactionally(string root)
+{
+    var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var toolCheck = await new PreflightService().CheckAsync(seed);
+    if (toolCheck.Tools["ffmpeg"] is not { } ffmpeg || toolCheck.Tools["ffprobe"] is null) return;
+
+    var album = Path.Combine(root, "Rock", "Exact Duplicate Artist - Exact Duplicate Album");
+    Directory.CreateDirectory(album);
+    var first = Path.Combine(album, "01 - First.flac");
+    var second = Path.Combine(album, "02 - Second.flac");
+    var duplicate = Path.Combine(album, "02.Second duplicate.flac");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "sine=frequency=720:duration=0.15", "-c:a", "flac", first);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "sine=frequency=860:duration=0.15", "-c:a", "flac", second);
+    for (var index = 0; index < 2; index++)
+    {
+        var path = index == 0 ? first : second;
+        using var file = TagLib.File.Create(path);
+        file.Tag.Title = index == 0 ? "First" : "Second";
+        file.Tag.Album = "Exact Duplicate Album";
+        file.Tag.Performers = ["Exact Duplicate Artist"];
+        file.Tag.AlbumArtists = ["Exact Duplicate Artist"];
+        file.Tag.Track = (uint)(index + 1);
+        file.Tag.TrackCount = 2;
+        file.Tag.Disc = 1;
+        file.Tag.DiscCount = 1;
+        file.Tag.Year = 2020;
+        file.Tag.Genres = ["Rock"];
+        file.Save();
+    }
+    File.Copy(second, duplicate);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=purple:s=96x96", "-frames:v", "1", "-update", "1", Path.Combine(album, "folder.jpg"));
+
+    var scan = await new AlbumScanner().ScanAsync(album);
+    Assert(scan.Mode == WorkflowMode.ExistingTrackRepair && scan.TrackCount == 3,
+        "Three physical FLAC entries must remain visible to the scanner before exact duplicate validation.");
+    var preflight = await new PreflightService().CheckAsync(scan);
+    Assert(preflight.CanStart, "An existing-track album containing an exact duplicate must pass repair preflight.");
+
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("musicbrainz.org", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"releases":[]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[]}""");
+        throw new InvalidOperationException($"Unexpected exact-duplicate metadata request: {uri}");
+    }));
+    var external = new ExternalMetadataService(client, discogsToken: null,
+        musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var job = PreflightService.CreateJobDirectory(preflight.TempRoot);
+    var staged = await new HostStagingService().StageAsync(scan, preflight, job, new Progress<ProgressSnapshot>());
+    var local = await new LocalTrackRepairProcessor(external).ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+
+    Assert(local.Tracks == 2 && !local.Metadata.RequiresResearch,
+        "A byte-identical same-coordinate duplicate must collapse to the logical two-track album before metadata resolution.");
+    using (var report = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(local.ReportPath)))
+    {
+        var deduplicated = report.RootElement.GetProperty("deduplicated_tracks");
+        Assert(deduplicated.GetArrayLength() == 1 &&
+               deduplicated[0].GetProperty("removed_file").GetString() == "02.Second duplicate.flac" &&
+               deduplicated[0].GetProperty("retained_file").GetString() == "02 - Second.flac" &&
+               deduplicated[0].GetProperty("source_file_sha256").GetString()?.Length == 64,
+            "The repair report must identify the exact duplicate, retained file, and source full-file hash.");
+    }
+    Assert(File.Exists(duplicate), "Local processing must not remove a duplicate from the source album before commit.");
+
+    var changedDuplicate = await File.ReadAllBytesAsync(duplicate);
+    changedDuplicate[changedDuplicate.Length / 2] ^= 0x01;
+    await File.WriteAllBytesAsync(duplicate, changedDuplicate);
+    Exception? changedSourceError = null;
+    try
+    {
+        await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>(), deleteOriginals: true);
+    }
+    catch (Exception error)
+    {
+        changedSourceError = error;
+    }
+    Assert(changedSourceError is IOException &&
+           changedSourceError.Message.Contains("changed after inventory", StringComparison.OrdinalIgnoreCase) &&
+           File.Exists(first) && File.Exists(second) && File.Exists(duplicate),
+        "A same-size source change after local validation must fail closed before any album file is moved.");
+    File.Copy(second, duplicate, overwrite: true);
+
+    var committed = await new HostCommitService().CommitAsync(scan, staged, new Progress<ProgressSnapshot>(), deleteOriginals: true);
+    Assert(committed.Tracks == 2 && File.Exists(first) && File.Exists(second) && !File.Exists(duplicate),
+        "Commit must transactionally retain the canonical files and remove only the revalidated byte-identical duplicate entry.");
+    var completed = await new AlbumScanner().ScanAsync(album);
+    Assert(completed.Mode == WorkflowMode.Completed && !completed.RequiresProcessing &&
+           completed.Media.Count(item => item.Kind == "Previous Album Fixer output") == 2,
+        "The committed exact-duplicate repair must inventory as a completed logical two-track album.");
+}
+
 static void DuplicateTaggedBonusTrackUsesFilenameAnchor()
 {
     var evidence = Enumerable.Range(1, 14)
@@ -1131,6 +2204,18 @@ static void DuplicateTaggedBonusTrackUsesFilenameAnchor()
         [(1u, (uint?)14, null, "Bonus A"), (1u, (uint?)14, null, "Bonus B")]);
     Assert(stillAmbiguous[0] == 14 && stillAmbiguous[1] == 14,
         "Duplicate tagged coordinates without a unique filename anchor must remain ambiguous instead of being silently reordered.");
+
+    var repeatedMiddleTags = Enumerable.Range(1, 12)
+        .Select(number => (1u, (uint?)(number switch { 9 => 7, 10 => 8, 11 => 9, 12 => 10, _ => number }),
+            (uint?)number, $"aurelio-darandi-{number:00}-track-{number:00}"))
+        .ToArray();
+    var repairedSequence = LocalTrackRepairProcessor.ResolveTrackNumbers(repeatedMiddleTags);
+    Assert(repairedSequence.SequenceEqual(Enumerable.Range(1, 12).Select(number => (uint)number)),
+        "A complete unique 1..N filename sequence must repair contradictory repeated embedded track tags as one album-level decision.");
+
+    var parsedSceneName = LocalTrackRepairProcessor.ParseFileName("aurelio-darandi-07-sananaru");
+    Assert(parsedSceneName.Number == 7 && parsedSceneName.Title == "sananaru",
+        "Scene-style filenames may carry the track number after artist and album text.");
 }
 
 static void RecognizedGenreFoldersAreNotArtistEvidence()
@@ -1146,6 +2231,297 @@ static void RecognizedGenreFoldersAreNotArtistEvidence()
     var albumRoot = Path.Combine(Path.GetTempPath(), "Music", "Alternative", "Random Access Memories [Limited Box Set Edition]");
     Assert(LibraryFolderMetadata.InferGenre(albumRoot) == "Alternative",
         "A recognized Alternative library folder may supply GENRE while remaining ineligible as ARTIST or ALBUMARTIST evidence.");
+}
+
+static void ClassicalComposerUsesCorroboratedAlbumIdentity()
+{
+    var composer = LocalTrackRepairProcessor.InferClassicalComposer(
+        "A. Dvořák - String Quintet Op. 77",
+        "Dvorak String Quintet - Berlin Philharmonic - SoS Bonus - FLAC 5CH",
+        "Classical",
+        ["Berlin Philharmonic String Quintet"]);
+    Assert(composer == "A. Dvořák",
+        "A missing classical COMPOSER must be resolved when the album tag names it, the album folder independently corroborates its surname, and it differs from the performer.");
+
+    var attachedInitialComposer = LocalTrackRepairProcessor.InferClassicalComposer(
+        "A.Dvorák - String Quintet Op.77",
+        "Dvorak String Quintet - Berlin Philharmonic - SoS Bonus - FLAC24",
+        "Classical",
+        ["Berlin Philharmonic String Quintet"]);
+    Assert(attachedInitialComposer == "A. Dvorák",
+        "A composer initial attached to the surname must be normalized before surname corroboration so equivalent FLAC editions resolve consistently.");
+
+    Assert(LocalTrackRepairProcessor.InferClassicalComposer(
+               "A. Dvořák - String Quintet Op. 77",
+               "Unrelated Album Folder",
+               "Classical",
+               ["Berlin Philharmonic String Quintet"]) is null &&
+           LocalTrackRepairProcessor.InferClassicalComposer(
+               "Berlin Philharmonic String Quintet - String Quintet Op. 77",
+               "Berlin Philharmonic String Quintet - Bonus",
+               "Classical",
+               ["Berlin Philharmonic String Quintet"]) is null &&
+           LocalTrackRepairProcessor.InferClassicalComposer(
+               "A. Dvořák - String Quintet Op. 77",
+               "Dvorak String Quintet - Bonus",
+               "Rock",
+               ["Berlin Philharmonic String Quintet"]) is null,
+        "Composer inference must stop when folder corroboration is absent, the candidate is the performer, or the release is not classical/opera.");
+}
+
+static void ClassicalTrackComposersUseReviewedAlbumAndWorkEvidence()
+{
+    var beethoven = LocalTrackRepairProcessor.InferClassicalTrackComposers(
+        "BEETHOVEN Piano Concerto No 2",
+        "BEETHOVEN-Piano-Concerto-No-2-FLAC24",
+        "Classical",
+        [("Piano Concerto No 2 i Allegro", "Piano Concerto No 2 i Allegro"),
+         ("Piano Concerto No 2 ii Adagio", "Piano Concerto No 2 ii Adagio")]);
+    Assert(beethoven.SequenceEqual(["Ludwig van Beethoven", "Ludwig van Beethoven"]),
+        "A sole reviewed composer surname in a classical album identity must fill every track without treating performers as composers.");
+
+    var rachmaninoffBalakirev = LocalTrackRepairProcessor.InferClassicalTrackComposers(
+        "RACHMANINOV Symphony No 1 & BALAKIREV Tamara",
+        "RACHMANINOV-Symphony-No-1-&-BALAKIREV-Tamara-FLAC24",
+        "Classical",
+        [("Symphony No 1 in D minor i Grave", "Symphony No 1 in D minor i Grave"),
+         ("Symphony No 1 in D minor ii Allegro", "Symphony No 1 in D minor ii Allegro"),
+         ("Tamara", "Tamara")]);
+    Assert(rachmaninoffBalakirev.SequenceEqual(["Sergei Rachmaninoff", "Sergei Rachmaninoff", "Mily Balakirev"]),
+        "Multiple album composers must be assigned only when each track matches the work identity associated with that composer.");
+
+    var mixedStrings = LocalTrackRepairProcessor.InferClassicalTrackComposers(
+        "VAUGHAN WILLIAMS Fantasia on a Theme by Thomas Tallis, BRITTEN Variations on a Theme of Frank Bridge",
+        "VAUGHAN-WILLIAMS-BRITTEN-FLAC24",
+        "Classical",
+        [("Introduction and Allegro", "ELGAR Introduction and Allegro for Strings"),
+         ("Fantasia on a Theme by Thomas Tallis", "VAUGHAN WILLIAMS Fantasia on a Theme by Thomas Tallis"),
+         ("Variations: Introduction", "BRITTEN Variations on a Theme of Frank Bridge")]);
+    Assert(mixedStrings.SequenceEqual(["Edward Elgar", "Ralph Vaughan Williams", "Benjamin Britten"]),
+        "An explicit reviewed surname in each filename must support track-specific composers, including a composer absent from the album title.");
+
+    var mixedRomantics = LocalTrackRepairProcessor.InferClassicalTrackComposers(
+        "MENDELSSOHN Symphony No 3, Hebrides Overture SCHUMANN Piano Concerto",
+        "Mendelssohn-Schumann-FLAC24",
+        "Classical",
+        [("The Hebrides Overture", "MENDELSSOHN The Hebrides Overture"),
+         ("Piano Concerto i Allegro", "SCHUMANN Piano Concerto i Allegro"),
+         ("Symphony No 3 i Andante", "MENDELSSOHN Symphony No 3 i Andante")]);
+    Assert(mixedRomantics.SequenceEqual(["Felix Mendelssohn", "Robert Schumann", "Felix Mendelssohn"]),
+        "Explicit composer surnames in a mixed classical track list must override ambiguous album-wide ordering.");
+
+    var singleComposerAlbums = new[]
+    {
+        ("Brahms-Clarinet Trio & Quintet", "Brahms-Clarinet Trio & Quintet", "Johannes Brahms"),
+        ("BERLIOZ Roméo et Juliette", "BERLIOZ-Romeo-et-Juliette-FLAC24", "Hector Berlioz"),
+        ("Arcangelo Corelli - Opus 6: Concerti Grossi", "Corelli - Concerti Grossi Op.6, The Avison Ensemble (2012)", "Arcangelo Corelli"),
+        ("DVORAK Symphony No 7", "DVORAK-Symphony-No-7-FLAC24", "Antonín Dvořák"),
+        ("SCRIABIN Symphony No 1", "SCRIABIN-SYMPHONY-No1-FLAC24", "Alexander Scriabin"),
+        ("SIBELIUS Symphonies Nos 1 & 4", "SIBELIUS-Symphonies-Nos-1-and-4-FLAC24", "Jean Sibelius"),
+        ("STRAUSS Elektra", "STRAUSS-Elektra-FLAC24", "Richard Strauss"),
+        ("WALTON Belshazzar's Feast & Symphony No 1", "WALTON-Belshazzar's-Feast-&-Symphony-No-1-FLAC24", "William Walton")
+    };
+    Assert(singleComposerAlbums.All(value => LocalTrackRepairProcessor.InferClassicalTrackComposers(
+               value.Item1, value.Item2, "Classical", [("First movement", "First movement")]).Single() == value.Item3),
+        "Each reviewed single-composer album identity from the failed batch must resolve its canonical composer deterministically.");
+
+    var nielsenMozart = LocalTrackRepairProcessor.InferClassicalTrackComposers(
+        "Nielsen & Mozart: Clarinet Concertos", "Neilsen-Mozart-Clarinet-Concertos", "Classical",
+        [("Clarinet Concerto - I. Allegretto un poco", "01 - Clarinet Concerto - I. Allegretto un poco"),
+         ("Clarinet Concerto - IV. Allegro vivace", "04 - Clarinet Concerto - IV. Allegro vivace"),
+         ("Non che non sei capace, K. 419", "05 - Non che non sei capace K 419"),
+         ("Clarinet Concerto in A major, K. 622", "07 - Clarinet Concerto in A major K622")]);
+    Assert(nielsenMozart.SequenceEqual(["Carl Nielsen", "Carl Nielsen", "Wolfgang Amadeus Mozart", "Wolfgang Amadeus Mozart"]),
+        "Mozart K-catalog evidence must identify its tracks and conservatively assign the remaining two-composer album tracks to Nielsen.");
+
+    var mozartVieuxtemps = LocalTrackRepairProcessor.InferClassicalTrackComposers(
+        "Violin Concertos: Mozart 5 & Vieuxtemps 4", "Mozart-Vieuxtemps-Violin-Concertos", "Classical",
+        [("Violin Concerto No. 5 in A, K. 219", "01 Violin Concerto K219"),
+         ("Violin Concerto No. 4 in D minor, Op. 31", "04 Violin Concerto Op 31"),
+         ("Hilary Hahn and Paavo Järvi in Conversation, Pt. 1", "08 Conversation Pt 1")]);
+    Assert(mozartVieuxtemps.SequenceEqual(["Wolfgang Amadeus Mozart", "Henri Vieuxtemps", null]),
+        "Two-composer catalog inference must resolve the musical works while leaving interview or conversation tracks without an invented composer.");
+
+    var explicitCompilation = LocalTrackRepairProcessor.InferClassicalTrackComposers(
+        "Piano", "Myung Whun Chung - Piano", "Classical",
+        [("Debussy: Clair de Lune", "01 - Debussy- Clair de Lune"),
+         ("Chopin: Nocturne", "02 - Chopin- Nocturne"),
+         ("Schubert: Impromptu", "03 - Schubert- Impromptu"),
+         ("Tchaikovsky: Autumn Song", "04 - Tchaikovsky- Autumn Song")]);
+    Assert(explicitCompilation.SequenceEqual(["Claude Debussy", "Frédéric Chopin", "Franz Schubert", "Pyotr Ilyich Tchaikovsky"]),
+        "Per-track surnames must resolve a recital compilation without inventing an album-wide composer.");
+
+    var shostakovichShchedrin = LocalTrackRepairProcessor.InferClassicalTrackComposers(
+        "MAR0509 SHOSTAKOVICH & SHCHEDRIN Piano Concertos",
+        "Shostakovich & Shchedrin Piano Concertos - Marinsky - FLAC24", "Classical",
+        [("Piano Concerto No 1", "01 Shostakovich Piano Concerto No 1"),
+         ("Piano Concerto No 5", "08 Shchedrin Piano Concerto No 5")]);
+    Assert(shostakovichShchedrin.SequenceEqual(["Dmitri Shostakovich", "Rodion Shchedrin"]) &&
+           LocalTrackRepairProcessor.InferReviewedReleaseYear(
+               "MAR0509 SHOSTAKOVICH & SHCHEDRIN Piano Concertos",
+               "Shostakovich & Shchedrin Piano Concertos - Marinsky - FLAC24") == 2012 &&
+           LocalTrackRepairProcessor.InferReviewedReleaseYear("Other Piano Concertos", "Other Album") is null,
+        "The exact MAR0509 identity must supply its reviewed 2012 release year and track-specific composers without affecting unrelated releases.");
+
+    Assert(LocalTrackRepairProcessor.InferClassicalTrackComposers(
+               "Wagner / Dressler: The Symphonic Ring", "Wagner Dressler The Symphonic Ring", "Classical",
+               [("Prelude Rhinegold", "01 - Prelude Rhinegold")]).Single() == "Richard Wagner",
+        "The Symphonic Ring must credit Richard Wagner as composer; Dressler's name must not be misclassified from the arrangement title.");
+
+    Assert(LocalTrackRepairProcessor.InferClassicalTrackComposers(
+               "Unknown Symphony", "Unknown-Symphony-FLAC24", "Classical",
+               [("Symphony i", "Symphony i")]).Single() is null,
+        "Unknown classical text must remain unresolved instead of inventing a composer.");
+
+    var opus3Titles = new (string? Title, string FileTitle)[]
+    {
+        ("1.Here's that rainy day", "Here's that rainy day"),
+        ("2.Teach me Tonight", "Teach me Tonight"),
+        (" 3.Black Beauty", "Black Beauty"),
+        ("4.Where the green grass grows", "Where the green grass grows"),
+        ("5.Vaquero", "Vaquero"),
+        ("6.La Maja de Goya", "La Maja de Goya"),
+        ("7.Nun komm der Heiden Heiland", "Nun komm der Heiden Heiland"),
+        ("8.Scherzo from Symphony no.2 in D Major", "Scherzo"),
+        ("9.Overture to Carmen", "Overture to Carmen")
+    };
+    var opus3Composers = LocalTrackRepairProcessor.InferReviewedTrackComposers(
+        "Opus3 DSD Showcase1", "Opus3 DSD Showcase 1", opus3Titles);
+    Assert(opus3Composers.SequenceEqual([
+               "Jimmy Van Heusen", "Gene de Paul", "Duke Ellington", "Eric Bibb", "Göran Wennerbrandt",
+               "Enrique Granados", "Johann Sebastian Bach", "Ludwig van Beethoven", "Georges Bizet"]),
+        "The exact Opus3 DSD Showcase 1 title sequence must receive its reviewed per-track composer credits.");
+
+    var alteredOpus3Titles = opus3Titles.ToArray();
+    alteredOpus3Titles[4] = ("Different Vaquero", "05 - Different Vaquero");
+    Assert(LocalTrackRepairProcessor.InferReviewedTrackComposers(
+               "Opus3 DSD Showcase1", "Opus3 DSD Showcase 1", alteredOpus3Titles).All(value => value is null) &&
+           LocalTrackRepairProcessor.InferReviewedTrackComposers(
+               "Opus3 DSD Showcase1", "Other Showcase", opus3Titles).All(value => value is null),
+        "Reviewed compilation credits must not leak to a release with a changed title sequence or folder identity.");
+
+    var linnVolume3Titles = new (string? Title, string FileTitle)[]
+    {
+        ("He never mentioned love", "01 - He never mentioned love"),
+        ("Painting by Numbers", "02 - Painting by Numbers"),
+        ("Beautiful Life", "03 - Beautiful Life"),
+        ("Yes I Know When I ve Had It", "04 - Yes I Know When I ve Had It"),
+        ("Love At Last", "05 - Love At Last"),
+        ("A Case of You", "06 - A Case of You"),
+        ("Grandes Etudes de Paganini Etude III", "07 - Grandes Etudes de Paganini Etude III"),
+        ("March, (K.189)", "08 - March K 189"),
+        ("Capriccio Espagnol Op.34 Scena e canto gitano", "09 - Capriccio Espagnol Op 34 Scena e canto gitano"),
+        ("Ludlow and Teme - When I was one and twenty", "10 - Ludlow and Teme - When I was one and twenty"),
+        ("Messiah: And the Glory of the Lord (chorus)", "11 - Messiah And the Glory of the Lord chorus"),
+        ("A Chloris", "12 - A Chloris"),
+        ("Missa Brevis - Kyrie", "13 - Missa Brevis - Kyrie"),
+        ("Sonata for Clarinet and Piano Allegro Con Fuoco", "14 - Sonata for Clarinet and Piano Allegro Con Fuoco"),
+        ("Sonata ‘Graz’ (No.3) for violin & continuo in D, RV 11 Allegro", "15 - Sonata Graz No 3 for violin continuo in D RV 11 Allegro"),
+        ("Cumbees", "16 - Cumbees")
+    };
+    var linnVolume3Composers = LocalTrackRepairProcessor.InferReviewedTrackComposers(
+        "Super Audio Surround Collection Vol 3 sampler",
+        "Linn Records - The Super Audio Collection Volume 3", linnVolume3Titles);
+    Assert(linnVolume3Composers.Take(6).All(value => value is null) &&
+           linnVolume3Composers.Skip(6).SequenceEqual([
+               "Franz Liszt", "Wolfgang Amadeus Mozart", "Nikolai Rimsky-Korsakov", "Ivor Gurney",
+               "George Frideric Handel", "Reynaldo Hahn", "James MacMillan", "Francis Poulenc",
+               "Antonio Vivaldi", "Santiago de Murcia"]),
+        "The exact Linn Volume 3 sequence must distinguish its six nonclassical selections from ten reviewed classical work credits.");
+
+    var linnXmasTitles = new[]
+    {
+        "Almost Like Being In Love", "24 Preludes, Op. 28: No. 15 in D flat Major 'Raindrop'",
+        "The Man Who Sold The World", "Brandenburg Concerto No. 2 in F Major, BWV 1047 - III. Allegro",
+        "Many Rivers To Cross", "Symphony No. 2 in C major, Op. 61 - III. Adagio espressivo", "Secret Love",
+        "The Well-Tempered Clavier Book I: Prelude & Fugue No. 21 in B flat Major, BWV 866", "Old Greenwich Time",
+        "Recorder Concerto in F Major: III. Allegro", "Twitter and Bisted", "Flute Concerto: II. Alla Marcia",
+        "Forty-two", "Symphonie No. 2 in C minor: III. Scherzo: Massig schnell", "We'll Never Have Manhattan",
+        "Sonnerie de Sainte Genevieve du Mont de Paris", "Giant Steps", "The End Of A Love Affair",
+        "Nicholas Drake", "Requiem in D minor, K. 626: I. Requiem aeternam", "Pause", "L'Envie: Vocalise No. 28",
+        "Toccata and Fugue in A minor, after Bach BWV 565", "Both Sides Now", "Caledonia"
+    }.Select((title, index) => ((string?)title, $"{index + 1:D2} - {title}")).ToArray();
+    var linnXmasComposers = LocalTrackRepairProcessor.InferReviewedTrackComposers(
+        "24-bits of Christmas 2014", "Linn Records - Xmas Gifts 2014", linnXmasTitles);
+    Assert(linnXmasComposers[1] == "Frédéric Chopin" &&
+           linnXmasComposers[9] == "Johann Friedrich Fasch" &&
+           linnXmasComposers[21] == "Gabriel Fauré" &&
+           linnXmasComposers[0] is null && linnXmasComposers[23] is null,
+        "The exact Linn 2014 Christmas sequence must add reviewed composer credits only to its classical selections.");
+}
+
+static void CompilationIdentityAndClassicalTrackEvidenceAreConservative()
+{
+    var commonLead = LocalTrackRepairProcessor.ResolveTrackAlbumArtist(
+    [
+        "Maria Callas, Orchestra del Teatro alla Scala di Milano, Tullio Serafin",
+        "Maria Callas, Philharmonia Orchestra, Alceo Galliera",
+        "Maria Callas, Orchestre National de la Radiodiffusion Française, Georges Prêtre"
+    ]);
+    Assert(commonLead == "Maria Callas",
+        "A common leading performer on every track must become the album artist without copying one long track-specific credit.");
+
+    var compilationArtist = LocalTrackRepairProcessor.ResolveTrackAlbumArtist(
+        ["Plaid", "John Metcalfe", "Cara Dillon", "Hannah Peel"]);
+    Assert(compilationArtist == "Various Artists",
+        "Three or more distinct track artists must establish a Various Artists compilation instead of choosing one arbitrarily.");
+
+    Assert(!ClassicalMetadataPolicy.RequiresComposer("Classical, pop, jazz", "Makin' Whoopee") &&
+           !ClassicalMetadataPolicy.RequiresComposer("Jazz, Rock, Pop, Classical, Folk, World, & Country", "Blackwood") &&
+           !ClassicalMetadataPolicy.RequiresComposer("Classical", "Makin' Whoopee", isCompilation: true) &&
+           ClassicalMetadataPolicy.RequiresComposer("Classical", "Recorder Concerto in F Major", isCompilation: true) &&
+           ClassicalMetadataPolicy.RequiresComposer("Classical, pop, jazz", "Symphony No. 40 in G minor, K 550, I. Molto Allegro") &&
+           ClassicalMetadataPolicy.RequiresComposer("Classical, pop, jazz", "Grandes Etudes de Paganini – Etude III") &&
+           ClassicalMetadataPolicy.RequiresComposer("Classical", "Ave Maria"),
+        "Mixed-genre compilations must require COMPOSER only for titles with explicit classical-work evidence, while a purely classical album retains the requirement for every musical track.");
+
+    Assert(LocalTrackRepairProcessor.InferKnownComposerFromFileTitle(
+               "14 - Concerto Caledonia - Thomas Erskine - Overture in C (Erskine)") == "Thomas Erskine" &&
+           LocalTrackRepairProcessor.InferKnownComposerFromFileTitle(
+               "15 - Francesco Geminiani - Sonata Op.5 No.4 (Geminiani)") == "Francesco Geminiani" &&
+           ClassicalMetadataPolicy.IsCompilationArtist("Various Artists"),
+        "DFF filename evidence and the Various Artists album credit must support mixed Linn compilation repair without inventing composers for jazz tracks.");
+
+    var operaEvidence = new (string? Title, string FileTitle)[]
+    {
+        ("Norma, Act 1: Casta diva", "Casta Diva (Bellini Norma)"),
+        ("Orphée et Eurydice, Act 4", "J'ai perdu mon Eurydice (Gluck Orphee et Eurydice)"),
+        ("Il barbiere di Siviglia, Act 1", "Una voce poco fa (Rossini Il barbiere di Siviglia)"),
+        ("Carmen, Act 1", "L'amour est un oiseau rebelle (Bizet Carmen)")
+    };
+    Assert(LocalTrackRepairProcessor.InferGenreFromTrackEvidence(operaEvidence) == "Opera" &&
+           LocalTrackRepairProcessor.InferKnownComposerFromFileTitle(operaEvidence[0].FileTitle) == "Vincenzo Bellini" &&
+           LocalTrackRepairProcessor.InferKnownComposerFromFileTitle("Ordinary Song (Unknown Person)") is null,
+        "Recognized composer surnames across most tracks may establish classical/opera metadata, while unknown parenthetical text must not be treated as a composer.");
+}
+
+static void ExternalAlbumTitleQualifiersRemainEquivalent()
+{
+    using var featuredRelease = System.Text.Json.JsonDocument.Parse("""
+        {"artist-credit":[
+          {"name":"The Mystery Of The Bulgarian Voices","joinphrase":" featuring "},
+          {"name":"Lisa Gerrard"}
+        ]}
+        """);
+    Assert(ExternalMetadataService.AlbumTitlesEquivalent(
+               "Maria Callas Remastered – A selection", "Maria Callas Remastered (Society of Sound)") &&
+           ExternalMetadataService.AlbumTitlesEquivalent(
+               "Bowers & Wilkins - Live", "Bowers & Wilkins - Live (WOMAD 2015)") &&
+           ExternalMetadataService.TrackTitlesEquivalent(
+               "Teil I", "Der Klang der Offenbarung des Göttlichen: Teil I") &&
+           ExternalMetadataService.ArtistCreditsEquivalent(
+               "The Mystery Of The Bulgarian Voices featuring Lisa Gerrard",
+               "The Mystery Of The Bulgarian Voices") &&
+           ExternalMetadataService.AlbumLookupTitle(
+               "The Mystery Of The Bulgarian Voices - BooCheeMish",
+               "The Mystery Of The Bulgarian Voices") == "BooCheeMish" &&
+           ExternalMetadataService.FeaturedCreditContainsArtist(
+               featuredRelease.RootElement, "The Mystery Of The Bulgarian Voices") &&
+           !ExternalMetadataService.ArtistCreditsEquivalent(
+               "The Mystery Of The Bulgarian Voices & Lisa Gerrard",
+               "The Mystery Of The Bulgarian Voices") &&
+           !ExternalMetadataService.AlbumTitlesEquivalent("Bowers & Wilkins - Live", "Bowers & Wilkins - Studio"),
+        "Known album qualifiers, fully qualified external track titles, and an explicit trailing featured-artist credit may differ without weakening the core identity comparison.");
 }
 
 static async Task ExistingTracksRepairSupportsMultipleDiscs(string root)
@@ -1685,7 +3061,7 @@ static async Task HostCommitsIncompleteFlacWithoutArtwork(string root)
       "workflow_mode": "flac_cue_split",
       "genre": { "value": "Rock", "source_type": "inferred", "confidence": "high", "rationale": "test" },
       "discs": [{ "disc": 1, "source": "source.flac", "tracks": [{ "disc": 1, "track": 1, "title": "Test", "file": "01 - Test.flac" }] }],
-      "verification": { "status": "pending", "sources_deleted": false, "errors": [] }
+      "verification": { "status": "pending", "sources_deleted": false, "errors": [], "missing_metadata": ["COVER"] }
     }
     """);
     var stagedSource = new StagedSource("source.flac", new FileInfo(source).Length);
@@ -2048,6 +3424,605 @@ static async Task ExternalCatalogIdentityResolvesMissingSacdDiscText()
         "General external matching must retain the exact hybrid-SACD release ID for cover lookup and select only its SACD medium track list.");
 }
 
+static async Task ExternalMetadataImportsExactTrackComposersAndCuratedGenre()
+{
+    using (var client = new HttpClient(new StubHttpHandler((request, _) =>
+           {
+               var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+               if (uri.Contains("/ws/2/release/?", StringComparison.Ordinal))
+                   return StubHttpHandler.Json("""
+                   {"releases":[{"id":"4e5f4f05-8a3c-4bcd-8bee-848180cbbeeb","score":100,"title":"Der Klang der Offenbarung des Göttlichen","artist-credit":[{"name":"Kjartan Sveinsson"}],"release-group":{"id":"klang-group"},"date":"2016-10-20","country":"XW","media":[{"position":1,"format":"Digital Media","track-count":4}]}]}
+                   """);
+               if (uri.Contains("/ws/2/release-group/klang-group", StringComparison.Ordinal))
+                   return StubHttpHandler.Json("""{"first-release-date":"2016-10-20","genres":[],"tags":[],"relations":[]}""");
+               if (uri.Contains("/ws/2/release/4e5f4f05-8a3c-4bcd-8bee-848180cbbeeb", StringComparison.Ordinal) &&
+                   uri.Contains("recording-level-rels", StringComparison.Ordinal))
+                   return StubHttpHandler.Json("""
+                   {"media":[{"position":1,"format":"Digital Media","track-count":4,"tracks":[
+                     {"position":1,"title":"Der Klang der Offenbarung des Göttlichen: Teil I","recording":{"relations":[{"type":"performance","work":{"relations":[{"type":"composer","artist":{"name":"Kjartan Sveinsson"}}]}}]}},
+                     {"position":2,"title":"Der Klang der Offenbarung des Göttlichen: Teil II","recording":{"relations":[{"type":"performance","work":{"relations":[{"type":"composer","artist":{"name":"Kjartan Sveinsson"}}]}}]}},
+                     {"position":3,"title":"Der Klang der Offenbarung des Göttlichen: Teil III","recording":{"relations":[{"type":"performance","work":{"relations":[{"type":"composer","artist":{"name":"Kjartan Sveinsson"}}]}}]}},
+                     {"position":4,"title":"Der Klang der Offenbarung des Göttlichen: Teil IV","recording":{"relations":[{"type":"performance","work":{"relations":[{"type":"composer","artist":{"name":"Kjartan Sveinsson"}}]}}]}}
+                   ]}]}
+                   """);
+               if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+                   return StubHttpHandler.Json("""{"results":[]}""");
+               throw new InvalidOperationException($"Unexpected composer metadata request: {uri}");
+           })))
+    {
+        var service = new ExternalMetadataService(client, musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+        var metadata = await service.ResolveAsync(
+            new("Der Klang Der Offenbarung Des Göttlichen", "Kjartan Sveinsson", 4, RequireSacd: false,
+                TrackTitleHints: ["Teil I", "Teil II", "Teil III", "Teil IV"]),
+            includeTrackTitles: true);
+        Assert(metadata.TrackComposers.SequenceEqual(Enumerable.Repeat("Kjartan Sveinsson", 4)) &&
+               metadata.TrackTitles.Count == 4,
+            $"An exact MusicBrainz release must import per-track composers through recording-to-work relationships, while qualified external titles remain aligned with short local titles. Titles={string.Join("|", metadata.TrackTitles)}; composers={string.Join("|", metadata.TrackComposers)}; warnings={string.Join("|", metadata.Warnings)}");
+    }
+
+    using (var client = new HttpClient(new StubHttpHandler((request, _) =>
+           {
+               var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+               if (uri.Contains("/ws/2/release/?", StringComparison.Ordinal))
+                   return StubHttpHandler.Json("""
+                   {"releases":[{"id":"6996d8df-7ab3-4b33-b3c2-67af7d45955f","score":100,"title":"Cash Is King","artist-credit":[{"name":"Bee MC"}],"release-group":{"id":"cash-group"},"date":"2016-01-21","country":"XW","media":[{"format":"Digital Media","track-count":15}]}]}
+                   """);
+               if (uri.Contains("/ws/2/release-group/cash-group", StringComparison.Ordinal))
+                   return StubHttpHandler.Json("""{"first-release-date":"2016-01-21","genres":[],"tags":[],"relations":[]}""");
+               if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+                   return StubHttpHandler.Json("""{"results":[]}""");
+               throw new InvalidOperationException($"Unexpected curated-genre metadata request: {uri}");
+           })))
+    {
+        var service = new ExternalMetadataService(client, musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+        var metadata = await service.ResolveAsync(new("Cash Is King", "Bee MC", 15, RequireSacd: false));
+        Assert(metadata.Genre == "Blues" && metadata.GenreSourceType == "curated_exact_release" &&
+               metadata.Sources.Contains("https://musify.club/release/bee-mc-cash-is-king-2016-793083"),
+            "The reviewed Bee MC genre may apply only after the exact MusicBrainz release ID is established, with its public-catalog provenance retained.");
+    }
+
+    using (var client = new HttpClient(new StubHttpHandler((request, _) =>
+           {
+               var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+               if (uri.Contains("/ws/2/release/?", StringComparison.Ordinal))
+                   return StubHttpHandler.Json("""{"releases":[{"id":"d1e3684c-549d-441d-a188-ec4e06ba12f0","score":100,"title":"Hollie Stephenson","artist-credit":[{"name":"Hollie Stephenson"}],"release-group":{"id":"hollie-group"},"date":"2016-04-21","country":"XW","media":[{"format":"Digital Media","track-count":12}]}]}""");
+               if (uri.Contains("/ws/2/release-group/hollie-group", StringComparison.Ordinal))
+                   return StubHttpHandler.Json("""{"first-release-date":"2016-04-21","genres":[],"tags":[],"relations":[]}""");
+               if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+                   return StubHttpHandler.Json("""{"results":[{"artistName":"Hollie Stephenson","collectionName":"Hollie Stephenson","primaryGenreName":"Vocal","releaseDate":"2016-05-06T00:00:00Z","trackCount":13,"collectionViewUrl":"https://music.apple.com/album/hollie"}]}""");
+               throw new InvalidOperationException($"Unexpected Hollie Stephenson metadata request: {uri}");
+           })))
+    {
+        var service = new ExternalMetadataService(client, musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+        var metadata = await service.ResolveAsync(new("Hollie Stephenson", "Hollie Stephenson", 12, RequireSacd: false));
+        Assert(metadata.Genre == "Pop" && metadata.GenreSourceType == "curated_exact_release" &&
+               metadata.Sources.Contains("https://www.muziekweb.nl/en/Link/JK207876/Hollie-Stephenson-bonus-track"),
+            "The exact 12-track Society of Sound release needs reviewed genre provenance because the 13-track Apple edition must remain ineligible.");
+    }
+}
+
+static async Task ExternalMetadataReadsEmbeddedDiscogsComposerCredits()
+{
+    var localTitles = new[]
+    {
+        "Turandot: Act 3 - \"Nessun dorma!\"",
+        "La Bohème: Act 1 - \"Che gelida manina\"",
+        "Rigoletto: Act 2 - \"Parmi veder le lagrime\"",
+        "Rigoletto: Act 3 - \"La donna e mobile\"",
+        "L'elisir d'amore: Act 2 - \"Una furtiva lagrima\"",
+        "Carmen: Act 2 - \"La fleur que tu m'avais jetee\"",
+        "Les Pecheurs des Perles: Act 1 - \"Au fond du temple saint\"",
+        "Pagliacci: Act 1 - \"Vesti la giubba\"",
+        "Tosca: Act 1 - \"Recondita armonia\"",
+        "Tosca: Act 3 - \"E lucevan le stelle\"",
+        "Il Trovatore: Act 3 - \"Di quella pira\"",
+        "Aida: Act 1 - \"Celeste Aida\"",
+        "La Bohème: Act 1 - \"O soave fanciulla\"",
+        "Martha: Act 3 - \"M'appari\"",
+        "Messa da Requiem - Ingemisco",
+        "'O sole mio",
+        "Funiculì, funicula",
+        "Torna a Surriento",
+        "Mattinata",
+        "Caro mio ben",
+        "Soirees musicales: La Danza",
+        "Malinconia, ninfa gentile",
+        "Ma rendi pur contento",
+        "La Serenata"
+    };
+    var discogsTitles = new[]
+    {
+        "Turandot / Act 3 (Giacomo Puccini) Nessun Dorma!",
+        "La Bohème / Act 1 (Giacomo Puccini) Che Gelida Manina",
+        "Rigoletto / Act 2 (Giuseppe Verdi) Parmi Veder Le Lagrime",
+        "Rigoletto / Act 3 (Giuseppe Verdi) La Donna è Mobile",
+        "L'elisir D'amore / Act 2 (Gaetano Donizetti) Una Furtiva Lagrima",
+        "Carmen / Act 2 (Georges Bizet) La Fleur Que Tu M'avais Jetee",
+        "Les Pecheurs des Perles / Act 1 (Georges Bizet) Au Fond Du Temple Saint",
+        "Pagliacci / Act 1 (Ruggiero Leoncavallo) Vesti La Giubba",
+        "Tosca / Act 1 (Giacomo Puccini) Recondita Armonia",
+        "Tosca / Act 3 (Giacomo Puccini) E Lucevan Le Stelle",
+        "Il Trovatore / Act 3 (Giuseppe Verdi) Di Quella Pira",
+        "Aida / Act 1 (Giuseppe Verdi) Celeste Aida",
+        "La Bohème / Act 1 (Giacomo Puccini) O Soave Fanciulla",
+        "Martha / Act 3 (Friedrich Von Flotow) M'appari",
+        "Messa Da Requiem (Giuseppe Verdi) 2h. Ingemisco",
+        "Di Capua, Mazzucchi: 'O Sole Mio",
+        "Denza: Funiculì, Funiculà",
+        "Curtis: Torna A Surriento",
+        "Leoncavallo: Mattinata",
+        "Giordani: Caro Mio Ben",
+        "Soirées Musicales (Gioachino Rossini) La Danza",
+        "Bellini: Malinconia, Ninfa Gentile",
+        "Bellini: Ma Rendi Pur Contento",
+        "Tosti: La Serenata"
+    };
+    var expectedComposers = new[]
+    {
+        "Giacomo Puccini", "Giacomo Puccini", "Giuseppe Verdi", "Giuseppe Verdi",
+        "Gaetano Donizetti", "Georges Bizet", "Georges Bizet", "Ruggiero Leoncavallo",
+        "Giacomo Puccini", "Giacomo Puccini", "Giuseppe Verdi", "Giuseppe Verdi",
+        "Giacomo Puccini", "Friedrich Von Flotow", "Giuseppe Verdi", "Di Capua, Mazzucchi",
+        "Denza", "Curtis", "Leoncavallo", "Giordani", "Gioachino Rossini", "Bellini", "Bellini", "Tosti"
+    };
+    Assert(localTitles.Zip(discogsTitles).All(pair =>
+            ExternalMetadataService.TrackTitlesEquivalent(pair.First, pair.Second)),
+        "Composer text embedded inside the exact Discogs title must not make the ordered Pavarotti tracklist appear different from the local tagged titles.");
+
+    var details = System.Text.Json.JsonSerializer.Serialize(new
+    {
+        title = "Pavarotti 24 Greatest HD Tracks",
+        artists = new[] { new { name = "Luciano Pavarotti" } },
+        released = "2013",
+        genres = new[] { "Classical" },
+        styles = new[] { "Opera" },
+        labels = new[] { new { name = "Decca music Group", catno = "none" } },
+        tracklist = discogsTitles.Select((title, index) => new
+        {
+            position = (index + 1).ToString(),
+            type_ = "track",
+            title
+        }).ToArray()
+    });
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("api.discogs.com/database/search", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""
+                {"results":[{"id":17330749,"title":"Luciano Pavarotti - Pavarotti 24 Greatest HD Tracks","year":2013,"format":["File","AIFF","Compilation"]}]}
+                """);
+        if (uri.Contains("api.discogs.com/releases/17330749", StringComparison.Ordinal))
+            return StubHttpHandler.Json(details);
+        if (uri.Contains("/ws/2/release/?", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"releases":[]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[]}""");
+        throw new InvalidOperationException($"Unexpected Pavarotti metadata request: {uri}");
+    }));
+    var service = new ExternalMetadataService(client, discogsMinimumInterval: TimeSpan.Zero,
+        musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var metadata = await service.ResolveAsync(
+        new("Pavarotti 24 Greatest HD Tracks", "Luciano Pavarotti", 24, OriginalYear: 2013,
+            RequireSacd: false, TrackTitleHints: localTitles),
+        includeTrackTitles: true);
+
+    Assert(metadata.TrackTitles.SequenceEqual(discogsTitles) &&
+           metadata.TrackComposers.SequenceEqual(expectedComposers) &&
+           metadata.TrackComposerSourceType == "discogs_exact_release_tracklist_credit" &&
+           metadata.Sources.Contains("https://www.discogs.com/release/17330749"),
+        $"The exact verified Discogs release must supply all 24 embedded and leading composer credits. " +
+        $"Tracks={metadata.TrackTitles.Count}; composers={string.Join("|", metadata.TrackComposers)}; warnings={string.Join("|", metadata.Warnings)}");
+}
+
+static async Task ExternalMetadataAlignsAbbreviatedOperaTitlesWithCredits()
+{
+    var localTitles = new[]
+    {
+        "Carmen, Act 1: \"L'amour est un oiseau rebelle\" (Carmen, Chorus) [Habanera]",
+        "Norma, Act 1: \"Casta diva\" (Norma, Chorus)",
+        "Gianni Schicchi, Act 1: \"O mio babbino caro\" (Lauretta)",
+        "La Wally, Act 1: \"Ebben?...Ne andrò lontana\" (Wally)",
+        "La Traviata, Act 1: \"Ah fors'e lui\" (Violetta)",
+        "La Traviata, Act 1: \"Sempre libera\" (Violetta, Alfredo)",
+        "Tosca, Act 2: \"Vissi d'arte\" (Tosca)",
+        "Madama Butterfly, Act 2: \"Un bel di vedremo\" (Butterfly)",
+        "Andrea Chénier, Act 3: \"La mamma morta\" (Maddalena)",
+        "La Bohème, Act 3: \"Donde lieta uscì al tuo grido d'amore\" (Mimì)",
+        "Adriana Lecouvreur, Act 1: \"Ecco: respiro appena...Io son l'umile ancella\" (Adriana Lecouvreur)",
+        "Lucia di Lammermoor, Act 3: \"Il dolce suono ... Ardon gli incensi\" (Lucia, Raimondo, Normanno, Chorus)",
+        "Il Trovatore, Act 4: \"D'amor sull'ali rosee\" (Leonora)",
+        "Otello, Act 4: \"Ave Maria\" (Desdemona)",
+        "Il Barbiere di Siviglia, Act 1: \"Una voce poco fa\" (Rosina)",
+        "Orphée et Eurydice, Act 4: \"J'ai perdu mon Eurydice\" (Orfeo)",
+        "Samson et Dalila, Act 2: \"Mon coeur s'ouvre à ta voix\" (Dalila)",
+        "Carmen, Act 2: \"Les tringles des sistres tintaient\" (Camen, Frasquita, Mercédès)"
+    };
+    var discogsTitles = new[]
+    {
+        "Habanera (Carmen)",
+        "Casta Diva (Norma)",
+        "O Mio Babbino Caro (Gianni Schicchi)",
+        "Ebben? Ne Andrò Lontana (La Wally)",
+        "Ah, Fors'è Lui (La Traviata)",
+        "Sempre Libera (La Traviata)",
+        "Viddi D'Arte (Tosca)",
+        "Un Bel Di Vedremo (Madame Butterfly)",
+        "La Mamma Morta (Andrea Chénier)",
+        "Donde Lieta Usci (La Bohème)",
+        "Io Son L'Umile Ancella (Adriana Lecouvreur)",
+        "Il Dolce Suono (Luca Di Lammermoor)",
+        "D'Amor Sull'ali Rosee (Il Trovatore)",
+        "Ave Maria (Otello)",
+        "Una Voce Poco Fa (Il Barbiere Di Siviglia)",
+        "J'Ai Perdu Mon Eurydice (Orphée Et Eurydice)",
+        "Mon Coeur S'Ouvre A Ta Voix (Samson Et Delila)",
+        "Chanson Boheme (Carmen)"
+    };
+    var composers = new[]
+    {
+        "Georges Bizet", "Vincenzo Bellini", "Giacomo Puccini", "Alfredo Catalani",
+        "Giuseppe Verdi", "Giuseppe Verdi", "Giacomo Puccini", "Giacomo Puccini",
+        "Umberto Giordano", "Giacomo Puccini", "Francesco Cilea", "Gaetano Donizetti",
+        "Giuseppe Verdi", "Giuseppe Verdi", "Gioacchino Rossini", "Christoph Willibald Gluck",
+        "Camille Saint-Saëns", "Georges Bizet"
+    };
+    var matchingTracks = localTitles.Zip(discogsTitles)
+        .Select((pair, index) => new
+        {
+            Index = index + 1,
+            Matches = ExternalMetadataService.TrackTitlesEquivalent(pair.First, pair.Second)
+        })
+        .Where(value => value.Matches)
+        .Select(value => value.Index)
+        .ToArray();
+    Assert(matchingTracks.SequenceEqual(Enumerable.Range(1, 17)),
+        $"The rich local opera titles must align with the 17 abbreviated Discogs titles while preserving the one genuine alias mismatch. Matches={string.Join(",", matchingTracks)}");
+
+    string Details(IReadOnlyList<string> titles) => System.Text.Json.JsonSerializer.Serialize(new
+    {
+        title = "Pure Maria Callas",
+        artists = new[] { new { name = "Maria Callas" } },
+        released = "2014",
+        genres = new[] { "Classical" },
+        styles = new[] { "Opera" },
+        labels = new[] { new { name = "Warner Classics", catno = "none" } },
+        tracklist = titles.Select((title, index) => new
+        {
+            position = (index + 1).ToString(),
+            type_ = "track",
+            title,
+            extraartists = new[] { new { name = composers[index], role = "Composed By" } }
+        }).ToArray()
+    });
+
+    ExternalMetadataService Service(string details)
+    {
+        var client = new HttpClient(new StubHttpHandler((request, _) =>
+        {
+            var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+            if (uri.Contains("api.discogs.com/database/search", StringComparison.Ordinal))
+                return StubHttpHandler.Json("""
+                    {"results":[{"id":32440695,"title":"Maria Callas - Pure Maria Callas","year":2014,"format":["File","FLAC","Reissue","Remastered"]}]}
+                    """);
+            if (uri.Contains("api.discogs.com/releases/32440695", StringComparison.Ordinal))
+                return StubHttpHandler.Json(details);
+            if (uri.Contains("/ws/2/release/?", StringComparison.Ordinal))
+                return StubHttpHandler.Json("""{"releases":[]}""");
+            if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+                return StubHttpHandler.Json("""{"results":[]}""");
+            throw new InvalidOperationException($"Unexpected Maria Callas metadata request: {uri}");
+        }));
+        return new(client, discogsMinimumInterval: TimeSpan.Zero,
+            musicBrainzMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    }
+
+    var metadata = await Service(Details(discogsTitles)).ResolveAsync(
+        new("Pure - Maria Callas", "Maria Callas", 18, OriginalYear: 2014, RequireSacd: false,
+            TrackTitleHints: localTitles, AlbumTitleHints: ["Maria Callas - Pure (2014) [96-24]"]),
+        includeTrackTitles: true);
+    Assert(metadata.TrackTitles.SequenceEqual(discogsTitles) &&
+           metadata.TrackComposers.SequenceEqual(composers) &&
+           metadata.TrackComposerSourceType == "discogs_exact_release_tracklist_credit" &&
+           metadata.Sources.Contains("https://www.discogs.com/release/32440695"),
+        $"The exact artist/title/year/count match plus 17 ordered titles must admit the single catalog alias and import all composer credits. " +
+        $"Tracks={metadata.TrackTitles.Count}; composers={string.Join("|", metadata.TrackComposers)}; warnings={string.Join("|", metadata.Warnings)}");
+
+    var twoMismatches = discogsTitles.ToArray();
+    twoMismatches[16] = "Unrelated Selection";
+    var rejected = await Service(Details(twoMismatches)).ResolveAsync(
+        new("Pure - Maria Callas", "Maria Callas", 18, OriginalYear: 2014, RequireSacd: false,
+            TrackTitleHints: localTitles), includeTrackTitles: true);
+    Assert(rejected.TrackComposers.Count == 0 &&
+           !rejected.Sources.Contains("https://www.discogs.com/release/32440695"),
+        "An exact album identity must still fail closed when more than one ordered Discogs title disagrees with local evidence.");
+}
+
+static async Task ExternalMetadataFallsBackFromFolderTitleToLinkedDiscogsTrackCredits()
+{
+    var localTitles = new[]
+    {
+        "Brandenburg Concerto No 1 in F Major BWV 1046 I",
+        "Les nuits d ete Op 7 I Villanelle",
+        "Piano Concerto No 2 in F Minor Op 21 III Allegro vivace",
+        "Requiem in D Minor K 626 IX Domine Jesu",
+        "Sonata in D Minor Op 5 No 7 III Sarabanda Largo",
+        "La vera costanza Hob 28 8 Gia la morte in mante nero",
+        "7 Fantasien Op 116 No 2 Intermezzo in A Minor",
+        "L enfance du Christ Partie II La fuite en Egypte L adieu des bergers",
+        "Johannes Passion BWV 245 Aria Ich folge dir gleichfalls mit freudigen Schritten",
+        "Les Gentils Airs - ou Airs Connus ajustee en duo pour bassoon seul accompagne d un clavecin Les Sauvages",
+        "Pargoletta che non sai",
+        "Set a5 in g II On the Playnsong a5",
+        "Ave Maria",
+        "Flute Concerto IV Scherzo",
+        "Holding Back",
+        "Your Very Soul",
+        "What ll I Do",
+        "Sleeping Horses"
+    };
+    var composers = new[]
+    {
+        "J. S. Bach", "Berlioz", "Chopin", "Mozart", "Corelli", "Haydn", "Brahms", "Berlioz",
+        "J. S. Bach", "Anonymous", "Rossi", "Lawes", "Parsons", "Rouse", "MacLean", "Duncan", "Berlin", "Barker"
+    };
+    var externalTitles = new[]
+    {
+        "J. S. Bach: Brandenburg Concerto No. 1 in F major, BWV 1046",
+        "Berlioz: Les Nuits D'été",
+        "Chopin: Piano Concerto No. 2 in F minor, Op. 21 - III. Allegro Vivace",
+        "Mozart: Requiem in D minor, K. 626 - Domine Jesu",
+        "Corelli: Sonata in D minor, Op. 5 No. 7 - III. Sarabanda - Largo",
+        "Haydn: La Vera Costanza, Hob. 28/8 - Già La Morte In Manto Nero",
+        "Brahms: 7 Fantasien, Op. 116 No. 2 - Intermezzo In A Minor",
+        "Berlioz: L'enfance Du Christ - Partie II, La Fuite En Ègypte - L'adieu Des Bergers",
+        "J. S. Bach: Johannes Passion, BWV 245 - Aria: Ich Folge Dir Gleichfalls Mit Freudigen Schritten",
+        "Anon: Les Gentils Aírs - Ou Airs Connus, Ajustée En Duo, Pour Basson Seul Accompagné D'un Clavecin - Les Sauvages",
+        "Rossi: Pargoletta, Che Non Sai",
+        "Lawes: Set a5 In g - II. On the Playnsong: a5",
+        "Parsons: Ave Maria",
+        "Rouse: Flute Concerto - IV. Scherzo",
+        "MacLean: Holding Back",
+        "Duncan: Your Very Soul",
+        "Berlin: What'll I Do?",
+        "Barker: Sleeping Horses"
+    };
+    var titleMismatches = localTitles.Zip(externalTitles)
+        .Select((pair, index) => new { Index = index + 1, Matches = ExternalMetadataService.TrackTitlesEquivalent(pair.First, pair.Second) })
+        .Where(value => !value.Matches)
+        .Select(value => value.Index)
+        .ToArray();
+    Assert(titleMismatches.Length == 0,
+        $"The real Discogs Volume 7 titles must align conservatively with the local filename titles. Mismatched tracks={string.Join(",", titleMismatches)}");
+    var discogsDetails = System.Text.Json.JsonSerializer.Serialize(new
+    {
+        title = "Super Audio Collection Vol. 7",
+        artists = new[] { new { name = "Various" } },
+        genres = new[] { "Classical" },
+        labels = new[] { new { name = "Linn Records", catno = "AKP 459" } },
+        tracklist = externalTitles.Select((title, index) => new { position = (index + 1).ToString(), type_ = "track", title }).ToArray()
+    });
+    var musicBrainzTracks = System.Text.Json.JsonSerializer.Serialize(new
+    {
+        media = new[]
+        {
+            new
+            {
+                position = 1,
+                format = "Digital Media",
+                track_count = 18,
+                tracks = externalTitles.Select((title, index) => new
+                {
+                    position = index + 1,
+                    title,
+                    recording = new { relations = Array.Empty<object>() }
+                }).ToArray()
+            }
+        }
+    }).Replace("track_count", "track-count", StringComparison.Ordinal);
+    var titleOnlyFallbackRequested = false;
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        var decoded = Uri.UnescapeDataString(uri);
+        if (uri.Contains("api.discogs.com/database/search", StringComparison.Ordinal))
+        {
+            if (!decoded.Contains("Super Audio Collection Vol. 7", StringComparison.OrdinalIgnoreCase))
+                return StubHttpHandler.Json("""{"results":[]}""");
+            return StubHttpHandler.Json("""
+            {"results":[{"id":8900116,"title":"Various - Super Audio Collection Vol. 7","year":"2014","format":["SACD","Hybrid","Compilation"]}]}
+            """);
+        }
+        if (uri.Contains("/ws/2/release/?", StringComparison.Ordinal))
+        {
+            var correctTitle = decoded.Contains("Super Audio Collection Vol. 7", StringComparison.OrdinalIgnoreCase);
+            var hasArtistConstraint = decoded.Contains(" AND artist:", StringComparison.OrdinalIgnoreCase);
+            if (!correctTitle || hasArtistConstraint) return StubHttpHandler.Json("""{"releases":[]}""");
+            titleOnlyFallbackRequested = true;
+            return StubHttpHandler.Json("""
+            {"releases":[{"id":"linn-vol7","score":100,"title":"Super Audio Collection Vol. 7","artist-credit":[{"name":"Various Artists"}],"release-group":{"id":"linn-vol7-group"},"date":"2014","country":"XE","barcode":"691062045926","media":[{"position":1,"format":"Digital Media","track-count":18}],"label-info":[{"catalog-number":"AKP 459","label":{"name":"Linn Records"}}]}]}
+            """);
+        }
+        if (uri.Contains("/ws/2/release-group/linn-vol7-group", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"first-release-date":"2014","genres":[{"name":"classical","count":10}],"tags":[],"relations":[{"type":"discogs","url":{"resource":"https://www.discogs.com/release/8900116"}}]}""");
+        if (uri.Contains("/ws/2/release/linn-vol7", StringComparison.Ordinal) &&
+            uri.Contains("recording-level-rels", StringComparison.Ordinal))
+            return StubHttpHandler.Json(musicBrainzTracks);
+        if (uri.Contains("api.discogs.com/releases/8900116", StringComparison.Ordinal))
+            return StubHttpHandler.Json(discogsDetails);
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[]}""");
+        throw new InvalidOperationException($"Unexpected Linn fallback request: {uri}");
+    }));
+
+    var service = new ExternalMetadataService(client, musicBrainzMinimumInterval: TimeSpan.Zero,
+        requestTimeout: TimeSpan.FromSeconds(1));
+    var metadata = await service.ResolveAsync(
+        new("Incorrect Embedded Album", "Linn Records", 18, RequireSacd: false,
+            TrackTitleHints: localTitles,
+            AlbumTitleHints: ["Linn Records - The Super Audio Collection Volume 7"]),
+        includeTrackTitles: true);
+
+    Assert(titleOnlyFallbackRequested && metadata.MusicBrainzReleaseId == "linn-vol7" &&
+           metadata.CatalogNumber == "AKP 459" && metadata.TrackTitles.Count == 18,
+        $"Folder-derived title-only fallback must identify the exact release only after full ordered-track verification. " +
+        $"Requested={titleOnlyFallbackRequested}; MBID={metadata.MusicBrainzReleaseId}; catalog={metadata.CatalogNumber}; " +
+        $"tracks={metadata.TrackTitles.Count}; sources={string.Join("|", metadata.Sources)}; warnings={string.Join("|", metadata.Warnings)}");
+    Assert(metadata.TrackComposers.SequenceEqual(composers) &&
+           metadata.TrackComposerSourceType == "discogs_exact_release_tracklist_credit" &&
+           metadata.Sources.Contains("https://www.discogs.com/release/8900116"),
+        $"The verified public Discogs tracklist must supply aligned composer prefixes and provenance without requiring a token. Composers={string.Join("|", metadata.TrackComposers)}");
+
+    var mismatchedTitles = externalTitles.ToArray();
+    mismatchedTitles[7] = "Berlioz: A different selection";
+    var mismatchedTracks = System.Text.Json.JsonSerializer.Serialize(new
+    {
+        media = new[]
+        {
+            new
+            {
+                position = 1,
+                format = "Digital Media",
+                track_count = 18,
+                tracks = mismatchedTitles.Select((title, index) => new
+                {
+                    position = index + 1,
+                    title,
+                    recording = new { relations = Array.Empty<object>() }
+                }).ToArray()
+            }
+        }
+    }).Replace("track_count", "track-count", StringComparison.Ordinal);
+    using var mismatchClient = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        var decoded = Uri.UnescapeDataString(uri);
+        if (uri.Contains("/ws/2/release/?", StringComparison.Ordinal))
+        {
+            if (decoded.Contains(" AND artist:", StringComparison.OrdinalIgnoreCase) ||
+                !decoded.Contains("Super Audio Collection", StringComparison.OrdinalIgnoreCase))
+                return StubHttpHandler.Json("""{"releases":[]}""");
+            return StubHttpHandler.Json("""
+            {"releases":[{"id":"wrong-selection","score":100,"title":"Super Audio Collection Vol. 7","artist-credit":[{"name":"Various Artists"}],"release-group":{"id":"wrong-selection-group"},"media":[{"position":1,"format":"Digital Media","track-count":18}]}]}
+            """);
+        }
+        if (uri.Contains("/ws/2/release-group/wrong-selection-group", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"genres":[],"tags":[],"relations":[]}""");
+        if (uri.Contains("/ws/2/release/wrong-selection", StringComparison.Ordinal))
+            return StubHttpHandler.Json(mismatchedTracks);
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[]}""");
+        throw new InvalidOperationException($"Unexpected mismatched Linn fallback request: {uri}");
+    }));
+    var mismatchService = new ExternalMetadataService(mismatchClient, musicBrainzMinimumInterval: TimeSpan.Zero,
+        requestTimeout: TimeSpan.FromSeconds(1));
+    var rejected = await mismatchService.ResolveAsync(
+        new("Incorrect Embedded Album", "Linn Records", 18, RequireSacd: false,
+            TrackTitleHints: localTitles,
+            AlbumTitleHints: ["Linn Records - The Super Audio Collection Volume 7"]),
+        includeTrackTitles: true);
+    Assert(rejected.MusicBrainzReleaseId is null && rejected.TrackTitles.Count == 0 && rejected.TrackComposers.Count == 0,
+        "A folder-name-only album candidate must fail closed when even one ordered external track title disagrees with local tag/filename evidence.");
+}
+
+static async Task ExternalMetadataAlignsPartialMixedCompilation()
+{
+    var localTitles = new[]
+    {
+        "Blackwood", "Man in The Station", "Makin' Whoopee", "Haven't We Met", "Johnny and Mary",
+        "She’s Turning", "Trouble In Mind", "Bad News On The Mountain", "Navigating", "Ca’ The Yowes",
+        "When The Sunny Sky Has Gone", "With Every Breath I Take", "Certain Smile", "Johnny Come Lately",
+        "Sittin’ and a Rockin’", "I Thought About You", "Happy This Way", "A Case of You", "No Surrender",
+        "Love Go Round", "That's Amore", "Symphony No. 40 in G minor, K 550, I. Molto Allegro",
+        "Grandes Etudes de Paganini – Etude III"
+    };
+    var fullTitles = localTitles.Concat(Enumerable.Range(24, 17).Select(number => $"Classical selection {number}"))
+        .ToArray();
+    var fullComposers = Enumerable.Repeat(string.Empty, fullTitles.Length).ToArray();
+    fullComposers[21] = "Wolfgang Amadeus Mozart";
+    fullComposers[22] = "Franz Liszt";
+    string[][] localArtists =
+    [
+        ["Emily Barker & The Red Clay Halo"], ["Claire Martin"], ["Hue & Cry"], ["Carol Kidd"],
+        ["Martin Taylor"], ["The McCluskey Brothers"], ["Barb Jungr"], ["Jon Strong"], ["Amy Duncan"],
+        ["Ian Bruce"], ["Fiona MacKenzie (2)"], ["Claire Martin", "Richard Rodney Bennett"], ["Martin Taylor"],
+        ["Tommy Smith"], ["Gill Manly"], ["Martin Taylor", "Stéphane Grappelli"], ["Judith Owen"],
+        ["Ian Shaw (2)"], ["Maeve O'Boyle"], ["Sarah Moule"], ["Ray Gelato Giants"],
+        ["Sir Charles Mackerras", "Scottish Chamber Orchestra"], ["George-Emmanuel Lazaridis"]
+    ];
+    var fullArtists = localArtists.Concat(Enumerable.Range(24, 17).Select(number => new[] { $"Classical Artist {number}" }))
+        .ToArray();
+    static object Track(string title, int index, string composer, IReadOnlyList<string> artists) => new
+    {
+        position = index < 21 ? $"1-{index + 1}" : $"2-{index - 20}",
+        type_ = "track",
+        title,
+        artists = artists.Select(name => new { name }).ToArray(),
+        extraartists = string.IsNullOrWhiteSpace(composer)
+            ? Array.Empty<object>()
+            : new object[] { new { name = composer, role = "Composed By" } }
+    };
+    var vinylDetails = System.Text.Json.JsonSerializer.Serialize(new
+    {
+        title = "Linn 40th Anniversary Collection",
+        artists = new[] { new { name = "Various" } },
+        genres = new[] { "Jazz", "Classical" },
+        tracklist = localTitles.Take(21).Select((title, index) => Track(title, index, string.Empty, localArtists[index])).ToArray()
+    });
+    const string primaryImage = "https://i.discogs.com/test-primary-image.jpeg";
+    var sacdDetails = System.Text.Json.JsonSerializer.Serialize(new
+    {
+        title = "Linn 40th Anniversary Collection",
+        artists = new[] { new { name = "Various" } },
+        genres = new[] { "Jazz", "Rock", "Pop", "Classical", "Folk, World, & Country" },
+        labels = new[] { new { name = "Linn Records", catno = "AKD 425" } },
+        images = new[] { new { type = "primary", uri = primaryImage, resource_url = "https://api.discogs.com/images/1" } },
+        tracklist = fullTitles.Select((title, index) => Track(title, index, fullComposers[index], fullArtists[index])).ToArray()
+    });
+    using var client = new HttpClient(new StubHttpHandler((request, _) =>
+    {
+        var uri = request.RequestUri?.AbsoluteUri ?? string.Empty;
+        if (uri.Contains("api.discogs.com/database/search", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""
+            {"results":[
+              {"id":5060214,"title":"Various - Linn 40th Anniversary Collection","year":"2013","format":["Vinyl","LP"]},
+              {"id":25359721,"title":"Various - Linn 40th Anniversary Collection","year":"2013","format":["SACD","Compilation"]}
+            ]}
+            """);
+        if (uri.Contains("api.discogs.com/releases/5060214", StringComparison.Ordinal))
+            return StubHttpHandler.Json(vinylDetails);
+        if (uri.Contains("api.discogs.com/releases/25359721", StringComparison.Ordinal))
+            return StubHttpHandler.Json(sacdDetails);
+        if (uri.Contains("musicbrainz.org", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"releases":[]}""");
+        if (uri.Contains("itunes.apple.com", StringComparison.Ordinal))
+            return StubHttpHandler.Json("""{"results":[]}""");
+        throw new InvalidOperationException($"Unexpected partial-compilation request: {uri}");
+    }));
+    var service = new ExternalMetadataService(client, musicBrainzMinimumInterval: TimeSpan.Zero,
+        discogsMinimumInterval: TimeSpan.Zero, requestTimeout: TimeSpan.FromSeconds(1));
+    var metadata = await service.ResolveAsync(
+        new("Linn 40th Anniversary Collection", "Various Artists", localTitles.Length, OriginalYear: 2013,
+            RequireSacd: false, TrackTitleHints: localTitles,
+            AlbumTitleHints: ["Linn 40th Anniversary Collection (2013) [192-24]"]),
+        includeTrackTitles: true);
+
+    Assert(metadata.Sources.Contains("https://www.discogs.com/release/25359721") &&
+           !metadata.Sources.Contains("https://www.discogs.com/release/5060214") &&
+           metadata.TrackTitles.Count == 23 && metadata.TrackComposers.Count == 23 &&
+           metadata.TrackComposers[21] == "Wolfgang Amadeus Mozart" &&
+           metadata.TrackComposers[22] == "Franz Liszt" &&
+           metadata.TrackComposerSourceType == "discogs_exact_release_tracklist_credit" &&
+           metadata.TrackArtists.Count == 23 &&
+           metadata.TrackArtists[0] == "Emily Barker & The Red Clay Halo" &&
+           metadata.TrackArtists[10] == "Fiona MacKenzie" &&
+           metadata.TrackArtists[11] == "Claire Martin & Richard Rodney Bennett" &&
+           metadata.TrackArtists[21] == "Sir Charles Mackerras & Scottish Chamber Orchestra" &&
+           metadata.TrackArtistSourceType == "discogs_exact_release_track_artist_credit" &&
+           metadata.ArtworkUrl == primaryImage &&
+           metadata.ArtworkSourceType == "discogs_exact_release_primary_image",
+        $"A unique 23-track prefix must select the 40-track SACD, retain aligned composers and track artists, and expose its primary cover. Sources={string.Join("|", metadata.Sources)}; composers={string.Join("|", metadata.TrackComposers)}; artists={string.Join("|", metadata.TrackArtists)}; artwork={metadata.ArtworkUrl}");
+}
+
 static async Task ExternalMetadataUsesAppleGenreFallback()
 {
     using var client = new HttpClient(new StubHttpHandler((request, _) =>
@@ -2087,6 +4062,22 @@ static async Task ExternalCoverDownloadIsMemoryOnlyAndBounded()
             "Cover Art Archive bytes must be returned in memory with MIME type and provenance.");
     }
 
+    using (var client = new HttpClient(new StubHttpHandler((request, _) =>
+           request.RequestUri?.Host.Equals("i.discogs.com", StringComparison.OrdinalIgnoreCase) == true
+               ? StubHttpHandler.Bytes(expected, "image/jpeg")
+               : throw new InvalidOperationException("Unexpected Discogs cover request."))))
+    {
+        var service = new ExternalMetadataService(client, requestTimeout: TimeSpan.FromSeconds(1));
+        var downloaded = await service.DownloadArtworkAsync("https://i.discogs.com/release-primary.jpeg");
+        Assert(downloaded.Data.SequenceEqual(expected) && downloaded.MimeType == "image/jpeg" &&
+               downloaded.Source.Contains("i.discogs.com", StringComparison.Ordinal),
+            "A verified Discogs primary image must be returned in memory with MIME type and provenance.");
+        Exception? untrusted = null;
+        try { await service.DownloadArtworkAsync("https://example.com/not-discogs.jpeg"); }
+        catch (Exception error) { untrusted = error; }
+        Assert(untrusted is InvalidDataException, "External artwork must be restricted to trusted Discogs image URLs.");
+    }
+
     using (var client = new HttpClient(new StubHttpHandler((_, _) =>
            StubHttpHandler.Bytes(new byte[15 * 1024 * 1024 + 1], "image/jpeg"))))
     {
@@ -2106,6 +4097,47 @@ static async Task ExternalCoverDownloadIsMemoryOnlyAndBounded()
         try { await service.DownloadFrontCoverAsync("release-canceled", canceled.Token); }
         catch (Exception error) { cancellation = error; }
         Assert(cancellation is OperationCanceledException, "A canceled in-memory cover download must stop without creating an image artifact.");
+    }
+}
+
+static byte[] CreateRgbTiffWithoutRowsPerStrip()
+{
+    const ushort width = 2;
+    const ushort height = 2;
+    const int pixelOffset = 8;
+    const int pixelBytes = width * height * 3;
+    const int ifdOffset = pixelOffset + pixelBytes;
+    const ushort entryCount = 9;
+    const int bitsPerSampleOffset = ifdOffset + 2 + entryCount * 12 + 4;
+    var bytes = new byte[bitsPerSampleOffset + 6];
+    bytes[0] = (byte)'I';
+    bytes[1] = (byte)'I';
+    BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(2, 2), 42);
+    BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(4, 4), ifdOffset);
+    bytes.AsSpan(pixelOffset, pixelBytes).Fill(0x70);
+    BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(ifdOffset, 2), entryCount);
+    var entryOffset = ifdOffset + 2;
+    WriteEntry(256, 3, 1, width);
+    WriteEntry(257, 3, 1, height);
+    WriteEntry(258, 3, 3, bitsPerSampleOffset);
+    WriteEntry(259, 3, 1, 1);
+    WriteEntry(262, 3, 1, 2);
+    WriteEntry(273, 4, 1, pixelOffset);
+    WriteEntry(277, 3, 1, 3);
+    WriteEntry(279, 4, 1, pixelBytes);
+    WriteEntry(284, 3, 1, 1);
+    BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(bitsPerSampleOffset, 2), 8);
+    BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(bitsPerSampleOffset + 2, 2), 8);
+    BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(bitsPerSampleOffset + 4, 2), 8);
+    return bytes;
+
+    void WriteEntry(ushort tag, ushort type, uint count, uint value)
+    {
+        BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(entryOffset, 2), tag);
+        BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(entryOffset + 2, 2), type);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(entryOffset + 4, 4), count);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(entryOffset + 8, 4), value);
+        entryOffset += 12;
     }
 }
 

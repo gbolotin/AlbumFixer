@@ -38,6 +38,91 @@ public static class PreviousOutputCleanupService
         ".flac", ".dsf", ".dff"
     };
 
+    internal static bool HasCompleteExistingTrackSet(IReadOnlyList<MediaItem> tracks)
+    {
+        if (tracks.Count < 2) return false;
+        var kinds = tracks.Select(item => item.Kind).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        if (kinds.Length != 1 || kinds[0] is not ("Existing FLAC" or "Existing DSF" or "Existing DFF"))
+            return false;
+        try
+        {
+            var evidence = new List<ExistingTrackEvidence>(tracks.Count);
+            foreach (var track in tracks)
+            {
+                var area = ExistingTrackArea(track.RelativePath);
+                if (track.Kind == "Existing DFF")
+                {
+                    var tag = DffMetadata.Read(track.Path);
+                    if (tag.SampleRate <= 0 || tag.Channels <= 0 ||
+                        string.IsNullOrWhiteSpace(tag.Title) || string.IsNullOrWhiteSpace(tag.Album) ||
+                        string.IsNullOrWhiteSpace(tag.Artist) || string.IsNullOrWhiteSpace(tag.AlbumArtist) ||
+                        tag.Track == 0 || tag.Disc == 0 || tag.Year == 0 ||
+                        string.IsNullOrWhiteSpace(tag.Genre) || tag.Picture is not { Length: > 0 } ||
+                        ClassicalMetadataPolicy.RequiresComposer(
+                            tag.Genre, tag.Title,
+                            ClassicalMetadataPolicy.IsCompilationArtist(tag.AlbumArtist)) &&
+                        string.IsNullOrWhiteSpace(tag.Composer))
+                        return false;
+                    evidence.Add(new(area, tag.Album.Trim(), tag.Disc, tag.DiscCount, tag.Track, tag.TrackCount));
+                    continue;
+                }
+
+                using var file = TagLib.File.Create(track.Path);
+                var nativeTag = file.Tag;
+                if (!file.Properties.MediaTypes.HasFlag(TagLib.MediaTypes.Audio) ||
+                    file.Properties.AudioSampleRate <= 0 || file.Properties.AudioChannels <= 0 ||
+                    string.IsNullOrWhiteSpace(nativeTag.Title) || string.IsNullOrWhiteSpace(nativeTag.Album) ||
+                    !nativeTag.Performers.Any(value => !string.IsNullOrWhiteSpace(value)) ||
+                    !nativeTag.AlbumArtists.Any(value => !string.IsNullOrWhiteSpace(value)) ||
+                    nativeTag.Track == 0 || nativeTag.Disc == 0 || nativeTag.Year == 0 ||
+                    !nativeTag.Genres.Any(value => !string.IsNullOrWhiteSpace(value)) ||
+                    !nativeTag.Pictures.Any(picture => picture.Data.Count > 0) ||
+                    ClassicalMetadataPolicy.RequiresComposer(
+                        nativeTag.FirstGenre, nativeTag.Title,
+                        ClassicalMetadataPolicy.IsCompilationArtist(nativeTag.FirstAlbumArtist)) &&
+                    string.IsNullOrWhiteSpace(nativeTag.FirstComposer))
+                    return false;
+                evidence.Add(new(area, nativeTag.Album.Trim(), nativeTag.Disc, nativeTag.DiscCount,
+                    nativeTag.Track, nativeTag.TrackCount));
+            }
+
+            if (evidence.Select(item => item.Album).Distinct(StringComparer.OrdinalIgnoreCase).Count() != 1)
+                return false;
+            foreach (var area in evidence.GroupBy(item => item.Area, StringComparer.OrdinalIgnoreCase))
+            {
+                var discs = area.GroupBy(item => item.Disc).OrderBy(group => group.Key).ToArray();
+                if (!discs.Select(group => group.Key)
+                        .SequenceEqual(Enumerable.Range(1, discs.Length).Select(value => (uint)value)))
+                    return false;
+                foreach (var disc in discs)
+                {
+                    var orderedTracks = disc.Select(item => item.Track).Order().ToArray();
+                    if (!orderedTracks.SequenceEqual(Enumerable.Range(1, disc.Count()).Select(value => (uint)value)) ||
+                        disc.Any(item => item.TrackCount != 0 && item.TrackCount != disc.Count()) ||
+                        disc.Any(item => item.DiscCount != 0 && item.DiscCount != discs.Length))
+                        return false;
+                }
+            }
+            return true;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or
+                                      TagLib.CorruptFileException or InvalidOperationException or
+                                      ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static string ExistingTrackArea(string relativePath)
+    {
+        var first = relativePath.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+            StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        return first is not null && Regex.IsMatch(first, "^(?:stereo|multi(?:channel|[ _-]?ch))$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+            ? first
+            : string.Empty;
+    }
+
     public static PreviousOutputPlan? Discover(string albumRoot)
     {
         var root = Path.GetFullPath(albumRoot);
@@ -49,7 +134,17 @@ public static class PreviousOutputCleanupService
             using var document = JsonDocument.Parse(File.ReadAllText(reportPath));
             var report = document.RootElement;
             var workflow = Text(report, "workflow_mode");
-            if (!IsFlacWorkflow(workflow)) return null;
+            var isDsdWorkflow = IsDsdWorkflow(workflow);
+            if (!IsFlacWorkflow(workflow) && !isDsdWorkflow) return null;
+            if (isDsdWorkflow)
+            {
+                var reusableIsoSources = EnumerateReportedSources(report)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Select(relative => HostStagingService.SafeCombine(root, NormalizeRelative(relative)))
+                    .Where(path => Path.GetExtension(path).Equals(".iso", StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (reusableIsoSources.Length != 1 || !File.Exists(reusableIsoSources[0])) return null;
+            }
             var verification = Property(report, "verification", out var value) ? value : default;
             var status = verification.ValueKind == JsonValueKind.Object ? Text(verification, "status") ?? "pending" : "pending";
             if (status.Equals("passed", StringComparison.OrdinalIgnoreCase)) return null;
@@ -123,6 +218,64 @@ public static class PreviousOutputCleanupService
         }
     }
 
+    public static VerifiedOutputPlan? DiscoverArchivedDsdArtifacts(string albumRoot)
+    {
+        var root = Path.GetFullPath(albumRoot);
+        var archivedReports = Directory.EnumerateFiles(root, "conversion-report.previous-*.json", SearchOption.TopDirectoryOnly)
+            .OrderByDescending(File.GetLastWriteTimeUtc)
+            .ToArray();
+        foreach (var reportPath in archivedReports)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllText(reportPath));
+                var report = document.RootElement;
+                if (!IsDsdWorkflow(Text(report, "workflow_mode")) ||
+                    !Property(report, "verification", out var verification) ||
+                    verification.ValueKind != JsonValueKind.Object ||
+                    !string.Equals(Text(verification, "status"), "incomplete", StringComparison.OrdinalIgnoreCase) ||
+                    !Property(report, "commit", out var commit) || commit.ValueKind != JsonValueKind.Object ||
+                    !string.Equals(Text(commit, "status"), "completed_incomplete", StringComparison.OrdinalIgnoreCase) ||
+                    !Property(report, "artifacts", out var artifacts) || artifacts.ValueKind != JsonValueKind.Array)
+                    continue;
+
+                var reportedArtifacts = artifacts.EnumerateArray()
+                    .Where(item => item.ValueKind == JsonValueKind.String)
+                    .Select(item => item.GetString())
+                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Select(value => NormalizeRelative(value!))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                if (reportedArtifacts.Length == 0 || reportedArtifacts.Any(path => !IsDsdProvenanceArtifact(path)))
+                    return null;
+
+                var sizes = CommitSizes(report);
+                var files = reportedArtifacts.Select(relative =>
+                    {
+                        var fullPath = HostStagingService.SafeCombine(root, relative);
+                        var size = sizes.TryGetValue(relative, out var recordedSize) ? recordedSize : (long?)null;
+                        return new PreviousOutputFile(relative, fullPath, size);
+                    })
+                    .OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                if (files.Any(file => file.Size is null || !File.Exists(file.FullPath) ||
+                                      new FileInfo(file.FullPath).Length != file.Size.Value))
+                    return null;
+                return new(root, reportPath, files);
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or
+                                          InvalidOperationException or ArgumentException or NotSupportedException)
+            {
+                return null;
+            }
+        }
+        return null;
+    }
+
     public static CompletedOutputPlan? DiscoverCompleted(string albumRoot)
     {
         var root = Path.GetFullPath(albumRoot);
@@ -151,6 +304,7 @@ public static class PreviousOutputCleanupService
             // Older successful reports may not have a terminal commit status, but an explicitly
             // recorded source deletion after passed verification is conclusive legacy evidence.
             if (!commitCompleted && !sourcesDeleted) return null;
+            if (!sourcesDeleted && IsLegacyRetainedIsoRepairPendingDisposition(root, report)) return null;
 
             var sizes = CommitSizes(report);
             var reportedPaths = EnumerateReportedOutputs(report)
@@ -593,6 +747,17 @@ public static class PreviousOutputCleanupService
         return AudioExtensions.Contains(Path.GetExtension(normalized));
     }
 
+    private static bool IsDsdProvenanceArtifact(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || Path.IsPathRooted(path)) return false;
+        var normalized = NormalizeRelative(path);
+        if (!string.IsNullOrEmpty(Path.GetDirectoryName(normalized))) return false;
+        return normalized.Equals("sacd_extract-layout.txt", StringComparison.OrdinalIgnoreCase) ||
+               Regex.IsMatch(normalized,
+                   "^sacd_extract-(?:stereo|multichannel)(?:-independent)?\\.log$",
+                   RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
     private static bool IsSourcePath(string? path)
     {
         if (string.IsNullOrWhiteSpace(path) || Path.IsPathRooted(path)) return false;
@@ -940,6 +1105,8 @@ public static class PreviousOutputCleanupService
     }
 
     private sealed record InventorySource(string Path, long Size);
+    private sealed record ExistingTrackEvidence(
+        string Area, string Album, uint Disc, uint DiscCount, uint Track, uint TrackCount);
     private sealed record SacdRecoveryArea(string Folder, IReadOnlyList<string> TrackTitles);
     private sealed record PcmAudioFormat(int SampleRate, int Channels);
     private sealed class CueRecoveryTrack(int number)
@@ -977,6 +1144,33 @@ public static class PreviousOutputCleanupService
         workflow is not null &&
         (workflow.Equals("existing_track_repair", StringComparison.OrdinalIgnoreCase) ||
          workflow.Equals(nameof(WorkflowMode.ExistingTrackRepair), StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsLegacyRetainedIsoRepairPendingDisposition(string root, JsonElement report)
+    {
+        if (!IsRepairWorkflow(Text(report, "workflow_mode")) ||
+            Text(report, "format") is not { } format ||
+            format is not ("dsf" or "dff") ||
+            !Property(report, "deletion", out var deletion) || deletion.ValueKind != JsonValueKind.Object ||
+            Flag(deletion, "performed") ||
+            !string.Equals(Text(deletion, "status"), "retained", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(Text(deletion, "policy"), "transactional_existing_track_replacement_without_source_deletion", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var isoSources = EnumerateReportedSources(report)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(relative => Path.GetExtension(relative).Equals(".iso", StringComparison.OrdinalIgnoreCase))
+            .Select(relative => HostStagingService.SafeCombine(root, NormalizeRelative(relative)))
+            .Where(File.Exists)
+            .ToArray();
+        var expectedExtension = $".{format}";
+        var repairedTracks = EnumerateReportedOutputs(report)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(relative => Path.GetExtension(relative).Equals(expectedExtension, StringComparison.OrdinalIgnoreCase))
+            .Select(relative => HostStagingService.SafeCombine(root, NormalizeRelative(relative)))
+            .Where(File.Exists)
+            .ToArray();
+        return isoSources.Length == 1 && repairedTracks.Length >= 2;
+    }
 
     private static bool IsCompletedWorkflow(string? workflow) =>
         IsFlacWorkflow(workflow) || IsDsdWorkflow(workflow) || IsRepairWorkflow(workflow);

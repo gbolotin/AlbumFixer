@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -89,7 +90,7 @@ public sealed partial class AlbumScanner
         string folder,
         IProgress<InventoryProgress>? progress,
         CancellationToken token = default) =>
-        Task.Run(() => Scan(folder, progress, token), token);
+        Task.Run(() => Scan(folder, progress, token, excludedAlbumRoots: null), token);
 
     public async Task<IReadOnlyList<ScanResult>> ScanAlbumsAsync(string folder, CancellationToken token = default)
     {
@@ -147,9 +148,13 @@ public sealed partial class AlbumScanner
     }
 
     public ScanResult Scan(string folder, CancellationToken token = default)
-        => Scan(folder, progress: null, token);
+        => Scan(folder, progress: null, token, excludedAlbumRoots: null);
 
-    private ScanResult Scan(string folder, IProgress<InventoryProgress>? progress, CancellationToken token)
+    private ScanResult Scan(
+        string folder,
+        IProgress<InventoryProgress>? progress,
+        CancellationToken token,
+        IReadOnlyList<string>? excludedAlbumRoots)
     {
         if (string.IsNullOrWhiteSpace(folder)) throw new ArgumentException("Choose an album folder first.");
         var root = Path.GetFullPath(folder);
@@ -158,7 +163,14 @@ public sealed partial class AlbumScanner
         var errors = new List<string>();
         string[] files;
         progress?.Report(new(0, 0, "Discovering files", new DirectoryInfo(root).Name));
-        try { files = Directory.GetFiles(root, "*", SearchOption.AllDirectories); }
+        try
+        {
+            files = Directory.GetFiles(root, "*", SearchOption.AllDirectories)
+                .Where(path => !IsTransientAlbumFixerPath(root, path))
+                .Where(path => excludedAlbumRoots is null ||
+                               !excludedAlbumRoots.Any(excluded => IsWithin(excluded, path)))
+                .ToArray();
+        }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         { throw new IOException($"Could not inventory this album: {error.Message}", error); }
 
@@ -225,6 +237,8 @@ public sealed partial class AlbumScanner
             catch (IOException error) { warnings.Add($"Could not read {Path.GetFileName(cue)}: {error.Message}"); }
             Advance("Reading CUE references", cue);
         }
+        var trackPerFileCue = AreTrackPerFileCueSheets(cues, references);
+        var verifiedLegacySplitCue = IsVerifiedLegacySplitCue(root, cues, references, files);
 
         var media = new List<MediaItem>();
         foreach (var path in files)
@@ -239,6 +253,8 @@ public sealed partial class AlbumScanner
                 ".iso" => ("SACD / DSD image", "Signature must be probed before extraction"),
                 ".flac" when previousOutputs.Contains(path) => ("Previous Album Fixer output", "Report-proven output; root files are replaced only after new tracks verify"),
                 ".flac" when PreviousOutputCleanupService.IsInnerTracksFile(root, path) => ("Inner-folder FLAC", "Retained legacy inner-folder track; new tracks are written at the album root"),
+                ".flac" when referenced && trackPerFileCue =>
+                    ("Existing FLAC", "Already-separated track referenced by a one-file-per-track CUE"),
                 ".flac" when referenced => ("FLAC image", "Referenced by CUE"),
                 ".flac" => ("Existing FLAC", "Individual track candidate"),
                 ".dsf" when previousOutputs.Contains(path) => ("Previous Album Fixer output", "Report-proven SACD output"),
@@ -249,7 +265,7 @@ public sealed partial class AlbumScanner
                 ".dff" => ("Existing DFF", "Individual track candidate"),
                 ".dst" => ("DST stream", "Losslessly compressed DSD; probe required"),
                 ".dsd" => ("Raw DSD", "Ambiguous extension; bit order and layout must be established"),
-                ".jpg" or ".jpeg" or ".png" when name.Contains("cover") || name.Contains("front") || name == "folder.jpg" => ("Artwork", "Local artwork candidate"),
+                ".jpg" or ".jpeg" or ".png" or ".tif" or ".tiff" when name.Contains("cover") || name.Contains("front") || name is "folder.jpg" or "folder.tif" or "folder.tiff" => ("Artwork", "Local artwork candidate"),
                 ".md5" or ".sfv" => ("Provenance", "Preserved checksum manifest and album identity evidence"),
                 ".log" or ".txt" or ".pdf" or ".m3u" or ".m3u8" or ".ddp" => ("Provenance", "Preserved log, scan, or playlist"),
                 _ => (string.Empty, string.Empty)
@@ -265,22 +281,43 @@ public sealed partial class AlbumScanner
 
         var images = media.Where(item => item.Kind.Contains("image", StringComparison.OrdinalIgnoreCase) || item.Kind is "DST stream" or "Raw DSD").ToArray();
         var tracks = media.Where(item => item.Kind.StartsWith("Existing", StringComparison.OrdinalIgnoreCase)).ToArray();
-        var repairTracks = tracks.Where(item => item.Kind.Equals("Existing FLAC", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var repairTracks = tracks.Where(item => item.Kind is "Existing FLAC" or "Existing DSF" or "Existing DFF").ToArray();
+        var repairKind = repairTracks.Select(item => item.Kind).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         var completedPlan = completedPlans.FirstOrDefault(plan => plan.AlbumRoot.Equals(root, StringComparison.OrdinalIgnoreCase));
         var completedSources = completedPlan?.SourcePaths.ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
-        var completed = completedPlan is not null && tracks.Length == 0 &&
+        var hasDsdRepairHistory = repairKind.Length == 1 && repairKind[0] is "Existing DSF" or "Existing DFF" &&
+                                  File.Exists(Path.Combine(root, "conversion-report.json"));
+        var completeExistingTrackSet = images.Length == 0 && repairTracks.Length == tracks.Length &&
+                                       !hasDsdRepairHistory &&
+                                       PreviousOutputCleanupService.HasCompleteExistingTrackSet(repairTracks);
+        var completed = completeExistingTrackSet || completedPlan is not null && tracks.Length == 0 &&
             images.All(item => completedSources.Contains(item.Path));
+        if (completeExistingTrackSet)
+        {
+            var format = repairKind[0].Replace("Existing ", string.Empty, StringComparison.OrdinalIgnoreCase);
+            warnings.Add(references.Any(path => !File.Exists(path))
+                ? $"The already-separated {format} tracks form a complete multi-disc or multi-area set with required tags and embedded artwork. Missing source files named by preserved CUE sheets were accepted as historical provenance; no repair or external lookup is required."
+                : $"The already-separated {format} tracks form a complete set with required tags and embedded artwork; no repair or external lookup is required.");
+        }
         if (completedPlan?.RecoveredFromStaleFallback == true)
             warnings.Add(completedPlan.RecoveryDetail ?? "Completion was recovered from a verified stale fallback state.");
-        if (!completed)
+        if (!completed && !verifiedLegacySplitCue)
             foreach (var missing in references.Where(path => !File.Exists(path)))
                 errors.Add($"CUE references a missing source: {Path.GetRelativePath(root, missing)}");
         if (previousOutputs.Count > 0 && !completed)
             warnings.Add($"Found {previousOutputs.Count} report-proven output file{(previousOutputs.Count == 1 ? "" : "s")} from an earlier Album Fixer run. Root-level outputs are replaced only after new tracks verify; inner-folder tracks are retained.");
 
         var albumRoots = AlbumRoots(root, media.Where(IsAlbumRootInput));
+        if (excludedAlbumRoots is null && albumRoots.Count > 1 &&
+            albumRoots.Contains(root, StringComparer.OrdinalIgnoreCase))
+        {
+            var nestedAlbumRoots = albumRoots
+                .Where(path => !path.Equals(root, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            return Scan(root, progress, token, nestedAlbumRoots);
+        }
         if (albumRoots.Count == 1 && !albumRoots[0].Equals(root, StringComparison.OrdinalIgnoreCase))
-            return Scan(albumRoots[0], progress, token);
+            return Scan(albumRoots[0], progress, token, excludedAlbumRoots: null);
 
         WorkflowMode mode;
         if (albumRoots.Count > 1)
@@ -291,17 +328,27 @@ public sealed partial class AlbumScanner
         else if (completed) mode = WorkflowMode.Completed;
         else if (tracks.Length > 0)
         {
-            if (repairTracks.Length >= 2 && repairTracks.Length == tracks.Length)
+            if (repairTracks.Length >= 2 && repairTracks.Length == tracks.Length && repairKind.Length == 1)
             {
                 mode = WorkflowMode.ExistingTrackRepair;
-                if (images.Length > 0) warnings.Add("Separated FLAC tracks coexist with an image. Repair-only mode takes precedence; the image stays until equivalence is proven.");
+                if (images.Length > 0) warnings.Add((repairKind[0] is "Existing DSF" or "Existing DFF") && images.Length == 1 && images[0].Kind == "SACD / DSD image"
+                    ? "Separated DSD tracks coexist with one retained SACD ISO. The ISO is eligible for deletion only when Delete originals is selected and every repaired track passes final payload, tag, and artwork verification."
+                    : "Separated tracks coexist with an image. Repair-only mode takes precedence and the image remains untouched.");
+                if (trackPerFileCue)
+                    warnings.Add("A one-file-per-track CUE was retained as provenance; the already-separated FLAC files will use verified repair-only write-back.");
+                if (verifiedLegacySplitCue)
+                    warnings.Add("The missing source file or files named by the legacy CUE were accepted as historical provenance because the complete root FLAC set has matching sequential numbers and normalized CUE titles; the tracks will continue through structural and metadata verification.");
+                if (repairKind[0].Equals("Existing DSF", StringComparison.OrdinalIgnoreCase))
+                    warnings.Add("Standalone DSF tracks will be repaired transactionally; the native DSD data chunk must remain byte-identical through final write-back.");
+                if (repairKind[0].Equals("Existing DFF", StringComparison.OrdinalIgnoreCase))
+                    warnings.Add("Standalone DFF tracks will be repaired transactionally through a native DSDIFF ID3 writer; the DSD audio chunk must remain byte-identical through final write-back.");
             }
             else
             {
                 mode = WorkflowMode.NeedsInspection;
-                errors.Add(repairTracks.Length == tracks.Length
-                    ? "Existing-track repair requires at least two standalone FLAC tracks."
-                    : "Standalone DSF or DFF tracks are not eligible for the FLAC existing-track repair workflow; report-proven SACD outputs are adopted separately.");
+                errors.Add(repairTracks.Length == tracks.Length && repairKind.Length <= 1
+                    ? "Existing-track repair requires at least two standalone FLAC, DSF, or DFF tracks."
+                    : "Mixed standalone track formats are not eligible for one automatic repair transaction.");
             }
         }
         else if (media.Any(item => item.Kind == "FLAC image")) mode = errors.Count == 0 ? WorkflowMode.FlacCueSplit : WorkflowMode.NeedsInspection;
@@ -352,11 +399,190 @@ public sealed partial class AlbumScanner
                !relative.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal);
     }
 
-    [GeneratedRegex("^(?:(?:cd|disc|disk)\\s*[-_. ]*\\d+|stereo|multichannel)$", RegexOptions.IgnoreCase)]
+    private static bool IsTransientAlbumFixerPath(string root, string path) =>
+        Path.GetRelativePath(root, path)
+            .Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries)
+            .Any(part => part.StartsWith(".album-fixer-", StringComparison.OrdinalIgnoreCase));
+
+    private static bool AreTrackPerFileCueSheets(IReadOnlyList<string> cues, IReadOnlySet<string> references)
+    {
+        // Two one-track images are indistinguishable from a conventional two-disc
+        // image set. Require album track scale before choosing track-per-file repair.
+        if (cues.Count == 0 || references.Count < 3) return false;
+        var allSources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var cue in cues)
+        {
+            var sourceFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var audioTracks = 0;
+            var zeroIndexes = 0;
+            var currentTrackHasZeroIndex = false;
+            foreach (var line in File.ReadLines(cue))
+            {
+                var file = CueFile().Match(line);
+                if (file.Success)
+                {
+                    var name = file.Groups["q"].Success ? file.Groups["q"].Value : file.Groups["u"].Value;
+                    var source = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(cue)!, name));
+                    if (!Path.GetExtension(source).Equals(".flac", StringComparison.OrdinalIgnoreCase) ||
+                        !sourceFiles.Add(source) || !allSources.Add(source))
+                        return false;
+                    continue;
+                }
+
+                if (CueAudioTrack().IsMatch(line))
+                {
+                    if (audioTracks > 0 && !currentTrackHasZeroIndex) return false;
+                    audioTracks++;
+                    currentTrackHasZeroIndex = false;
+                    continue;
+                }
+
+                if (audioTracks > 0 && CueIndex01Zero().IsMatch(line) && !currentTrackHasZeroIndex)
+                {
+                    currentTrackHasZeroIndex = true;
+                    zeroIndexes++;
+                }
+            }
+            if (audioTracks == 0 || !currentTrackHasZeroIndex ||
+                sourceFiles.Count != audioTracks || zeroIndexes != audioTracks)
+                return false;
+        }
+        return allSources.SetEquals(references);
+    }
+
+    private static bool IsVerifiedLegacySplitCue(
+        string root,
+        IReadOnlyList<string> cues,
+        IReadOnlySet<string> references,
+        IReadOnlyList<string> files)
+    {
+        if (cues.Count == 0 || references.Count == 0 || references.Any(File.Exists)) return false;
+
+        var cueDirectory = Path.GetDirectoryName(cues[0])!;
+        if (!Path.GetFullPath(cueDirectory).Equals(Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase) ||
+            cues.Any(cue => !Path.GetDirectoryName(cue)!.Equals(cueDirectory, StringComparison.OrdinalIgnoreCase)))
+            return false;
+        var allFlacs = files.Where(path => Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var rootFlacs = allFlacs.Where(path => Path.GetDirectoryName(path)!.Equals(cueDirectory, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (rootFlacs.Length < 2 || rootFlacs.Length != allFlacs.Length) return false;
+
+        Dictionary<int, string>? cueTitles = null;
+        foreach (var cue in cues)
+        {
+            if (!TryReadCueAudioTracks(cue, out var candidateTitles)) return false;
+            if (cueTitles is null) cueTitles = candidateTitles;
+            else if (cueTitles.Count != candidateTitles.Count || cueTitles.Any(pair =>
+                         !candidateTitles.TryGetValue(pair.Key, out var candidate) ||
+                         !CueTitleIdentity(pair.Value).Equals(CueTitleIdentity(candidate), StringComparison.Ordinal)))
+                return false;
+        }
+
+        if (cueTitles is null) return false;
+        var expectedNumbers = Enumerable.Range(1, cueTitles.Count).ToArray();
+        if (cueTitles.Count != rootFlacs.Length || !cueTitles.Keys.Order().SequenceEqual(expectedNumbers) ||
+            references.Count != 1 && references.Count != cueTitles.Count)
+            return false;
+
+        var splitTracks = new Dictionary<int, string>();
+        foreach (var flac in rootFlacs)
+        {
+            var parsed = LocalTrackRepairProcessor.ParseFileName(Path.GetFileNameWithoutExtension(flac));
+            if (parsed.Number is not { } number || number == 0 || number > int.MaxValue ||
+                !splitTracks.TryAdd((int)number, parsed.Title))
+                return false;
+        }
+
+        if (!splitTracks.Keys.Order().SequenceEqual(expectedNumbers) || expectedNumbers.Any(number =>
+                !CueTitleIdentity(cueTitles[number]).Equals(CueTitleIdentity(splitTracks[number]), StringComparison.Ordinal)))
+            return false;
+
+        if (references.Count == 1) return true;
+        var referencedTracks = new Dictionary<int, string>();
+        foreach (var reference in references)
+        {
+            if (Path.GetDirectoryName(reference) is not { } directory ||
+                !directory.Equals(cueDirectory, StringComparison.OrdinalIgnoreCase) ||
+                Path.GetExtension(reference) is not { } extension ||
+                extension is not (".wav" or ".WAV" or ".flac" or ".FLAC"))
+                return false;
+            var parsed = LocalTrackRepairProcessor.ParseFileName(Path.GetFileNameWithoutExtension(reference));
+            if (parsed.Number is not { } number || number == 0 || number > int.MaxValue ||
+                !referencedTracks.TryAdd((int)number, parsed.Title))
+                return false;
+        }
+        return referencedTracks.Keys.Order().SequenceEqual(expectedNumbers) && expectedNumbers.All(number =>
+            CueTitleIdentity(cueTitles[number]).Equals(CueTitleIdentity(referencedTracks[number]), StringComparison.Ordinal));
+    }
+
+    private static bool TryReadCueAudioTracks(string cue, out Dictionary<int, string> titles)
+    {
+        titles = [];
+        var indexedTracks = new HashSet<int>();
+        int? currentTrack = null;
+        foreach (var line in File.ReadLines(cue))
+        {
+            var track = CueAudioTrackNumber().Match(line);
+            if (track.Success)
+            {
+                if (!int.TryParse(track.Groups["number"].Value, out var number) || number <= 0 ||
+                    !titles.TryAdd(number, string.Empty))
+                    return false;
+                currentTrack = number;
+                continue;
+            }
+
+            if (CueAnyTrack().IsMatch(line))
+            {
+                currentTrack = null;
+                continue;
+            }
+            if (currentTrack is not { } activeTrack) continue;
+            var title = CueTitle().Match(line);
+            if (title.Success && titles[activeTrack].Length == 0)
+            {
+                titles[activeTrack] = title.Groups["q"].Success
+                    ? title.Groups["q"].Value.Trim()
+                    : title.Groups["u"].Value.Trim();
+                continue;
+            }
+            if (CueIndex01().IsMatch(line)) indexedTracks.Add(activeTrack);
+        }
+        return titles.Count >= 2 && indexedTracks.Count == titles.Count && titles.Values.All(value => !string.IsNullOrWhiteSpace(value));
+    }
+
+    private static string CueTitleIdentity(string value)
+    {
+        var normalized = value.Normalize(NormalizationForm.FormD);
+        var identity = new StringBuilder(normalized.Length);
+        foreach (var character in normalized)
+            if (CharUnicodeInfo.GetUnicodeCategory(character) != UnicodeCategory.NonSpacingMark && char.IsLetterOrDigit(character))
+                identity.Append(char.ToLowerInvariant(character));
+        return identity.ToString();
+    }
+
+    [GeneratedRegex("^(?:(?:cd|disc|disk)\\s*[-_. ]*\\d+(?:\\s*[-_.].*)?|stereo|multichannel)$", RegexOptions.IgnoreCase)]
     private static partial Regex DiscOrAreaFolder();
 
     [GeneratedRegex("^\\s*FILE\\s+(?:\"(?<q>[^\"]+)\"|(?<u>\\S+))\\s+\\S+", RegexOptions.IgnoreCase)]
     private static partial Regex CueFile();
+
+    [GeneratedRegex("^\\s*TRACK\\s+\\d+\\s+AUDIO\\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex CueAudioTrack();
+
+    [GeneratedRegex("^\\s*TRACK\\s+(?<number>\\d+)\\s+AUDIO\\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex CueAudioTrackNumber();
+
+    [GeneratedRegex("^\\s*TRACK\\s+\\d+\\s+\\S+\\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex CueAnyTrack();
+
+    [GeneratedRegex("^\\s*TITLE\\s+(?:\"(?<q>[^\"]+)\"|(?<u>\\S.*))\\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex CueTitle();
+
+    [GeneratedRegex("^\\s*INDEX\\s+01\\s+\\d{1,3}:\\d{2}:\\d{2}\\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex CueIndex01();
+
+    [GeneratedRegex("^\\s*INDEX\\s+01\\s+00:00:00\\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex CueIndex01Zero();
 }
 
 public sealed class PreflightService
@@ -499,11 +725,27 @@ public sealed class PreflightService
                 : new("Verified write-back", CheckState.Failed, "This release supports one SACD ISO per album. Other DSD source types remain read-only.", true));
         }
         else if (scan.Mode == WorkflowMode.ExistingTrackRepair)
-            checks.Add(scan.CueCount == 0 && scan.ImageCount == 0 && scan.TrackCount >= 2
+        {
+            var repairKinds = scan.Media
+                .Where(item => item.Kind.StartsWith("Existing", StringComparison.OrdinalIgnoreCase))
+                .Select(item => item.Kind)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var isDsfRepair = repairKinds.Length == 1 && repairKinds[0].Equals("Existing DSF", StringComparison.OrdinalIgnoreCase);
+            var isDffRepair = repairKinds.Length == 1 && repairKinds[0].Equals("Existing DFF", StringComparison.OrdinalIgnoreCase);
+            var retainedDsdIso = (isDsfRepair || isDffRepair) && scan.ImageCount == 1 &&
+                                 scan.Media.Count(item => item.Kind == "SACD / DSD image") == 1;
+            checks.Add((scan.ImageCount == 0 || retainedDsdIso) && scan.TrackCount >= 2 && repairKinds.Length == 1 &&
+                       (repairKinds[0].Equals("Existing FLAC", StringComparison.OrdinalIgnoreCase) || isDsfRepair || isDffRepair)
                 ? new("Verified write-back", CheckState.Passed,
-                    "Standalone FLAC tracks will be repaired in local staging, checked for exact compressed-audio payload equality, and replaced through destination-side rollback.")
+                    isDsfRepair
+                        ? "Existing DSF tracks will be repaired in local staging, checked for exact native-DSD data-chunk equality, and replaced through destination-side rollback."
+                        : isDffRepair
+                            ? "Existing DFF tracks will be repaired in local staging with native DSDIFF ID3 handling, checked for exact DSD-chunk equality, and replaced through destination-side rollback; one coexisting SACD ISO may be deleted only after complete final verification."
+                        : "Existing FLAC tracks will be repaired in local staging, checked for exact compressed-audio payload equality, and replaced through destination-side rollback; any one-file-per-track CUE remains untouched as provenance.")
                 : new("Verified write-back", CheckState.Failed,
-                    "Existing-track repair is enabled only when at least two standalone FLAC tracks have no CUE sheet or source image. Ambiguous mixed sources remain read-only.", true));
+                    "Existing-track repair requires at least two standalone FLAC tracks, standalone DSF tracks, or standalone DFF tracks of one format. DSF or DFF repair may coexist with one retained SACD ISO; ambiguous mixed sources remain read-only.", true));
+        }
         else if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.MultipleAlbums and not WorkflowMode.Unsupported)
             checks.Add(new("Verified write-back", CheckState.Failed, "Host-managed final placement is enabled for FLAC + CUE and single SACD ISO workflows. Other modes stop before changing files.", true));
         checks.AddRange(scan.Errors.Select(error => new PreflightCheck("Inventory", CheckState.Failed, error, true)));

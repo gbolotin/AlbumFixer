@@ -180,13 +180,28 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool IsSingleSacd => AlbumCount == 1 && _scans[0].Mode == WorkflowMode.DsdExtraction;
     public bool IsSingleTrackRepair => AlbumCount == 1 && _scans[0].Mode == WorkflowMode.ExistingTrackRepair;
     public bool HasSacdWorkflows => _scans.Any(scan => scan.Mode == WorkflowMode.DsdExtraction);
-    public bool DeletesSourceAfterSuccess => DeleteOriginals && RunnableAlbumCount > 0 && _albumPreflights.Where(album => album.CanStart).All(album => album.Scan is { ImageCount: 1, TrackCount: 0 });
-    public bool DeletesAnySourceAfterSuccess => DeleteOriginals && _albumPreflights.Any(album => album.CanStart && album.Scan is { ImageCount: 1, TrackCount: 0 });
+    public bool DeletesSourceAfterSuccess => DeleteOriginals && RunnableAlbumCount > 0 &&
+                                             _albumPreflights.Where(album => album.CanStart).All(album => HasDeletableSource(album.Scan));
+    public bool DeletesAnySourceAfterSuccess => DeleteOriginals &&
+                                                _albumPreflights.Any(album => album.CanStart && HasDeletableSource(album.Scan));
+    private static bool HasDeletableSource(ScanResult scan) =>
+        scan is { ImageCount: 1, TrackCount: 0 } || HasRetainedDsdIsoRepair(scan);
+    private static bool HasRetainedDsdIsoRepair(ScanResult scan)
+    {
+        if (scan.Mode != WorkflowMode.ExistingTrackRepair || scan.ImageCount != 1 ||
+            scan.Media.Count(item => item.Kind == "SACD / DSD image") != 1) return false;
+        var tracks = scan.Media.Where(item => item.Kind is "Existing DSF" or "Existing DFF").ToArray();
+        return tracks.Length >= 2 && tracks.All(item => item.Kind == tracks[0].Kind);
+    }
     private string SourceActionDetail => IsBatch
         ? $"Hardware-aware pipeline: {BatchPipelineDescription}. Every album remains isolated, blocked albums are skipped, and SACD areas stay sequential inside each album. " +
           (DeleteOriginals ? "Failed, canceled, or artwork-incomplete albums retain their originals." : "Delete originals is off; every original will be retained.")
         : IsSingleTrackRepair
-            ? "Existing tags and embedded artwork have highest priority; external exact-album matches and filenames fill only missing fields. Repaired FLACs replace the originals transactionally only after exact compressed-audio payload verification. Delete originals does not apply."
+            ? DeletesSourceAfterSuccess
+                ? "Existing tags and embedded artwork have highest priority; external exact-album matches and filenames fill only missing fields. Repaired DSF or DFF tracks replace the originals transactionally only after exact native-audio-payload verification. The single retained SACD ISO is deleted only after every repaired track, tag, and embedded cover passes final-path verification."
+                : HasRetainedDsdIsoRepair(_scans[0]) && !DeleteOriginals
+                    ? "Existing DSF or DFF tracks are repaired transactionally after exact native-audio-payload verification. Delete originals is off, so the coexisting SACD ISO will be retained."
+                    : "Existing tags and embedded artwork have highest priority; external exact-album matches and filenames fill only missing fields. Repaired FLAC, DSF, or DFF tracks replace the originals transactionally only after exact native-audio-payload verification. Source deletion does not apply unless uniform DSF or DFF tracks coexist with one retained SACD ISO."
         : !DeleteOriginals
             ? "Delete originals is off. Verified output will be committed and every original source will be retained."
         : IsSingleSacd
@@ -770,7 +785,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         RefreshProgressTime();
         _progressTimer.Start();
         ReportStatus = "Pending"; ReportTracks = ReportSections = ReportDisposition = "—"; ReportJson = "";
-        ReportHeadline = "Run in progress"; ReportDetail = "A terminal report will be preserved even if the run stops.";
+        ReportHeadline = "Run in progress"; ReportDetail = "Terminal status will be recorded before transient staging is cleaned.";
         JobDirectory = PreflightService.CreateJobDirectory(runPreflight.TempRoot);
         var pipelineLimits = PreflightService.PipelineLimits(runAlbums);
         var workerLimit = pipelineLimits.MaxInFlight;
@@ -963,7 +978,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                         .Where(field => !field.Equals("COVER", StringComparison.OrdinalIgnoreCase))
                         .ToArray();
                     if (unresolvedRequired.Length > 0)
-                        throw new InvalidOperationException($"Required FLAC metadata remains unresolved after local lookup ({string.Join(", ", unresolvedRequired)}). Local results are preserved at {staged.AlbumRoot}.");
+                        throw new InvalidOperationException($"Required FLAC metadata remains unresolved after local lookup ({string.Join(", ", unresolvedRequired)}). Originals remain untouched; transient local staging will be cleaned automatically.");
                     if (gaps.RequiresResearch)
                         uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA", Message: "Front artwork remains unavailable. Verified tracks will be delivered as incomplete work and the source image will be retained."));
                     else
@@ -975,7 +990,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                         .Where(field => !field.Equals("COVER", StringComparison.OrdinalIgnoreCase))
                         .ToArray();
                     if (unresolvedRequired.Length > 0)
-                        throw new InvalidOperationException($"Required existing-track metadata remains unresolved after local and external lookup ({string.Join(", ", unresolvedRequired)}). Originals remain untouched; local results are preserved at {staged.AlbumRoot}.");
+                        throw new MetadataResolutionException(
+                            $"Required existing-track metadata remains unresolved after local and external lookup ({string.Join(", ", unresolvedRequired)}). Originals remain untouched; transient local staging will be cleaned automatically.",
+                            gaps.LookupWarnings);
                     uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "METADATA",
                         Message: "Front artwork remains unavailable. Audio-identical repaired tracks will be delivered as incomplete work."));
                 }
@@ -1016,7 +1033,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: new(JobPhase.Failed, last.Percent, "failed", error.Message, DateTimeOffset.UtcNow)));
             if (transactionLock is not null)
-                await EnsureAlbumTerminalReportAsync(scan, runPreflight, jobDirectory, last with { Detail = error.Message }, false, uiUpdates, index, albumIndex);
+                await EnsureAlbumTerminalReportAsync(scan, runPreflight, jobDirectory, last with { Detail = error.Message }, false, uiUpdates, index, albumIndex,
+                    error is MetadataResolutionException metadataError ? metadataError.Diagnostics : []);
             throw;
         }
         finally
@@ -1095,13 +1113,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         bool canceled,
         IProgress<JobUiUpdate> uiUpdates,
         int index,
-        int albumIndex)
+        int albumIndex,
+        IReadOnlyList<string>? diagnostics = null)
     {
         try
         {
             await HostReportWriter.EnsureTerminalReportAsync(scan, runPreflight, jobDirectory,
-                canceled ? "canceled" : "failed", last.Phase, last.Percent, last.Detail);
-            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "REPORT", Message: "A terminal report was preserved; this album's originals remain in place."));
+                canceled ? "canceled" : "failed", last.Phase, last.Percent, last.Detail,
+                diagnostics: diagnostics);
+            uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "REPORT", Message: "A terminal failure report was recorded before transient cleanup; this album's originals remain in place."));
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
         {
@@ -1321,7 +1341,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             await HostReportWriter.EnsureTerminalReportAsync(_scan, _preflight, JobDirectory,
                 canceled ? "canceled" : "failed", _lastPhase, (int)Progress, _lastRunDetail);
-            Log("REPORT", "A terminal report was preserved; every original remains in place.");
+            Log("REPORT", "A terminal failure report was recorded before transient cleanup; every original remains in place.");
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
         {

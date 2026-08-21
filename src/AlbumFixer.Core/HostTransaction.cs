@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -106,7 +107,8 @@ public sealed class HostStagingService
         if (previousOutputCleanup is not null)
             progress.Report(Snapshot(JobPhase.Inventoried, 1,
                 $"Removed {previousOutputCleanup.DeletedFiles} report-proven track{(previousOutputCleanup.DeletedFiles == 1 ? "" : "s")} from an incomplete earlier run and archived its report."));
-        var previousVerifiedOutput = PreviousOutputCleanupService.DiscoverVerified(scan.AlbumRoot);
+        var previousVerifiedOutput = PreviousOutputCleanupService.DiscoverVerified(scan.AlbumRoot)
+            ?? PreviousOutputCleanupService.DiscoverArchivedDsdArtifacts(scan.AlbumRoot);
         PreviousOutputCleanupService.VerifyDirectFileSizes(previousVerifiedOutput, token);
         var directPreviousFiles = PreviousOutputCleanupService.DirectFiles(previousVerifiedOutput);
         var directPreviousAudio = PreviousOutputCleanupService.DirectFiles(previousVerifiedOutput)
@@ -116,6 +118,10 @@ public sealed class HostStagingService
         if (directPreviousAudio.Count > 0)
             progress.Report(Snapshot(JobPhase.Inventoried, 1,
                 $"Verified {directPreviousAudio.Count} prior root track{(directPreviousAudio.Count == 1 ? "" : "s")} for replacement after the new output passes."));
+        var directPreviousArtifacts = directPreviousFiles.Count - directPreviousAudio.Count;
+        if (directPreviousArtifacts > 0)
+            progress.Report(Snapshot(JobPhase.Inventoried, 1,
+                $"Verified {directPreviousArtifacts} archived-report-proven SACD provenance artifact{(directPreviousArtifacts == 1 ? "" : "s")} for transactional replacement after the new extraction passes."));
 
         var sourceFiles = scan.Media
             .Where(IsSource)
@@ -219,7 +225,7 @@ public sealed class HostStagingService
             previous_output_replacement = previousVerifiedOutput is null ? null : new
             {
                 retained_inner_files = previousVerifiedOutput.Files.Count - directPreviousFiles.Count,
-                replaceable_root_files = directPreviousAudio.Select(path => SafeRelative(scan.AlbumRoot, path)).OrderBy(path => path).ToArray(),
+                replaceable_root_files = directPreviousFiles.Select(file => file.RelativePath).OrderBy(path => path).ToArray(),
                 status = "pending_final_verification"
             },
             sources = stagedSources.Select(source => new
@@ -367,7 +373,7 @@ public sealed class HostCommitService
         CancellationToken token)
     {
         if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.DsdExtraction and not WorkflowMode.ExistingTrackRepair)
-            throw new NotSupportedException("Verified host write-back is available for FLAC + CUE, SACD ISO, and standalone existing-FLAC repair workflows only. Every original was retained.");
+            throw new NotSupportedException("Verified host write-back is available for FLAC + CUE, SACD ISO, and standalone existing-FLAC/DSF/DFF repair workflows only. Every original was retained.");
         var isDsd = scan.Mode == WorkflowMode.DsdExtraction;
         var isRepair = scan.Mode == WorkflowMode.ExistingTrackRepair;
         if (!staged.SourceCacheUsed || isRepair)
@@ -378,6 +384,12 @@ public sealed class HostCommitService
 
         var report = JsonNode.Parse(await File.ReadAllTextAsync(localReportPath, token)) as JsonObject
             ?? throw new JsonException("The local conversion report is not a JSON object.");
+        var repairFormat = isRepair ? report["format"]?.GetValue<string>()?.ToLowerInvariant() : null;
+        if (isRepair && repairFormat is not ("flac" or "dsf" or "dff"))
+            throw new JsonException("The existing-track repair report has an unsupported format.");
+        var repairExtension = $".{repairFormat ?? "flac"}";
+        var repairFormatLabel = (repairFormat ?? "flac").ToUpperInvariant();
+        StagedSource? retainedRepairIsoSource = null;
         var outputs = isDsd
             ? NormalizeAndCollectDsdOutputs(report, staged.AlbumRoot)
             : NormalizeAndCollectOutputs(report, staged.AlbumRoot);
@@ -388,17 +400,33 @@ public sealed class HostCommitService
             .Select(file => file.RelativePath)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var outputPaths = outputs.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        IReadOnlySet<string> repairDeduplicatedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (isRepair)
         {
             var repairSources = scan.Media
-                .Where(item => item.Kind.Equals("Existing FLAC", StringComparison.OrdinalIgnoreCase))
+                .Where(item => item.Kind is "Existing FLAC" or "Existing DSF" or "Existing DFF")
                 .Select(item => item.RelativePath)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            if (scan.CueCount != 0 || scan.ImageCount != 0 || repairSources.Count < 2 || !repairSources.SetEquals(outputPaths))
-                throw new IOException("The repair output set does not exactly match the standalone FLAC tracks admitted by inventory. Every original was retained.");
+            repairDeduplicatedPaths = await ValidateRepairDeduplicationAsync(
+                report, scan.AlbumRoot, repairSources, outputPaths, token);
+            var omittedSources = repairSources.Where(path => !outputPaths.Contains(path)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var retainedDsdIso = repairFormat is "dsf" or "dff" && scan.ImageCount == 1 &&
+                                 scan.Media.Count(item => item.Kind == "SACD / DSD image") == 1;
+            if (retainedDsdIso)
+            {
+                var retainedIsoPath = scan.Media.Single(item => item.Kind == "SACD / DSD image").RelativePath;
+                retainedRepairIsoSource = staged.Sources.SingleOrDefault(source =>
+                    source.RelativePath.Equals(retainedIsoPath, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new IOException("The retained SACD ISO is missing from the immutable staging manifest. Every original was retained.");
+            }
+            if (scan.ImageCount != 0 && !retainedDsdIso || outputPaths.Count < 2 ||
+                !outputPaths.IsSubsetOf(repairSources) || !omittedSources.SetEquals(repairDeduplicatedPaths))
+                throw new IOException("The repair output set does not exactly match the same-format standalone tracks admitted by inventory. Every original was retained.");
             replacementPaths.UnionWith(repairSources);
         }
-        var unmatchedReplacements = replacementPaths.Where(path => !outputPaths.Contains(path)).ToArray();
+        var unmatchedReplacements = replacementPaths
+            .Where(path => !outputPaths.Contains(path) && !repairDeduplicatedPaths.Contains(path))
+            .ToArray();
         if (unmatchedReplacements.Length > 0)
             throw new IOException($"The new split no longer produces every report-proven root output: {string.Join(", ", unmatchedReplacements)}. The prior tracks were retained.");
         var localPlayback = await VerifyPlaybackFilesAsync(outputs, staged.AlbumRoot, staged, report, isDsd, isRepair, token);
@@ -406,8 +434,9 @@ public sealed class HostCommitService
         var localIncompleteIssues = IncompleteIssues(report, localArtworkIssues);
         var incomplete = localIncompleteIssues.Count > 0;
         var localIncompleteKind = CompletionIssue(localIncompleteIssues);
+        var retainedRepairIsoDeletionRequested = isRepair && deleteOriginals && retainedRepairIsoSource is not null && !incomplete;
         if (isDsd) ConfirmDsdVerification(report, "local staging", sourceDeletionRequested: true);
-        else if (isRepair) SetRepairVerification(report, "local staging", localIncompleteIssues);
+        else if (isRepair) SetRepairVerification(report, "local staging", localIncompleteIssues, retainedRepairIsoDeletionRequested);
         else SetQuickVerification(report, "local staging", staged.Sources.Count == 1 && !incomplete, localIncompleteIssues);
         await AtomicWriteAsync(localReportPath, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
         progress.Report(new(JobPhase.LocalVerificationPassed, 50,
@@ -417,8 +446,8 @@ public sealed class HostCommitService
                 : "Independent SACD extraction size, DSF/DSD, tag, and artwork checks passed locally."
             : isRepair
                 ? incomplete
-                    ? "Exact FLAC audio-payload equality and tag checks passed locally; artwork remains incomplete."
-                    : "Exact FLAC audio-payload equality, tag, and artwork checks passed locally."
+                    ? $"Exact {repairFormatLabel} audio-payload equality and tag checks passed locally; artwork remains incomplete."
+                    : $"Exact {repairFormatLabel} audio-payload equality, tag, and artwork checks passed locally."
             : incomplete
                 ? "Local FLAC and tag checks passed; front-cover artwork is deferred and the original source will be retained."
                 : "Quick local FLAC, tag, and artwork checks passed. Full PCM comparison was skipped.", DateTimeOffset.UtcNow));
@@ -590,28 +619,50 @@ public sealed class HostCommitService
             commit["previous_output_rollback_cleaned"] = rollbackCleaned;
             await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
         }
-        var deletesSource = !isRepair && deleteOriginals && !incomplete && staged.Sources.Count == 1 && (!isDsd || DsdDeletionEligible(report));
+        var deletesRetainedRepairIso = isRepair && deleteOriginals && !incomplete && retainedRepairIsoSource is not null;
+        var deletesSource = deletesRetainedRepairIso ||
+                            !isRepair && deleteOriginals && !incomplete && staged.Sources.Count == 1 && (!isDsd || DsdDeletionEligible(report));
+        var deletesSacdIso = isDsd || deletesRetainedRepairIso;
         if (isDsd) ConfirmDsdVerification(report, "final album path", deletesSource);
-        else if (isRepair) SetRepairVerification(report, "final album path", finalIncompleteIssues);
+        else if (isRepair) SetRepairVerification(report, "final album path", finalIncompleteIssues, deletesRetainedRepairIso);
         else SetQuickVerification(report, "final album path", deletesSource, finalIncompleteIssues);
         token.ThrowIfCancellationRequested();
         IReadOnlyList<DeletionTarget> deletionTargets = deletesSource
-            ? ResolveDeletionTargets(scan, staged, isDsd, token)
+            ? deletesRetainedRepairIso
+                ? ResolveRetainedRepairIsoDeletionTarget(scan, retainedRepairIsoSource!, token)
+                : ResolveDeletionTargets(scan, staged, isDsd, token)
             : [];
+        var reportedDeletionFiles = deletionTargets.Count > 0
+            ? deletionTargets.Select(target => target.RelativePath)
+            : retainedRepairIsoSource is not null
+                ? [retainedRepairIsoSource.RelativePath]
+                : staged.Sources.Select(source => source.RelativePath);
         var deletion = new JsonObject
         {
             ["status"] = deletesSource ? "pending" : "retained",
-            ["policy"] = isRepair
+            ["policy"] = deletesRetainedRepairIso
+                ? "verified_retained_sacd_iso_deletion_after_existing_dsd_track_repair"
+                : isRepair && retainedRepairIsoSource is not null
+                ? !deleteOriginals
+                    ? "retained_sacd_iso_by_user_request_after_existing_dsd_track_repair"
+                    : "retained_sacd_iso_because_existing_dsd_track_repair_is_incomplete"
+                : isRepair
                 ? "transactional_existing_track_replacement_without_source_deletion"
                 : deletesSource
                 ? isDsd ? "sacd_independent_extraction_size_and_structure_checks" : "user_requested_size_and_quick_checks_without_pcm_equivalence"
                 : deleteOriginals ? "source_retained_without_complete_deletion_authorization" : "source_retained_by_user_request",
-            ["authorized_after"] = deletesSource ? isDsd ? "full_dsd_final_path_verification" : "quick_final_path_checks" : null,
-            ["files"] = new JsonArray(staged.Sources.Select(source => JsonValue.Create(source.RelativePath)).ToArray()),
+            ["authorized_after"] = deletesSource ? deletesSacdIso ? "full_native_dsd_payload_tag_artwork_and_final_path_verification" : "quick_final_path_checks" : null,
+            ["files"] = new JsonArray(reportedDeletionFiles.Select(path => JsonValue.Create(path)).ToArray()),
             ["performed"] = false
         };
         if (!deletesSource) deletion["reason"] = isRepair
-            ? "Existing tracks were replaced transactionally after exact compressed-audio payload verification; source deletion does not apply."
+            ? retainedRepairIsoSource is not null && !deleteOriginals
+                ? "The user chose to retain the coexisting SACD ISO. Existing DSD tracks were replaced transactionally after exact native-audio-payload verification."
+                : retainedRepairIsoSource is not null && incomplete
+                    ? $"The repaired DSD tracks passed native-audio-payload checks, but {CompletionIssuePresentation.Description(finalIncompleteKind)}; the retained SACD ISO was not deleted."
+                    : repairDeduplicatedPaths.Count > 0
+                ? $"Existing tracks were replaced transactionally after exact compressed-audio payload verification; {repairDeduplicatedPaths.Count} byte-identical duplicate filename entr{(repairDeduplicatedPaths.Count == 1 ? "y was" : "ies were")} removed as part of the verified replacement set."
+                : "Existing tracks were replaced transactionally after exact compressed-audio payload verification; source deletion does not apply."
             : !deleteOriginals
             ? "The user chose to retain original sources."
             : isDsd
@@ -630,8 +681,8 @@ public sealed class HostCommitService
                 : "Final DSF/DSD, tag, artwork, report-path, and file-size checks passed."
             : isRepair
                 ? incomplete
-                    ? "Final FLAC audio-payload and tag checks passed; artwork remains incomplete."
-                    : "Final FLAC audio-payload, tag, artwork, report-path, and file-size checks passed."
+                    ? $"Final {repairFormatLabel} audio-payload and tag checks passed; artwork remains incomplete."
+                    : $"Final {repairFormatLabel} audio-payload, tag, artwork, report-path, and file-size checks passed."
             : incomplete
                 ? "Final FLAC, tag, and file-size checks passed; artwork remains deferred."
                 : "Quick final FLAC, tag, artwork, and file-size checks passed.", DateTimeOffset.UtcNow));
@@ -639,7 +690,7 @@ public sealed class HostCommitService
         var deleted = false;
         if (deletesSource)
         {
-            progress.Report(Snapshot(JobPhase.SourceDisposition, 94, isDsd
+            progress.Report(Snapshot(JobPhase.SourceDisposition, 94, deletesSacdIso
                 ? "Deleting the exact inventoried SACD ISO after independent extraction and final DSD verification."
                 : "Deleting the exact inventoried FLAC image as requested; PCM/MD5 comparison was skipped."));
             try
@@ -660,7 +711,7 @@ public sealed class HostCommitService
                 verification["errors"] = new JsonArray(JsonValue.Create($"Tracks passed quick checks, but source deletion failed: {error.Message}"));
                 try { await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None); }
                 catch (Exception reportError) when (reportError is IOException or UnauthorizedAccessException) { }
-                throw new IOException($"Tracks were committed, but the original {(isDsd ? "SACD ISO" : "FLAC image")} could not be deleted. Review the report and source path.", error);
+                throw new IOException($"Tracks were committed, but the original {(deletesSacdIso ? "SACD ISO" : "FLAC image")} could not be deleted. Review the report and source path.", error);
             }
 
             deleted = true;
@@ -670,7 +721,7 @@ public sealed class HostCommitService
             var finalVerification = report["verification"] as JsonObject ?? new JsonObject();
             report["verification"] = finalVerification;
             finalVerification["sources_deleted"] = true;
-            progress.Report(Snapshot(JobPhase.SourceDisposition, 96, isDsd
+            progress.Report(Snapshot(JobPhase.SourceDisposition, 96, deletesSacdIso
                 ? "The exact inventoried SACD ISO was deleted after every DSD verification gate passed."
                 : "The exact inventoried FLAC image was deleted after quick final checks."));
         }
@@ -678,7 +729,9 @@ public sealed class HostCommitService
         {
             progress.Report(Snapshot(JobPhase.SourceDisposition, 96,
                 isRepair
-                    ? $"Transactionally replaced {outputs.Count(path => Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase))} existing FLAC tracks; source deletion does not apply."
+                    ? repairDeduplicatedPaths.Count > 0
+                        ? $"Transactionally replaced {outputs.Count(path => Path.GetExtension(path).Equals(repairExtension, StringComparison.OrdinalIgnoreCase))} existing {repairFormatLabel} tracks and removed {repairDeduplicatedPaths.Count} byte-identical duplicate filename entr{(repairDeduplicatedPaths.Count == 1 ? "y" : "ies")}."
+                        : $"Transactionally replaced {outputs.Count(path => Path.GetExtension(path).Equals(repairExtension, StringComparison.OrdinalIgnoreCase))} existing {repairFormatLabel} tracks; source deletion does not apply."
                 : !deleteOriginals
                     ? $"All {staged.Sources.Count} original source image{(staged.Sources.Count == 1 ? " was" : "s were")} retained as requested."
                     : $"All {staged.Sources.Count} original source image{(staged.Sources.Count == 1 ? " was" : "s were")} retained; deletion was not authorized."));
@@ -709,7 +762,11 @@ public sealed class HostCommitService
             // Final report enrichment is best effort after the quick final checks pass.
         }
         var disposition = isRepair
-            ? $"{outputs.Count(path => Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase))} existing FLAC tracks were transactionally replaced without source deletion"
+            ? deleted
+                ? $"{outputs.Count(path => Path.GetExtension(path).Equals(repairExtension, StringComparison.OrdinalIgnoreCase))} existing {repairFormatLabel} tracks were transactionally replaced and the retained SACD ISO was deleted"
+                : repairDeduplicatedPaths.Count > 0
+                ? $"{outputs.Count(path => Path.GetExtension(path).Equals(repairExtension, StringComparison.OrdinalIgnoreCase))} existing {repairFormatLabel} tracks were transactionally replaced and {repairDeduplicatedPaths.Count} byte-identical duplicate filename entr{(repairDeduplicatedPaths.Count == 1 ? "y was" : "ies were")} removed"
+                : $"{outputs.Count(path => Path.GetExtension(path).Equals(repairExtension, StringComparison.OrdinalIgnoreCase))} existing {repairFormatLabel} tracks were transactionally replaced without source deletion"
             : deleted
             ? $"the original {(isDsd ? "SACD ISO" : "FLAC image")} was deleted"
             : $"all {staged.Sources.Count} original source image{(staged.Sources.Count == 1 ? " was" : "s were")} retained";
@@ -720,8 +777,53 @@ public sealed class HostCommitService
                 : $"Conversion completed and {disposition}; a staging folder may require cleanup.";
         progress.Report(new(JobPhase.CleanupCompleted, 100,
             incomplete ? CompletionIssuePresentation.Status(finalIncompleteKind) : "passed", cleanupDetail, DateTimeOffset.UtcNow));
-        return new(existingReport, outputs.Count(path => Path.GetExtension(path) is ".flac" or ".dsf"),
+        return new(existingReport, outputs.Count(path =>
+                Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase) ||
+                Path.GetExtension(path).Equals(".dsf", StringComparison.OrdinalIgnoreCase) ||
+                Path.GetExtension(path).Equals(".dff", StringComparison.OrdinalIgnoreCase)),
             deleted, incomplete, finalIncompleteKind);
+    }
+
+    private static async Task<IReadOnlySet<string>> ValidateRepairDeduplicationAsync(
+        JsonObject report,
+        string albumRoot,
+        IReadOnlySet<string> repairSources,
+        IReadOnlySet<string> outputPaths,
+        CancellationToken token)
+    {
+        var removedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (report["deduplicated_tracks"] is not JsonArray duplicates || duplicates.Count == 0)
+            return removedPaths;
+
+        foreach (var node in duplicates)
+        {
+            if (node is not JsonObject duplicate)
+                throw new JsonException("A deduplicated_tracks entry is not an object.");
+            var removed = NormalizePathValue(duplicate["removed_file"], albumRoot, "deduplicated source");
+            var retained = NormalizePathValue(duplicate["retained_file"], albumRoot, "retained duplicate counterpart");
+            var expectedHash = duplicate["source_file_sha256"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(expectedHash) || expectedHash.Length != 64 ||
+                !expectedHash.All(Uri.IsHexDigit))
+                throw new JsonException("A deduplicated_tracks entry has no valid source SHA-256.");
+            if (!repairSources.Contains(removed) || !repairSources.Contains(retained) ||
+                outputPaths.Contains(removed) || !outputPaths.Contains(retained) ||
+                !removedPaths.Add(removed))
+                throw new IOException("The repair deduplication map does not match the admitted source and output paths. Every original was retained.");
+
+            var removedHash = await FullFileSha256Async(HostStagingService.SafeCombine(albumRoot, removed), token);
+            var retainedHash = await FullFileSha256Async(HostStagingService.SafeCombine(albumRoot, retained), token);
+            if (!removedHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase) ||
+                !retainedHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("A proposed duplicate FLAC changed after inventory; every original was retained.");
+        }
+        return removedPaths;
+    }
+
+    private static async Task<string> FullFileSha256Async(string path, CancellationToken token)
+    {
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        return Convert.ToHexString(await SHA256.HashDataAsync(stream, token));
     }
 
     private static List<string> NormalizeAndCollectOutputs(JsonObject report, string stagedAlbumRoot)
@@ -869,9 +971,9 @@ public sealed class HostCommitService
                     !before.All(Uri.IsHexDigit) || !after.All(Uri.IsHexDigit) ||
                     !before.Equals(after, StringComparison.OrdinalIgnoreCase))
                     throw new JsonException($"The repair report does not prove unchanged compressed audio for '{relative}'.");
-                var actual = await FlacAudioPayload.Sha256Async(HostStagingService.SafeCombine(albumRoot, relative), token);
+                var actual = await TrackAudioPayload.Sha256Async(HostStagingService.SafeCombine(albumRoot, relative), token);
                 if (!actual.Equals(before, StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException($"The compressed FLAC audio payload no longer matches the pre-repair source: {relative}");
+                    throw new InvalidDataException($"The native audio payload no longer matches the pre-repair source: {relative}");
             }
         }
     }
@@ -913,9 +1015,15 @@ public sealed class HostCommitService
         CancellationToken token)
     {
         var artworkIssues = new List<string>();
-        foreach (var relative in outputs.Where(path => Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase)))
+        foreach (var relative in outputs.Where(path =>
+                     Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase) ||
+                     Path.GetExtension(path).Equals(".dsf", StringComparison.OrdinalIgnoreCase) ||
+                     Path.GetExtension(path).Equals(".dff", StringComparison.OrdinalIgnoreCase)))
         {
             var path = HostStagingService.SafeCombine(albumRoot, relative);
+            var isDsfRepair = Path.GetExtension(path).Equals(".dsf", StringComparison.OrdinalIgnoreCase);
+            var isDffRepair = Path.GetExtension(path).Equals(".dff", StringComparison.OrdinalIgnoreCase);
+            var isDsdRepair = isDsfRepair || isDffRepair;
             var info = new ProcessStartInfo(staged.FfprobePath)
             {
                 UseShellExecute = false,
@@ -925,7 +1033,7 @@ public sealed class HostCommitService
             };
             foreach (var value in new[] { "-v", "error", "-show_streams", "-show_format", "-of", "json", path }) info.ArgumentList.Add(value);
             using var process = new Process { StartInfo = info };
-            if (!process.Start()) throw new InvalidOperationException("Could not start ffprobe for quick FLAC verification.");
+            if (!process.Start()) throw new InvalidOperationException("Could not start ffprobe for quick existing-track verification.");
             var outputTask = process.StandardOutput.ReadToEndAsync(token);
             var errorTask = process.StandardError.ReadToEndAsync(token);
             try { await process.WaitForExitAsync(token); }
@@ -938,28 +1046,86 @@ public sealed class HostCommitService
             var root = document.RootElement;
             if (!root.TryGetProperty("streams", out var streams) || streams.ValueKind != JsonValueKind.Array)
                 throw new InvalidOperationException($"No readable streams were found in '{relative}'.");
-            var hasFlac = streams.EnumerateArray().Any(stream =>
+            var hasExpectedAudio = streams.EnumerateArray().Any(stream =>
                 Text(stream, "codec_type")?.Equals("audio", StringComparison.OrdinalIgnoreCase) == true &&
-                Text(stream, "codec_name")?.Equals("flac", StringComparison.OrdinalIgnoreCase) == true);
+                (isDsdRepair
+                    ? Text(stream, "codec_name")?.StartsWith("dsd", StringComparison.OrdinalIgnoreCase) == true &&
+                      Text(stream, "codec_name")?.Contains("pcm", StringComparison.OrdinalIgnoreCase) != true
+                    : Text(stream, "codec_name")?.Equals("flac", StringComparison.OrdinalIgnoreCase) == true));
             var coverStream = streams.EnumerateArray().FirstOrDefault(stream =>
                 Text(stream, "codec_type")?.Equals("video", StringComparison.OrdinalIgnoreCase) == true &&
                 stream.TryGetProperty("disposition", out var disposition) &&
                 disposition.TryGetProperty("attached_pic", out var attached) &&
                 attached.TryGetInt32(out var value) && value == 1);
-            if (!hasFlac) throw new InvalidOperationException($"A FLAC audio stream is missing from '{relative}'.");
-            if (coverStream.ValueKind == JsonValueKind.Undefined)
-                artworkIssues.Add($"Embedded front cover is missing from '{relative}'.");
-            else if (!coverStream.TryGetProperty("width", out var widthValue) || !widthValue.TryGetInt32(out var width) ||
-                     !coverStream.TryGetProperty("height", out var heightValue) || !heightValue.TryGetInt32(out var height) ||
-                     width <= 0 || height <= 0)
-                artworkIssues.Add($"Embedded front-cover dimensions are unreadable in '{relative}'.");
-            else if (width > 600 || height > 600 || width != height)
-                artworkIssues.Add($"Embedded front cover in '{relative}' is {width}x{height}; it must be square and no larger than 600x600.");
+            if (!hasExpectedAudio)
+                throw new InvalidOperationException($"A native {(isDsdRepair ? "DSD" : "FLAC")} audio stream is missing from '{relative}'.");
+            if (!isDffRepair)
+            {
+                if (coverStream.ValueKind == JsonValueKind.Undefined)
+                    artworkIssues.Add($"Embedded front cover is missing from '{relative}'.");
+                else if (!coverStream.TryGetProperty("width", out var widthValue) || !widthValue.TryGetInt32(out var width) ||
+                         !coverStream.TryGetProperty("height", out var heightValue) || !heightValue.TryGetInt32(out var height) ||
+                         width <= 0 || height <= 0)
+                    artworkIssues.Add($"Embedded front-cover dimensions are unreadable in '{relative}'.");
+                else if (width > 600 || height > 600 || width != height)
+                    artworkIssues.Add($"Embedded front cover in '{relative}' is {width}x{height}; it must be square and no larger than 600x600.");
+            }
             if (expectedArtworkSha256 is not null)
             {
                 var actualArtworkSha256 = InMemoryArtworkService.ReadFrontCoverSha256(path);
                 if (!string.Equals(actualArtworkSha256, expectedArtworkSha256, StringComparison.OrdinalIgnoreCase))
                     artworkIssues.Add($"Embedded front cover in '{relative}' does not match the report-proven in-memory artwork.");
+            }
+            else if (isDffRepair && DffMetadata.Read(path).Picture is null)
+                artworkIssues.Add($"Embedded front cover is missing from '{relative}'.");
+
+            if (isDffRepair)
+            {
+                var tagged = DffMetadata.Read(path);
+                var requiredDff = new Dictionary<string, string?>
+                {
+                    ["TITLE"] = tagged.Title,
+                    ["ALBUM"] = tagged.Album,
+                    ["ARTIST"] = tagged.Artist,
+                    ["ALBUMARTIST"] = tagged.AlbumArtist,
+                    ["GENRE"] = tagged.Genre
+                };
+                var missingDff = requiredDff.Where(pair => string.IsNullOrWhiteSpace(pair.Value)).Select(pair => pair.Key).ToList();
+                if (tagged.Track == 0) missingDff.Add("TRACKNUMBER");
+                if (tagged.Disc == 0) missingDff.Add("DISCNUMBER");
+                if (tagged.Year == 0) missingDff.Add("DATE");
+                if (missingDff.Count > 0)
+                    throw new InvalidOperationException($"Required tags missing from '{relative}': {string.Join(", ", missingDff)}.");
+                if (ClassicalMetadataPolicy.RequiresComposer(
+                        tagged.Genre, tagged.Title, ClassicalMetadataPolicy.IsCompilationArtist(tagged.AlbumArtist)) &&
+                    string.IsNullOrWhiteSpace(tagged.Composer))
+                    throw new InvalidOperationException($"COMPOSER is required for classical/opera track '{relative}'.");
+                continue;
+            }
+
+            if (isDsfRepair)
+            {
+                using var tagged = TagLib.File.Create(path);
+                var requiredDsf = new Dictionary<string, string?>
+                {
+                    ["TITLE"] = tagged.Tag.Title,
+                    ["ALBUM"] = tagged.Tag.Album,
+                    ["ARTIST"] = tagged.Tag.FirstPerformer,
+                    ["ALBUMARTIST"] = tagged.Tag.FirstAlbumArtist,
+                    ["GENRE"] = tagged.Tag.FirstGenre
+                };
+                var missingDsf = requiredDsf.Where(pair => string.IsNullOrWhiteSpace(pair.Value)).Select(pair => pair.Key).ToList();
+                if (tagged.Tag.Track == 0) missingDsf.Add("TRACKNUMBER");
+                if (tagged.Tag.Disc == 0) missingDsf.Add("DISCNUMBER");
+                if (tagged.Tag.Year == 0) missingDsf.Add("DATE");
+                if (missingDsf.Count > 0)
+                    throw new InvalidOperationException($"Required tags missing from '{relative}': {string.Join(", ", missingDsf)}.");
+                if (ClassicalMetadataPolicy.RequiresComposer(
+                        tagged.Tag.FirstGenre, tagged.Tag.Title,
+                        ClassicalMetadataPolicy.IsCompilationArtist(tagged.Tag.FirstAlbumArtist)) &&
+                    string.IsNullOrWhiteSpace(tagged.Tag.FirstComposer))
+                    throw new InvalidOperationException($"COMPOSER is required for classical/opera track '{relative}'.");
+                continue;
             }
 
             if (!root.TryGetProperty("format", out var format) ||
@@ -981,8 +1147,13 @@ public sealed class HostCommitService
                 .ToArray();
             if (missing.Length > 0)
                 throw new InvalidOperationException($"Required tags missing from '{relative}': {string.Join(", ", missing)}.");
+            values.TryGetValue("TITLE", out var title);
+            values.TryGetValue("ALBUMARTIST", out var albumArtist);
+            if (string.IsNullOrWhiteSpace(albumArtist))
+                values.TryGetValue("ALBUM_ARTIST", out albumArtist);
             if (values.TryGetValue("GENRE", out var genre) &&
-                (genre.Contains("classical", StringComparison.OrdinalIgnoreCase) || genre.Contains("opera", StringComparison.OrdinalIgnoreCase)) &&
+                ClassicalMetadataPolicy.RequiresComposer(
+                    genre, title, ClassicalMetadataPolicy.IsCompilationArtist(albumArtist)) &&
                 (!values.TryGetValue("COMPOSER", out var composer) || string.IsNullOrWhiteSpace(composer)))
                 throw new InvalidOperationException($"COMPOSER is required for classical/opera track '{relative}'.");
         }
@@ -1036,6 +1207,29 @@ public sealed class HostCommitService
         return [new(source.RelativePath, fullPath)];
     }
 
+    private static IReadOnlyList<DeletionTarget> ResolveRetainedRepairIsoDeletionTarget(
+        ScanResult scan,
+        StagedSource source,
+        CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (!Path.GetExtension(source.RelativePath).Equals(".iso", StringComparison.OrdinalIgnoreCase) ||
+            scan.Media.Count(item =>
+                item.Kind.Equals("SACD / DSD image", StringComparison.OrdinalIgnoreCase) &&
+                item.RelativePath.Equals(source.RelativePath, StringComparison.OrdinalIgnoreCase)) != 1)
+            throw new InvalidOperationException("The retained repair deletion target is not the single SACD ISO identified by the read-only inventory.");
+
+        var fullPath = HostStagingService.SafeCombine(scan.AlbumRoot, source.RelativePath);
+        if (!File.Exists(fullPath))
+            throw new FileNotFoundException("The retained SACD ISO disappeared during the repair.", fullPath);
+        var info = new FileInfo(fullPath);
+        if (info.Length != source.Size)
+            throw new IOException($"The retained SACD ISO size changed during the repair: {source.RelativePath}. It was retained.");
+        if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("Album Fixer will not delete a reparse-point SACD ISO.");
+        return [new(source.RelativePath, fullPath)];
+    }
+
     private sealed record DeletionTarget(string RelativePath, string FullPath);
     private sealed record PlaybackVerification(IReadOnlyList<string> ArtworkIssues);
     private sealed class RepairRollbackException(string message, Exception innerException) : IOException(message, innerException);
@@ -1084,7 +1278,9 @@ public sealed class HostCommitService
             issues.AddRange(missing
                 .Select(value => value?.GetValue<string>())
                 .Where(value => !string.IsNullOrWhiteSpace(value) && !MetadataFieldPolicy.IsOptional(value!))
-                .Select(value => $"Metadata field remains unresolved: {value}."));
+                .Select(value => value!.Equals("COVER", StringComparison.OrdinalIgnoreCase)
+                    ? "Cover artwork remains unresolved."
+                    : $"Metadata field remains unresolved: {value}."));
         }
         if (report["genre"] is not JsonObject genre ||
             string.IsNullOrWhiteSpace(genre["value"]?.GetValue<string>()) ||
@@ -1132,23 +1328,35 @@ public sealed class HostCommitService
         else verification["incomplete_kind"] = CompletionIssuePresentation.Status(kind);
     }
 
-    private static void SetRepairVerification(JsonObject report, string stage, IReadOnlyList<string> incompleteIssues)
+    private static void SetRepairVerification(
+        JsonObject report,
+        string stage,
+        IReadOnlyList<string> incompleteIssues,
+        bool sourceDeletionRequested)
     {
         var incomplete = incompleteIssues.Count > 0;
         var incompleteKind = CompletionIssue(incompleteIssues);
+        var isDsf = report["format"]?.GetValue<string>().Equals("dsf", StringComparison.OrdinalIgnoreCase) == true;
+        var isDff = report["format"]?.GetValue<string>().Equals("dff", StringComparison.OrdinalIgnoreCase) == true;
         var verification = report["verification"] as JsonObject ?? new JsonObject();
         report["verification"] = verification;
         verification["status"] = incomplete ? "incomplete" : "passed";
-        verification["method"] = "Exact SHA-256 equality of each compressed FLAC audio-frame payload before tag/art repair, in local staging, and at the final album path; ffprobe tag/artwork and file-size copy checks also passed.";
+        verification["method"] = isDsf
+            ? "Exact SHA-256 equality of each native DSF data-chunk payload before tag/art repair, in local staging, and at the final album path; native-DSD, tag/artwork, and file-size copy checks also passed."
+            : isDff
+            ? "Exact SHA-256 equality of each native DFF DSD-chunk payload before tag/art repair, in local staging, and at the final album path; native-DSD, ID3v2 tag/artwork, and file-size copy checks also passed."
+            : "Exact SHA-256 equality of each compressed FLAC audio-frame payload before tag/art repair, in local staging, and at the final album path; ffprobe tag/artwork and file-size copy checks also passed.";
         verification["audio_payload_equivalence"] = "passed";
-        verification["pcm_equivalence"] = "encoded_flac_frames_bit_exact_without_decode";
+        verification["pcm_equivalence"] = isDsf || isDff
+            ? "native_dsd_data_chunk_bit_exact_without_decode"
+            : "encoded_flac_frames_bit_exact_without_decode";
         verification["audio_and_tags"] = "passed";
         verification["required_metadata"] = incompleteKind is CompletionIssueKind.RequiredMetadata or CompletionIssueKind.RequiredMetadataAndCoverArtwork ? "incomplete" : "passed";
         verification["artwork"] = incompleteKind is CompletionIssueKind.CoverArtwork or CompletionIssueKind.RequiredMetadataAndCoverArtwork ? "incomplete" : "passed";
         verification["verified_stage"] = stage;
         verification["verified_at_utc"] = DateTimeOffset.UtcNow;
-        verification["source_deletion_requested"] = false;
-        verification["source_deletion_eligible"] = false;
+        verification["source_deletion_requested"] = sourceDeletionRequested && !incomplete;
+        verification["source_deletion_eligible"] = sourceDeletionRequested && !incomplete;
         verification["sources_deleted"] = false;
         verification["errors"] = new JsonArray();
         verification["warnings"] = VerificationWarnings(report, incompleteIssues);
