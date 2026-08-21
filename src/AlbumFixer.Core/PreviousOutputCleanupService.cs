@@ -38,9 +38,10 @@ public static class PreviousOutputCleanupService
         ".flac", ".dsf", ".dff"
     };
 
-    internal static bool HasCompleteExistingTrackSet(IReadOnlyList<MediaItem> tracks)
+    internal static bool HasCompleteExistingTrackSet(IReadOnlyList<MediaItem> tracks, int minimumTrackCount = 2)
     {
-        if (tracks.Count < 2) return false;
+        if (minimumTrackCount < 1) throw new ArgumentOutOfRangeException(nameof(minimumTrackCount));
+        if (tracks.Count < minimumTrackCount) return false;
         var kinds = tracks.Select(item => item.Kind).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         if (kinds.Length != 1 || kinds[0] is not ("Existing FLAC" or "Existing DSF" or "Existing DFF"))
             return false;
@@ -424,15 +425,15 @@ public static class PreviousOutputCleanupService
         {
             if (!string.Equals(Text(pipeline, "stopped_phase"), nameof(JobPhase.Inventoried), StringComparison.OrdinalIgnoreCase))
                 return null;
-            return CompletedPlan(root, reportPath, "flac_cue_split", tracks, true, [sourcePath],
-                "Completion was recovered from a later pre-processing fallback report after the original FLAC image had already been removed. The exact CUE-derived root track set, sequential filenames, native FLAC properties, required tags, and embedded artwork passed quick verification; decoded PCM equivalence could not be recomputed without the source image.");
+            return CompletedPlan(root, reportPath, CueAudioImagePolicy.WorkflowId([sourcePath]), tracks, true, [sourcePath],
+                "Completion was recovered from a later pre-processing fallback report after the original FLAC/APE image had already been removed. The exact CUE-derived root track set, sequential filenames, native FLAC output properties, required tags, and embedded artwork passed quick verification; decoded PCM equivalence could not be recomputed without the source image.");
         }
 
         if (!string.Equals(Text(pipeline, "status"), "canceled", StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(Text(pipeline, "stopped_phase"), nameof(JobPhase.CopyingIn), StringComparison.OrdinalIgnoreCase)) return null;
         var ffmpeg = new PreflightService().FindToolsAsync(token).GetAwaiter().GetResult()["ffmpeg"];
         if (ffmpeg is null || !HasExactDecodedPcmEquivalence(ffmpeg, sourcePath, tracks, cueIndexFrames, token)) return null;
-        return CompletedPlan(root, reportPath, "flac_cue_split", tracks, false, [sourcePath],
+        return CompletedPlan(root, reportPath, CueAudioImagePolicy.WorkflowId([sourcePath]), tracks, false, [sourcePath],
             "Completion was recovered from a later canceled fallback report after recomputing per-track decoded PCM equality at the current CUE boundaries and confirming matching audio formats; tags and embedded artwork also passed.");
     }
 
@@ -447,7 +448,9 @@ public static class PreviousOutputCleanupService
         sourcePath = string.Empty;
         tracks = [];
         cueIndexFrames = [];
-        var sourceEntries = InventorySources(report, "FLAC image", ".flac");
+        var sourceEntries = InventorySources(report, CueAudioImagePolicy.FlacKind, ".flac")
+            .Concat(InventorySources(report, CueAudioImagePolicy.ApeKind, ".ape"))
+            .ToArray();
         if (sourceEntries.Length != 1) return false;
         sourcePath = HostStagingService.SafeCombine(root, NormalizeRelative(sourceEntries[0].Path));
 
@@ -1133,6 +1136,8 @@ public static class PreviousOutputCleanupService
     private static bool IsFlacWorkflow(string? workflow) =>
         workflow is not null &&
         (workflow.Equals("flac_cue_split", StringComparison.OrdinalIgnoreCase) ||
+         workflow.Equals("ape_cue_split", StringComparison.OrdinalIgnoreCase) ||
+         workflow.Equals("lossless_audio_image_cue_split", StringComparison.OrdinalIgnoreCase) ||
          workflow.Equals(nameof(WorkflowMode.FlacCueSplit), StringComparison.OrdinalIgnoreCase));
 
     private static bool IsDsdWorkflow(string? workflow) =>

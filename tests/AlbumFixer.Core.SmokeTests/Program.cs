@@ -50,6 +50,7 @@ try
 {
     await ToolDiscoveryReportsEveryStartupComponent();
     await ScannerClassifiesFlacCue(root);
+    await ScannerClassifiesApeCueAndRejectsStandaloneApe(root);
     await ScannerInventoriesChecksumIdentitySidecars(root);
     await ScannerDescendsIntoSingleNestedAlbum(root);
     await ScannerPrefersExistingTracks(root);
@@ -61,6 +62,7 @@ try
     await ScannerAcceptsMultipleImagesInOneAlbumFolder(root);
     await ScannerRecognizesAndCleansIncompletePreviousOutput(root);
     await ScannerSkipsCompletedAlbumsWithDeletedSources(root);
+    await RecheckCompletedAlbumsUsesCurrentStateWithoutRewritingValidTracks(root);
     await ScannerAdoptsOptionalOnlyVerifiedSacdCompletion(root);
     await ScannerRoutesStandaloneDsfAndReusableIncompleteSacd(root);
     await ArchivedSacdArtifactsAreTransactionallyReplaceable(root);
@@ -74,6 +76,7 @@ try
     await StageAwarePipelineBoundsEveryLane();
     await HostStagesAndChecksSourceSize(root);
     await LocalSplitterRunsLocally(root);
+    await ApeCueSplitsAndCommitsToFlac(root);
     await LocalClassicalCueInfersComposer(root);
     await LocalMetadataEnrichmentRunsInCode(root);
     await ExternalArtworkFallbackSupportsSacdAndPreservesLocalPriority(root);
@@ -148,6 +151,28 @@ static async Task ScannerClassifiesFlacCue(string root)
     var result = await new AlbumScanner().ScanAsync(folder);
     Assert(result.Mode == WorkflowMode.FlacCueSplit, "FLAC+CUE should use image-split mode.");
     Assert(result.ImageCount == 1 && result.CueCount == 1, "FLAC+CUE inventory counts are wrong.");
+}
+
+static async Task ScannerClassifiesApeCueAndRejectsStandaloneApe(string root)
+{
+    var album = Path.Combine(root, "ape-cue-scan");
+    Directory.CreateDirectory(album);
+    await File.WriteAllBytesAsync(Path.Combine(album, "album.ape"), [1, 2, 3]);
+    await File.WriteAllTextAsync(Path.Combine(album, "album.cue"),
+        "FILE \"album.ape\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00");
+
+    var scan = await new AlbumScanner().ScanAsync(album);
+    Assert(scan.Mode == WorkflowMode.FlacCueSplit && scan.ImageCount == 1 && scan.CueCount == 1 && scan.HasFlac &&
+           scan.Media.Count(item => item.Kind == CueAudioImagePolicy.ApeKind) == 1,
+        "A CUE-referenced APE image must use the lossless image split workflow and require the FLAC output toolchain.");
+
+    var standalone = Path.Combine(root, "standalone-ape-scan");
+    Directory.CreateDirectory(standalone);
+    await File.WriteAllBytesAsync(Path.Combine(standalone, "album.ape"), [1, 2, 3]);
+    var blocked = await new AlbumScanner().ScanAsync(standalone);
+    Assert(blocked.Mode == WorkflowMode.NeedsInspection &&
+           blocked.Errors.Any(error => error.Contains("matching CUE", StringComparison.OrdinalIgnoreCase)),
+        "A standalone APE file must remain blocked because deterministic splitting requires exact CUE boundaries.");
 }
 
 static async Task ScannerInventoriesChecksumIdentitySidecars(string root)
@@ -661,6 +686,82 @@ static async Task ScannerSkipsCompletedAlbumsWithDeletedSources(string root)
     var unsafeScan = await new AlbumScanner().ScanAsync(unsafeCompleted);
     Assert(unsafeScan.Mode != WorkflowMode.Completed && unsafeScan.Errors.Any(error => error.Contains("missing source", StringComparison.OrdinalIgnoreCase)),
         "A missing source must remain a blocker unless the completed report confirms intentional deletion.");
+}
+
+static async Task RecheckCompletedAlbumsUsesCurrentStateWithoutRewritingValidTracks(string root)
+{
+    var seed = await new AlbumScanner().ScanAsync(Path.Combine(root, "flac-cue"));
+    var toolCheck = await new PreflightService().CheckAsync(seed);
+    if (toolCheck.Tools["ffmpeg"] is not { } ffmpeg) return;
+
+    var album = Path.Combine(root, "recheck-completed-album");
+    Directory.CreateDirectory(album);
+    var coverPath = Path.Combine(album, "front.jpg");
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=navy:s=96x96", "-frames:v", "1", "-update", "1", coverPath);
+    var coverBytes = await File.ReadAllBytesAsync(coverPath);
+    var trackPaths = new[] { Path.Combine(album, "01 - First.flac"), Path.Combine(album, "02 - Second.flac") };
+    for (var index = 0; index < trackPaths.Length; index++)
+    {
+        await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+            $"sine=frequency={440 + index * 80}:duration=0.08", "-c:a", "flac", trackPaths[index]);
+        using var file = TagLib.File.Create(trackPaths[index]);
+        file.Tag.Title = index == 0 ? "First" : "Second";
+        file.Tag.Album = "Recheck Album";
+        file.Tag.Performers = ["Recheck Artist"];
+        file.Tag.AlbumArtists = ["Recheck Artist"];
+        file.Tag.Composers = ["Recheck Composer"];
+        file.Tag.Track = (uint)(index + 1);
+        file.Tag.TrackCount = 2;
+        file.Tag.Disc = 1;
+        file.Tag.DiscCount = 1;
+        file.Tag.Year = 2026;
+        file.Tag.Genres = ["Classical"];
+        file.Tag.Pictures =
+        [
+            new TagLib.Picture(new TagLib.ByteVector(coverBytes))
+            {
+                Type = TagLib.PictureType.FrontCover,
+                MimeType = "image/jpeg",
+                Description = "Front cover"
+            }
+        ];
+        file.Save();
+    }
+    await File.WriteAllTextAsync(Path.Combine(album, "conversion-report.json"), """
+    {
+      "workflow_mode": "flac_cue_split",
+      "discs": [{ "tracks": [{ "file": "01 - First.flac" }, { "file": "02 - Second.flac" }] }],
+      "verification": { "status": "passed", "sources_deleted": false },
+      "commit": { "status": "completed" },
+      "deletion": { "status": "retained", "performed": false }
+    }
+    """);
+
+    var ordinary = await new AlbumScanner().ScanAsync(album);
+    Assert(ordinary.Mode == WorkflowMode.Completed && !ordinary.RecheckCompleted,
+        "Normal inventory must continue to honor a verified completion report.");
+
+    var hashesBefore = trackPaths.Select(FileSha256).ToArray();
+    var rechecked = await new AlbumScanner().ScanAsync(album, recheckCompletedAlbums: true);
+    var hashesAfter = trackPaths.Select(FileSha256).ToArray();
+    Assert(rechecked.Mode == WorkflowMode.Completed && rechecked.RecheckCompleted &&
+           rechecked.Media.Count(item => item.Kind == "Existing FLAC") == 2 &&
+           rechecked.Warnings.Any(warning => warning.Contains("no repair, rewrite, or external lookup", StringComparison.OrdinalIgnoreCase)) &&
+           hashesBefore.SequenceEqual(hashesAfter, StringComparer.OrdinalIgnoreCase),
+        "Rechecking a valid completed album must inspect current tags and artwork without rewriting either track or using external lookup.");
+
+    using (var incomplete = TagLib.File.Create(trackPaths[1]))
+    {
+        incomplete.Tag.Composers = [];
+        incomplete.Save();
+    }
+    var reportTrusted = await new AlbumScanner().ScanAsync(album);
+    var repairNeeded = await new AlbumScanner().ScanAsync(album, recheckCompletedAlbums: true);
+    Assert(reportTrusted.Mode == WorkflowMode.Completed &&
+           repairNeeded.Mode == WorkflowMode.ExistingTrackRepair && repairNeeded.RecheckCompleted &&
+           (await new PreflightService().CheckAsync(repairNeeded)).CanStart,
+        "Ignoring completion status must admit repair only when the current files actually have a required tag or artwork gap.");
 }
 
 static async Task ScannerAdoptsOptionalOnlyVerifiedSacdCompletion(string root)
@@ -1362,6 +1463,80 @@ static async Task LocalSplitterRunsLocally(string root)
            reportCover.GetProperty("byte_size").GetInt32() <= 1024 * 1024 &&
            EmbeddedCoverSha256(Path.Combine(stagedAlbum, "01 - First.flac")) == reportCover.GetProperty("sha256").GetString(),
         "The report must prove the bounded in-memory artwork embedded in every FLAC track.");
+}
+
+static async Task ApeCueSplitsAndCommitsToFlac(string root)
+{
+    var album = Path.Combine(root, "ape-cue-transaction");
+    Directory.CreateDirectory(album);
+    var source = Path.Combine(album, "source.ape");
+    var cue = Path.Combine(album, "source.cue");
+    var cover = Path.Combine(album, "front.jpg");
+    await File.WriteAllBytesAsync(source, [1, 2, 3]);
+    await File.WriteAllTextAsync(cue, """
+    REM GENRE Rock
+    REM DATE 2026
+    PERFORMER "APE Test Artist"
+    TITLE "APE Test Album"
+    FILE "source.ape" WAVE
+      TRACK 01 AUDIO
+        TITLE "First"
+        INDEX 01 00:00:00
+      TRACK 02 AUDIO
+        TITLE "Second"
+        INDEX 01 00:01:00
+    """);
+
+    var provisional = await new AlbumScanner().ScanAsync(album);
+    var provisionalPreflight = await new PreflightService().CheckAsync(provisional);
+    if (provisionalPreflight.Tools["ffmpeg"] is not { } ffmpeg ||
+        provisionalPreflight.Tools["ffprobe"] is not { } ffprobe) return;
+
+    File.Delete(source);
+    // FFmpeg normally decodes APE but does not encode it. A FLAC bitstream with an .ape fixture name
+    // exercises the complete APE inventory, CUE resolution, report, commit, and deletion path; the
+    // installed FFmpeg APE decoder is validated separately against the user's real read-only source.
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "sine=frequency=520:duration=2", "-c:a", "flac", "-f", "flac", source);
+    await RunToolAsync(ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        "color=c=purple:s=256x256", "-frames:v", "1", "-update", "1", cover);
+
+    var scan = await new AlbumScanner().ScanAsync(album);
+    var preflight = await new PreflightService().CheckAsync(scan);
+    Assert(scan.Mode == WorkflowMode.FlacCueSplit && preflight.CanStart &&
+           scan.Media.Single(item => CueAudioImagePolicy.IsImageKind(item.Kind)).Kind == CueAudioImagePolicy.ApeKind,
+        "The verified APE+CUE fixture must pass inventory and preflight as one APE image.");
+
+    var job = Path.Combine(Path.GetTempPath(), "album-fixer", $"ape-commit-test-{Guid.NewGuid():N}");
+    var stagedAlbum = Path.Combine(job, "album");
+    Directory.CreateDirectory(stagedAlbum);
+    var staged = new StagedJob(job, stagedAlbum, ffmpeg, ffprobe, Path.Combine(job, "host-manifest.json"),
+        [new StagedSource("source.ape", new FileInfo(source).Length)],
+        SourceAlbumRoot: album, SourceCacheUsed: false);
+
+    var local = await new LocalFlacProcessor().ProcessAsync(scan, staged, new Progress<ProgressSnapshot>());
+    Assert(local.Tracks == 2 && !local.Metadata.RequiresResearch &&
+           File.Exists(Path.Combine(stagedAlbum, "01 - First.flac")) &&
+           File.Exists(Path.Combine(stagedAlbum, "02 - Second.flac")),
+        "APE+CUE processing must decode the image and create the complete FLAC track set.");
+    using (var localReport = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(local.ReportPath)))
+    {
+        Assert(localReport.RootElement.GetProperty("source_type").GetString() == "ape_cue" &&
+               localReport.RootElement.GetProperty("workflow_mode").GetString() == "ape_cue_split",
+            "An APE source must be identified explicitly in the conversion report.");
+    }
+
+    var originalCoverHash = FileSha256(cover);
+    var committed = await new HostCommitService().CommitAsync(
+        scan, staged, new Progress<ProgressSnapshot>(), deleteOriginals: true);
+    Assert(committed.Tracks == 2 && committed.SourcesDeleted && !File.Exists(source) &&
+           File.Exists(cue) && FileSha256(cover) == originalCoverHash &&
+           File.Exists(Path.Combine(album, "01 - First.flac")) &&
+           File.Exists(Path.Combine(album, "02 - Second.flac")),
+        "The transaction must commit verified FLAC tracks, preserve CUE/artwork, and delete only the exact inventoried APE image.");
+    var completed = await new AlbumScanner().ScanAsync(album);
+    Assert(completed.Mode == WorkflowMode.Completed,
+        "A successfully committed APE+CUE album with its source intentionally deleted must be recognized as completed on the next scan.");
 }
 
 static async Task LocalClassicalCueInfersComposer(string root)
@@ -2271,6 +2446,15 @@ static void ClassicalComposerUsesCorroboratedAlbumIdentity()
 
 static void ClassicalTrackComposersUseReviewedAlbumAndWorkEvidence()
 {
+    var gershwin = LocalTrackRepairProcessor.InferClassicalTrackComposers(
+        "Gershwin: Rhapsody in Blue/An American in Paris",
+        "George Gershwin. Rapsody In Blue American In Paris.  Leonard Bernstein",
+        "Classical",
+        [("Rhapsody in Blue", "Rhapsody in Blue"),
+         ("An American in Paris", "An American in Paris")]);
+    Assert(gershwin.SequenceEqual(["George Gershwin", "George Gershwin"]),
+        "The reviewed Gershwin name in the CUE album title and source folder must resolve both works locally without an external catalog lookup.");
+
     var beethoven = LocalTrackRepairProcessor.InferClassicalTrackComposers(
         "BEETHOVEN Piano Concerto No 2",
         "BEETHOVEN-Piano-Concerto-No-2-FLAC24",

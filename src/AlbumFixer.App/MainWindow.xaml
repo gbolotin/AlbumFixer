@@ -18,6 +18,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
           <TextBlock Text="SOURCE FOLDERS" Foreground="{StaticResource Muted}" FontSize="10" FontWeight="Bold" Margin="0,0,0,9"/>
           <Border Grid.Row="1" Background="#0E161F" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6" Padding="9" MinHeight="74"
@@ -73,10 +74,17 @@
               <TextBlock Text="{Binding SourceSize, StringFormat=Source material: {0}}" Foreground="{StaticResource Muted}"/>
             </StackPanel>
           </Border>
-          <CheckBox Grid.Row="5" Content="Delete originals" IsChecked="{Binding DeleteOriginals, Mode=TwoWay}" IsEnabled="{Binding CanBrowse}"
-                    Margin="0,15,0,0" Foreground="{StaticResource Text}" FontWeight="SemiBold"
+          <StackPanel Grid.Row="5" Margin="0,15,0,0">
+            <CheckBox Content="Recheck completed albums" IsChecked="{Binding RecheckCompletedAlbums, Mode=TwoWay}" IsEnabled="{Binding CanBrowse}"
+                      Foreground="{StaticResource Text}" FontWeight="SemiBold"
+                      ToolTip="Ignore only the previous report's completion status. Read current tags and embedded artwork again, repair missing values only, and preserve existing nonempty tags and artwork. Run Scan albums after changing this option."/>
+            <TextBlock Text="Valid tags and artwork stay untouched; only genuine gaps are repaired."
+                       Foreground="{StaticResource Muted}" FontSize="10" Margin="20,3,0,0" TextWrapping="Wrap"/>
+          </StackPanel>
+          <CheckBox Grid.Row="6" Content="Delete originals" IsChecked="{Binding DeleteOriginals, Mode=TwoWay}" IsEnabled="{Binding CanBrowse}"
+                    Margin="0,12,0,0" Foreground="{StaticResource Text}" FontWeight="SemiBold"
                     ToolTip="When selected, eligible single-image originals are deleted only after final verification. Clear this option to retain every original."/>
-          <Button Grid.Row="6" Margin="0,10,0,0" VerticalAlignment="Center">
+          <Button Grid.Row="7" Margin="0,10,0,0" VerticalAlignment="Center">
             <Button.Resources>
               <DataTemplate x:Key="StartButtonContentTemplate">
                 <StackPanel Orientation="Horizontal">

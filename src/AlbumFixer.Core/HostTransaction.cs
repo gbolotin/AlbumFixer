@@ -373,9 +373,10 @@ public sealed class HostCommitService
         CancellationToken token)
     {
         if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.DsdExtraction and not WorkflowMode.ExistingTrackRepair)
-            throw new NotSupportedException("Verified host write-back is available for FLAC + CUE, SACD ISO, and standalone existing-FLAC/DSF/DFF repair workflows only. Every original was retained.");
+            throw new NotSupportedException("Verified host write-back is available for FLAC/APE + CUE, SACD ISO, and standalone existing-FLAC/DSF/DFF repair workflows only. Every original was retained.");
         var isDsd = scan.Mode == WorkflowMode.DsdExtraction;
         var isRepair = scan.Mode == WorkflowMode.ExistingTrackRepair;
+        var cueImageDescription = !isDsd && !isRepair ? CueImageDescription(scan, staged) : "audio image";
         if (!staged.SourceCacheUsed || isRepair)
             VerifyOriginalSourceSizesUnchanged(scan, staged, token);
 
@@ -670,8 +671,8 @@ public sealed class HostCommitService
                 ? $"The DSF tracks passed extraction-size and structure verification, but {CompletionIssuePresentation.Description(finalIncompleteKind)}; the original SACD ISO was retained."
                 : "The SACD report did not prove every independent-extraction size and DSD structure gate."
             : incomplete
-                ? $"Completion remains incomplete because {CompletionIssuePresentation.Description(finalIncompleteKind)}; the original FLAC image was retained for later repair."
-                : "Automatic deletion confirmation covers one exact FLAC image only.";
+                ? $"Completion remains incomplete because {CompletionIssuePresentation.Description(finalIncompleteKind)}; the original {cueImageDescription} was retained for later repair."
+                : $"Automatic deletion confirmation covers one exact {cueImageDescription} only.";
         report["deletion"] = deletion;
         await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), token);
         progress.Report(new(JobPhase.FinalVerificationPassed, 90,
@@ -692,7 +693,7 @@ public sealed class HostCommitService
         {
             progress.Report(Snapshot(JobPhase.SourceDisposition, 94, deletesSacdIso
                 ? "Deleting the exact inventoried SACD ISO after independent extraction and final DSD verification."
-                : "Deleting the exact inventoried FLAC image as requested; PCM/MD5 comparison was skipped."));
+                : $"Deleting the exact inventoried {cueImageDescription} as requested; PCM/MD5 comparison was skipped."));
             try
             {
                 foreach (var target in deletionTargets) File.Delete(target.FullPath);
@@ -711,7 +712,7 @@ public sealed class HostCommitService
                 verification["errors"] = new JsonArray(JsonValue.Create($"Tracks passed quick checks, but source deletion failed: {error.Message}"));
                 try { await AtomicWriteAsync(existingReport, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), CancellationToken.None); }
                 catch (Exception reportError) when (reportError is IOException or UnauthorizedAccessException) { }
-                throw new IOException($"Tracks were committed, but the original {(deletesSacdIso ? "SACD ISO" : "FLAC image")} could not be deleted. Review the report and source path.", error);
+                throw new IOException($"Tracks were committed, but the original {(deletesSacdIso ? "SACD ISO" : cueImageDescription)} could not be deleted. Review the report and source path.", error);
             }
 
             deleted = true;
@@ -723,7 +724,7 @@ public sealed class HostCommitService
             finalVerification["sources_deleted"] = true;
             progress.Report(Snapshot(JobPhase.SourceDisposition, 96, deletesSacdIso
                 ? "The exact inventoried SACD ISO was deleted after every DSD verification gate passed."
-                : "The exact inventoried FLAC image was deleted after quick final checks."));
+                : $"The exact inventoried {cueImageDescription} was deleted after quick final checks."));
         }
         else
         {
@@ -768,7 +769,7 @@ public sealed class HostCommitService
                 ? $"{outputs.Count(path => Path.GetExtension(path).Equals(repairExtension, StringComparison.OrdinalIgnoreCase))} existing {repairFormatLabel} tracks were transactionally replaced and {repairDeduplicatedPaths.Count} byte-identical duplicate filename entr{(repairDeduplicatedPaths.Count == 1 ? "y was" : "ies were")} removed"
                 : $"{outputs.Count(path => Path.GetExtension(path).Equals(repairExtension, StringComparison.OrdinalIgnoreCase))} existing {repairFormatLabel} tracks were transactionally replaced without source deletion"
             : deleted
-            ? $"the original {(isDsd ? "SACD ISO" : "FLAC image")} was deleted"
+            ? $"the original {(isDsd ? "SACD ISO" : cueImageDescription)} was deleted"
             : $"all {staged.Sources.Count} original source image{(staged.Sources.Count == 1 ? " was" : "s were")} retained";
         var cleanupDetail = incomplete
             ? $"Tracks were delivered, but {CompletionIssuePresentation.Description(finalIncompleteKind)}; structural and file-size checks passed, and {disposition}."
@@ -1190,10 +1191,12 @@ public sealed class HostCommitService
             throw new InvalidOperationException($"Automatic source deletion requires exactly one inventoried image; found {staged.Sources.Count}.");
 
         var source = staged.Sources[0];
-        var requiredExtension = isDsd ? ".iso" : ".flac";
-        var requiredKind = isDsd ? "SACD / DSD image" : "FLAC image";
-        if (!Path.GetExtension(source.RelativePath).Equals(requiredExtension, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException($"Automatic source deletion is limited to an inventoried {requiredExtension} image for this workflow.");
+        if ((isDsd && !Path.GetExtension(source.RelativePath).Equals(".iso", StringComparison.OrdinalIgnoreCase)) ||
+            (!isDsd && !CueAudioImagePolicy.IsSupportedPath(source.RelativePath)))
+            throw new InvalidOperationException(isDsd
+                ? "Automatic source deletion is limited to an inventoried .iso image for this workflow."
+                : "Automatic source deletion is limited to one inventoried FLAC or APE image for this workflow.");
+        var requiredKind = isDsd ? "SACD / DSD image" : CueAudioImagePolicy.KindForPath(source.RelativePath);
         if (!scan.Media.Any(item =>
                 item.Kind.Equals(requiredKind, StringComparison.OrdinalIgnoreCase) &&
                 item.RelativePath.Equals(source.RelativePath, StringComparison.OrdinalIgnoreCase)))
@@ -1205,6 +1208,16 @@ public sealed class HostCommitService
         if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
             throw new IOException("Album Fixer will not delete a reparse-point source.");
         return [new(source.RelativePath, fullPath)];
+    }
+
+    private static string CueImageDescription(ScanResult scan, StagedJob staged)
+    {
+        if (staged.Sources.Count != 1) return "FLAC/APE source set";
+        var relative = staged.Sources[0].RelativePath;
+        return scan.Media.FirstOrDefault(item =>
+                   item.RelativePath.Equals(relative, StringComparison.OrdinalIgnoreCase) &&
+                   CueAudioImagePolicy.IsImageKind(item.Kind))?.Kind
+               ?? "FLAC/APE image";
     }
 
     private static IReadOnlyList<DeletionTarget> ResolveRetainedRepairIsoDeletionTarget(

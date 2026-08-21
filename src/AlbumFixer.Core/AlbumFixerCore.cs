@@ -17,18 +17,65 @@ public enum JobPhase
 }
 
 public sealed record MediaItem(string Path, string RelativePath, string Kind, long Size, string Note);
+
+public static class CueAudioImagePolicy
+{
+    public const string FlacKind = "FLAC image";
+    public const string ApeKind = "APE image";
+
+    public static bool IsSupportedExtension(string? extension) =>
+        extension is not null &&
+        (extension.Equals(".flac", StringComparison.OrdinalIgnoreCase) ||
+         extension.Equals(".ape", StringComparison.OrdinalIgnoreCase));
+
+    public static bool IsSupportedPath(string path) => IsSupportedExtension(Path.GetExtension(path));
+
+    public static bool IsImageKind(string? kind) =>
+        kind is not null &&
+        (kind.Equals(FlacKind, StringComparison.OrdinalIgnoreCase) ||
+         kind.Equals(ApeKind, StringComparison.OrdinalIgnoreCase));
+
+    public static string KindForPath(string path)
+    {
+        var extension = Path.GetExtension(path);
+        if (extension.Equals(".ape", StringComparison.OrdinalIgnoreCase)) return ApeKind;
+        if (extension.Equals(".flac", StringComparison.OrdinalIgnoreCase)) return FlacKind;
+        throw new NotSupportedException($"Unsupported CUE audio-image extension: {extension}");
+    }
+
+    public static string SourceType(IEnumerable<string> paths)
+    {
+        var extensions = paths.Select(Path.GetExtension).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        return extensions.Length == 1 && string.Equals(extensions[0], ".ape", StringComparison.OrdinalIgnoreCase)
+            ? "ape_cue"
+            : extensions.Length == 1 && string.Equals(extensions[0], ".flac", StringComparison.OrdinalIgnoreCase)
+                ? "flac_cue"
+                : "lossless_audio_image_cue";
+    }
+
+    public static string WorkflowId(IEnumerable<string> paths) => SourceType(paths) switch
+    {
+        "ape_cue" => "ape_cue_split",
+        "flac_cue" => "flac_cue_split",
+        _ => "lossless_audio_image_cue_split"
+    };
+}
+
 public sealed record ScanResult(
     string AlbumRoot, string AlbumName, WorkflowMode Mode, IReadOnlyList<MediaItem> Media,
     IReadOnlyList<string> Warnings, IReadOnlyList<string> Errors, long SourceBytes,
-    int ImageCount, int TrackCount, int CueCount, bool HasFlac, bool HasDsd)
+    int ImageCount, int TrackCount, int CueCount, bool HasFlac, bool HasDsd,
+    bool RecheckCompleted = false)
 {
     public string WorkflowLabel => Mode switch
     {
-        WorkflowMode.FlacCueSplit => "FLAC + CUE image split",
+        WorkflowMode.FlacCueSplit => "FLAC/APE + CUE image split",
         WorkflowMode.DsdExtraction => "DSD / SACD extraction",
+        WorkflowMode.ExistingTrackRepair when RecheckCompleted => "Recheck completed album — repair only missing tags or artwork",
         WorkflowMode.ExistingTrackRepair => "Existing-track metadata repair",
         WorkflowMode.MultipleAlbums => "Multiple albums detected",
         WorkflowMode.NeedsInspection => "Needs inspection",
+        WorkflowMode.Completed when RecheckCompleted => "Rechecked — current tags and artwork are complete",
         WorkflowMode.Completed => "Already completed — no pending work",
         _ => "No supported source found"
     };
@@ -84,23 +131,53 @@ public sealed partial class AlbumScanner
     public static int InventoryWorkerLimit => Math.Clamp(Environment.ProcessorCount, 1, 4);
 
     public Task<ScanResult> ScanAsync(string folder, CancellationToken token = default) =>
-        ScanAsync(folder, progress: null, token);
+        ScanAsync(folder, progress: null, recheckCompletedAlbums: false, token);
+
+    public Task<ScanResult> ScanAsync(
+        string folder,
+        bool recheckCompletedAlbums,
+        CancellationToken token = default) =>
+        ScanAsync(folder, progress: null, recheckCompletedAlbums, token);
 
     public Task<ScanResult> ScanAsync(
         string folder,
         IProgress<InventoryProgress>? progress,
         CancellationToken token = default) =>
-        Task.Run(() => Scan(folder, progress, token, excludedAlbumRoots: null), token);
+        ScanAsync(folder, progress, recheckCompletedAlbums: false, token);
+
+    public Task<ScanResult> ScanAsync(
+        string folder,
+        IProgress<InventoryProgress>? progress,
+        bool recheckCompletedAlbums,
+        CancellationToken token = default) =>
+        Task.Run(() => Scan(folder, progress, token, excludedAlbumRoots: null,
+            recheckCompletedAlbums: recheckCompletedAlbums), token);
 
     public async Task<IReadOnlyList<ScanResult>> ScanAlbumsAsync(string folder, CancellationToken token = default)
     {
         var scan = await ScanAsync(folder, token).ConfigureAwait(false);
-        return await ScanAlbumsAsync(scan, progress: null, token).ConfigureAwait(false);
+        return await ScanAlbumsAsync(scan, progress: null, recheckCompletedAlbums: false, token).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<ScanResult>> ScanAlbumsAsync(
+        string folder,
+        bool recheckCompletedAlbums,
+        CancellationToken token = default)
+    {
+        var scan = await ScanAsync(folder, recheckCompletedAlbums, token).ConfigureAwait(false);
+        return await ScanAlbumsAsync(scan, progress: null, recheckCompletedAlbums, token).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<ScanResult>> ScanAlbumsAsync(
         ScanResult scan,
         IProgress<InventoryProgress>? progress = null,
+        CancellationToken token = default)
+        => await ScanAlbumsAsync(scan, progress, recheckCompletedAlbums: false, token).ConfigureAwait(false);
+
+    public async Task<IReadOnlyList<ScanResult>> ScanAlbumsAsync(
+        ScanResult scan,
+        IProgress<InventoryProgress>? progress,
+        bool recheckCompletedAlbums,
         CancellationToken token = default)
     {
         if (scan.Mode != WorkflowMode.MultipleAlbums) return [scan];
@@ -116,7 +193,7 @@ public sealed partial class AlbumScanner
             CancellationToken = token
         }, async (index, itemToken) =>
         {
-            results[index] = await ScanAsync(roots[index], itemToken).ConfigureAwait(false);
+            results[index] = await ScanAsync(roots[index], recheckCompletedAlbums, itemToken).ConfigureAwait(false);
             lock (progressGate)
             {
                 completed++;
@@ -148,13 +225,18 @@ public sealed partial class AlbumScanner
     }
 
     public ScanResult Scan(string folder, CancellationToken token = default)
-        => Scan(folder, progress: null, token, excludedAlbumRoots: null);
+        => Scan(folder, progress: null, token, excludedAlbumRoots: null, recheckCompletedAlbums: false);
+
+    public ScanResult Scan(string folder, bool recheckCompletedAlbums, CancellationToken token = default)
+        => Scan(folder, progress: null, token, excludedAlbumRoots: null,
+            recheckCompletedAlbums: recheckCompletedAlbums);
 
     private ScanResult Scan(
         string folder,
         IProgress<InventoryProgress>? progress,
         CancellationToken token,
-        IReadOnlyList<string>? excludedAlbumRoots)
+        IReadOnlyList<string>? excludedAlbumRoots,
+        bool recheckCompletedAlbums)
     {
         if (string.IsNullOrWhiteSpace(folder)) throw new ArgumentException("Choose an album folder first.");
         var root = Path.GetFullPath(folder);
@@ -216,9 +298,14 @@ public sealed partial class AlbumScanner
         var previousPlans = previousPlanResults.OfType<PreviousOutputPlan>().ToArray();
         var verifiedPreviousPlans = verifiedPlanResults.OfType<VerifiedOutputPlan>().ToArray();
         var completedPlans = completedPlanResults.OfType<CompletedOutputPlan>().ToArray();
-        var previousOutputs = previousPlans.SelectMany(plan => plan.Files)
-            .Concat(verifiedPreviousPlans.SelectMany(plan => plan.Files))
+        var reportProvenOutputs = verifiedPreviousPlans.SelectMany(plan => plan.Files)
             .Concat(completedPlans.SelectMany(plan => plan.Files))
+            .ToArray();
+        var recheckOutputs = recheckCompletedAlbums
+            ? reportProvenOutputs.Select(file => file.FullPath).ToHashSet(StringComparer.OrdinalIgnoreCase)
+            : [];
+        var previousOutputs = previousPlans.SelectMany(plan => plan.Files)
+            .Concat(recheckCompletedAlbums ? [] : reportProvenOutputs)
             .Select(file => file.FullPath)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -251,15 +338,20 @@ public sealed partial class AlbumScanner
             {
                 ".cue" => ("CUE sheet", "Track boundaries and edition evidence"),
                 ".iso" => ("SACD / DSD image", "Signature must be probed before extraction"),
+                ".flac" when recheckOutputs.Contains(path) => ("Existing FLAC", "Report completion ignored; current tags and embedded artwork will be rechecked"),
                 ".flac" when previousOutputs.Contains(path) => ("Previous Album Fixer output", "Report-proven output; root files are replaced only after new tracks verify"),
                 ".flac" when PreviousOutputCleanupService.IsInnerTracksFile(root, path) => ("Inner-folder FLAC", "Retained legacy inner-folder track; new tracks are written at the album root"),
                 ".flac" when referenced && trackPerFileCue =>
                     ("Existing FLAC", "Already-separated track referenced by a one-file-per-track CUE"),
-                ".flac" when referenced => ("FLAC image", "Referenced by CUE"),
+                ".flac" when referenced => (CueAudioImagePolicy.FlacKind, "Referenced by CUE"),
                 ".flac" => ("Existing FLAC", "Individual track candidate"),
+                ".ape" when referenced => (CueAudioImagePolicy.ApeKind, "Lossless Monkey's Audio image referenced by CUE"),
+                ".ape" => (CueAudioImagePolicy.ApeKind, "APE splitting requires an exact CUE reference"),
+                ".dsf" when recheckOutputs.Contains(path) => ("Existing DSF", "Report completion ignored; current tags and embedded artwork will be rechecked"),
                 ".dsf" when previousOutputs.Contains(path) => ("Previous Album Fixer output", "Report-proven SACD output"),
                 ".dsf" when referenced => ("DSF image", "Large DSD source referenced by CUE"),
                 ".dsf" => ("Existing DSF", "Individual track candidate"),
+                ".dff" when recheckOutputs.Contains(path) => ("Existing DFF", "Report completion ignored; current tags and embedded artwork will be rechecked"),
                 ".dff" when previousOutputs.Contains(path) => ("Previous Album Fixer output", "Report-proven SACD output"),
                 ".dff" when referenced => ("DFF image", "DSDIFF source referenced by CUE"),
                 ".dff" => ("Existing DFF", "Individual track candidate"),
@@ -283,27 +375,46 @@ public sealed partial class AlbumScanner
         var tracks = media.Where(item => item.Kind.StartsWith("Existing", StringComparison.OrdinalIgnoreCase)).ToArray();
         var repairTracks = tracks.Where(item => item.Kind is "Existing FLAC" or "Existing DSF" or "Existing DFF").ToArray();
         var repairKind = repairTracks.Select(item => item.Kind).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        var completedPlan = completedPlans.FirstOrDefault(plan => plan.AlbumRoot.Equals(root, StringComparison.OrdinalIgnoreCase));
+        var reportedCompletedPlan = completedPlans.FirstOrDefault(plan => plan.AlbumRoot.Equals(root, StringComparison.OrdinalIgnoreCase));
+        var completedPlan = recheckCompletedAlbums ? null : reportedCompletedPlan;
+        var recheckEvidence = recheckCompletedAlbums && (reportedCompletedPlan is not null ||
+            verifiedPreviousPlans.Any(plan => plan.AlbumRoot.Equals(root, StringComparison.OrdinalIgnoreCase)));
         var completedSources = completedPlan?.SourcePaths.ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
-        var hasDsdRepairHistory = repairKind.Length == 1 && repairKind[0] is "Existing DSF" or "Existing DFF" &&
+        var hasDsdRepairHistory = !recheckEvidence &&
+                                  repairKind.Length == 1 && (repairKind[0] is "Existing DSF" or "Existing DFF") &&
                                   File.Exists(Path.Combine(root, "conversion-report.json"));
-        var completeExistingTrackSet = images.Length == 0 && repairTracks.Length == tracks.Length &&
+        var recheckReportedTrackSet = recheckEvidence && repairTracks.Length > 0 &&
+                                      repairTracks.All(item => recheckOutputs.Contains(item.Path));
+        var minimumRepairTracks = recheckReportedTrackSet ? 1 : 2;
+        var completeExistingTrackSet = (images.Length == 0 || recheckReportedTrackSet) &&
+                                       repairTracks.Length == tracks.Length &&
                                        !hasDsdRepairHistory &&
-                                       PreviousOutputCleanupService.HasCompleteExistingTrackSet(repairTracks);
+                                       PreviousOutputCleanupService.HasCompleteExistingTrackSet(repairTracks, minimumRepairTracks);
         var completed = completeExistingTrackSet || completedPlan is not null && tracks.Length == 0 &&
             images.All(item => completedSources.Contains(item.Path));
         if (completeExistingTrackSet)
         {
             var format = repairKind[0].Replace("Existing ", string.Empty, StringComparison.OrdinalIgnoreCase);
-            warnings.Add(references.Any(path => !File.Exists(path))
+            warnings.Add(recheckEvidence
+                ? $"The previous completion status was ignored. Every current {format} track was read again and already has complete required tags and embedded artwork; no repair, rewrite, or external lookup is required."
+                : references.Any(path => !File.Exists(path))
                 ? $"The already-separated {format} tracks form a complete multi-disc or multi-area set with required tags and embedded artwork. Missing source files named by preserved CUE sheets were accepted as historical provenance; no repair or external lookup is required."
                 : $"The already-separated {format} tracks form a complete set with required tags and embedded artwork; no repair or external lookup is required.");
         }
         if (completedPlan?.RecoveredFromStaleFallback == true)
             warnings.Add(completedPlan.RecoveryDetail ?? "Completion was recovered from a verified stale fallback state.");
-        if (!completed && !verifiedLegacySplitCue)
-            foreach (var missing in references.Where(path => !File.Exists(path)))
+        var missingReferences = references.Where(path => !File.Exists(path)).ToArray();
+        var reportedDeletedReferences = recheckEvidence && missingReferences.Length > 0 &&
+                                        reportedCompletedPlan?.SourcesDeleted == true &&
+                                        missingReferences.All(path => reportedCompletedPlan.SourcePaths.Contains(path, StringComparer.OrdinalIgnoreCase));
+        if (!completed && !verifiedLegacySplitCue && !reportedDeletedReferences)
+            foreach (var missing in missingReferences)
                 errors.Add($"CUE references a missing source: {Path.GetRelativePath(root, missing)}");
+        if (!completed && reportedDeletedReferences)
+            warnings.Add("Missing source files named by preserved CUE sheets were accepted as historical provenance because the prior report records their verified deletion. Only the report's completion status was ignored.");
+        if (!completed)
+            foreach (var ape in media.Where(item => item.Kind == CueAudioImagePolicy.ApeKind && !references.Contains(item.Path)))
+                errors.Add($"APE image requires a matching CUE reference: {ape.RelativePath}");
         if (previousOutputs.Count > 0 && !completed)
             warnings.Add($"Found {previousOutputs.Count} report-proven output file{(previousOutputs.Count == 1 ? "" : "s")} from an earlier Album Fixer run. Root-level outputs are replaced only after new tracks verify; inner-folder tracks are retained.");
 
@@ -314,10 +425,11 @@ public sealed partial class AlbumScanner
             var nestedAlbumRoots = albumRoots
                 .Where(path => !path.Equals(root, StringComparison.OrdinalIgnoreCase))
                 .ToArray();
-            return Scan(root, progress, token, nestedAlbumRoots);
+            return Scan(root, progress, token, nestedAlbumRoots, recheckCompletedAlbums);
         }
         if (albumRoots.Count == 1 && !albumRoots[0].Equals(root, StringComparison.OrdinalIgnoreCase))
-            return Scan(albumRoots[0], progress, token, excludedAlbumRoots: null);
+            return Scan(albumRoots[0], progress, token, excludedAlbumRoots: null,
+                recheckCompletedAlbums: recheckCompletedAlbums);
 
         WorkflowMode mode;
         if (albumRoots.Count > 1)
@@ -328,7 +440,7 @@ public sealed partial class AlbumScanner
         else if (completed) mode = WorkflowMode.Completed;
         else if (tracks.Length > 0)
         {
-            if (repairTracks.Length >= 2 && repairTracks.Length == tracks.Length && repairKind.Length == 1)
+            if (repairTracks.Length >= minimumRepairTracks && repairTracks.Length == tracks.Length && repairKind.Length == 1)
             {
                 mode = WorkflowMode.ExistingTrackRepair;
                 if (images.Length > 0) warnings.Add((repairKind[0] is "Existing DSF" or "Existing DFF") && images.Length == 1 && images[0].Kind == "SACD / DSD image"
@@ -347,21 +459,24 @@ public sealed partial class AlbumScanner
             {
                 mode = WorkflowMode.NeedsInspection;
                 errors.Add(repairTracks.Length == tracks.Length && repairKind.Length <= 1
-                    ? "Existing-track repair requires at least two standalone FLAC, DSF, or DFF tracks."
+                    ? recheckEvidence
+                        ? "Completed-album recheck requires at least one report-proven FLAC, DSF, or DFF track."
+                        : "Existing-track repair requires at least two standalone FLAC, DSF, or DFF tracks."
                     : "Mixed standalone track formats are not eligible for one automatic repair transaction.");
             }
         }
-        else if (media.Any(item => item.Kind == "FLAC image")) mode = errors.Count == 0 ? WorkflowMode.FlacCueSplit : WorkflowMode.NeedsInspection;
+        else if (media.Any(item => CueAudioImagePolicy.IsImageKind(item.Kind))) mode = errors.Count == 0 ? WorkflowMode.FlacCueSplit : WorkflowMode.NeedsInspection;
         else if (media.Any(item => item.Kind is "SACD / DSD image" or "DSF image" or "DFF image" or "DST stream")) mode = WorkflowMode.DsdExtraction;
         else if (media.Any(item => item.Kind == "Raw DSD") || tracks.Length == 1) mode = WorkflowMode.NeedsInspection;
-        else { mode = WorkflowMode.Unsupported; errors.Add("No supported FLAC, ISO, DSF, DFF, DST, or DSD source was found."); }
+        else { mode = WorkflowMode.Unsupported; errors.Add("No supported FLAC, APE, ISO, DSF, DFF, DST, or DSD source was found."); }
 
         var sourceBytes = images.Length > 0 ? images.Sum(item => item.Size) : tracks.Sum(item => item.Size);
         var result = new ScanResult(root, new DirectoryInfo(root).Name, mode,
             media.OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase).ToArray(), warnings, errors,
             sourceBytes, images.Length, tracks.Length, cues.Length,
-            media.Any(item => item.Kind.Contains("FLAC", StringComparison.OrdinalIgnoreCase)),
-            media.Any(item => item.Kind.Contains("DS", StringComparison.OrdinalIgnoreCase) || item.Kind.Contains("SACD", StringComparison.OrdinalIgnoreCase)));
+            media.Any(item => item.Kind.Contains("FLAC", StringComparison.OrdinalIgnoreCase) || item.Kind == CueAudioImagePolicy.ApeKind),
+            media.Any(item => item.Kind.Contains("DS", StringComparison.OrdinalIgnoreCase) || item.Kind.Contains("SACD", StringComparison.OrdinalIgnoreCase)),
+            RecheckCompleted: recheckEvidence);
         progress?.Report(new(Math.Max(totalSteps, 1), Math.Max(totalSteps, 1), "Inventory complete", result.AlbumName));
         return result;
     }
@@ -677,7 +792,7 @@ public sealed class PreflightService
         if (scan.HasFlac || scan.HasDsd)
         {
             Require(checks, "ffmpeg", tools["ffmpeg"], scan.HasFlac
-                ? "local FLAC splitting and in-memory artwork normalization"
+                ? "local FLAC/APE+CUE splitting and in-memory artwork normalization"
                 : "in-memory SACD artwork normalization");
             Require(checks, "ffprobe", tools["ffprobe"], "stream, tag, and artwork verification");
         }
@@ -735,7 +850,8 @@ public sealed class PreflightService
             var isDffRepair = repairKinds.Length == 1 && repairKinds[0].Equals("Existing DFF", StringComparison.OrdinalIgnoreCase);
             var retainedDsdIso = (isDsfRepair || isDffRepair) && scan.ImageCount == 1 &&
                                  scan.Media.Count(item => item.Kind == "SACD / DSD image") == 1;
-            checks.Add((scan.ImageCount == 0 || retainedDsdIso) && scan.TrackCount >= 2 && repairKinds.Length == 1 &&
+            var minimumTrackCount = scan.RecheckCompleted ? 1 : 2;
+            checks.Add((scan.ImageCount == 0 || retainedDsdIso || scan.RecheckCompleted) && scan.TrackCount >= minimumTrackCount && repairKinds.Length == 1 &&
                        (repairKinds[0].Equals("Existing FLAC", StringComparison.OrdinalIgnoreCase) || isDsfRepair || isDffRepair)
                 ? new("Verified write-back", CheckState.Passed,
                     isDsfRepair
@@ -747,7 +863,7 @@ public sealed class PreflightService
                     "Existing-track repair requires at least two standalone FLAC tracks, standalone DSF tracks, or standalone DFF tracks of one format. DSF or DFF repair may coexist with one retained SACD ISO; ambiguous mixed sources remain read-only.", true));
         }
         else if (scan.Mode is not WorkflowMode.FlacCueSplit and not WorkflowMode.MultipleAlbums and not WorkflowMode.Unsupported)
-            checks.Add(new("Verified write-back", CheckState.Failed, "Host-managed final placement is enabled for FLAC + CUE and single SACD ISO workflows. Other modes stop before changing files.", true));
+            checks.Add(new("Verified write-back", CheckState.Failed, "Host-managed final placement is enabled for FLAC/APE + CUE and single SACD ISO workflows. Other modes stop before changing files.", true));
         checks.AddRange(scan.Errors.Select(error => new PreflightCheck("Inventory", CheckState.Failed, error, true)));
         return new(checks, tempRoot, required, available, tools);
     }

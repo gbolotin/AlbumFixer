@@ -75,13 +75,13 @@ public sealed class WpfUserInteractionService : IUserInteractionService
                """
             : confirmation.DeletesSourceAfterSuccess
                 ? $"""
-                   Album Fixer will skip decoded PCM/MD5 and cryptographic hash comparisons. After the tracks are committed and pass quick FLAC, tag, artwork, and file-size checks, it will permanently delete the exact inventoried FLAC image. If artwork cannot be completed, usable tracks are delivered as incomplete work and the source image is retained.
+                   Album Fixer will split the exact CUE-referenced FLAC or APE image into FLAC tracks and skip decoded PCM/MD5 and cryptographic hash comparisons. After the tracks are committed and pass quick FLAC, tag, artwork, and file-size checks, it will permanently delete that one inventoried source image. If artwork cannot be completed, usable tracks are delivered as incomplete work and the source image is retained.
                    {cleanup}
 
                    Start this run?
                    """
                 : $"""
-                   Album Fixer found multiple FLAC images. It will create CD<n> folders, run quick FLAC, tag, artwork, and file-size checks, and retain every original image after the tracks are committed.
+                   Album Fixer found multiple CUE-referenced FLAC and/or APE images. It will create CD<n> folders, run quick FLAC, tag, artwork, and file-size checks, and retain every original image after the tracks are committed.
                    {cleanup}
 
                    Start this run?

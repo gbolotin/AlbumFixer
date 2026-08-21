@@ -27,7 +27,7 @@ public sealed partial class LocalTrackRepairProcessor
         var retainedDsdIso = scan.ImageCount == 1 &&
                              scan.Media.Count(item => item.Kind == "SACD / DSD image") == 1 &&
                              scan.Media.Any(item => item.Kind is "Existing DSF" or "Existing DFF");
-        if (scan.Mode != WorkflowMode.ExistingTrackRepair || scan.ImageCount != 0 && !retainedDsdIso)
+        if (scan.Mode != WorkflowMode.ExistingTrackRepair || scan.ImageCount != 0 && !retainedDsdIso && !scan.RecheckCompleted)
             throw new NotSupportedException("Verified existing-track repair requires same-format standalone FLAC, DSF, or DFF tracks. DSF or DFF repair may coexist with one retained SACD ISO.");
 
         var inventory = scan.Media
@@ -35,8 +35,11 @@ public sealed partial class LocalTrackRepairProcessor
             .OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var formats = inventory.Select(item => Path.GetExtension(item.Path).ToLowerInvariant()).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        if (inventory.Length < 2 || formats.Length != 1 || formats[0] is not (".flac" or ".dsf" or ".dff"))
-            throw new InvalidOperationException("Existing-track repair requires at least two inventoried, same-format FLAC, DSF, or DFF tracks.");
+        var minimumTrackCount = scan.RecheckCompleted ? 1 : 2;
+        if (inventory.Length < minimumTrackCount || formats.Length != 1 || formats[0] is not (".flac" or ".dsf" or ".dff"))
+            throw new InvalidOperationException(scan.RecheckCompleted
+                ? "Completed-album recheck requires at least one report-proven FLAC, DSF, or DFF track."
+                : "Existing-track repair requires at least two inventoried, same-format FLAC, DSF, or DFF tracks.");
         var isDsf = formats[0].Equals(".dsf", StringComparison.OrdinalIgnoreCase);
         var isDff = formats[0].Equals(".dff", StringComparison.OrdinalIgnoreCase);
         var formatLabel = isDsf ? "DSF" : isDff ? "DFF" : "FLAC";
@@ -1195,6 +1198,7 @@ public sealed partial class LocalTrackRepairProcessor
             ["geminiani"] = "Francesco Geminiani",
             ["gluck"] = "Christoph Willibald Gluck",
             ["granados"] = "Enrique Granados",
+            ["gershwin"] = "George Gershwin",
             ["handel"] = "George Frideric Handel",
             ["haydn"] = "Joseph Haydn",
             ["johnward"] = "John Ward",

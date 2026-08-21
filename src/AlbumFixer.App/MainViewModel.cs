@@ -41,6 +41,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _busy;
     private bool _isRunActive;
     private bool _deleteOriginals = true;
+    private bool _recheckCompletedAlbums;
     private string _reportHeadline = "No conversion report yet";
     private string _reportDetail = "A validated summary and JSON report will appear here.";
     private string _reportJson = "";
@@ -162,6 +163,31 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (!SetProperty(ref _deleteOriginals, value)) return;
             OnPropertyChanged(nameof(DeletesSourceAfterSuccess));
             OnPropertyChanged(nameof(DeletesAnySourceAfterSuccess));
+        }
+    }
+    public bool RecheckCompletedAlbums
+    {
+        get => _recheckCompletedAlbums;
+        set
+        {
+            if (!SetProperty(ref _recheckCompletedAlbums, value)) return;
+            if (Busy || SourceFolders.Count == 0 || _scan is null && _scans.Count == 0) return;
+
+            _scan = null;
+            _scans = [];
+            _albumPreflights = [];
+            _preflight = null;
+            _previousOutputFileCount = 0;
+            _albumCheckRows.Clear();
+            PreflightChecks.Clear();
+            Workflow = "Scan required after changing completed-album recheck";
+            Inventory = "Current inventory is stale";
+            StatusTitle = "Scan albums again";
+            StatusDetail = value
+                ? "Completed-album recheck is enabled. Run Scan albums to ignore prior completion status and validate current tags and artwork."
+                : "Completed-album recheck is disabled. Run Scan albums to use verified completion reports normally.";
+            OnPropertyChanged(nameof(CanStart));
+            StartCommand.NotifyCanExecuteChanged();
         }
     }
     public bool CanBrowse => !Busy && !_addingSourceFolders;
@@ -365,13 +391,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async Task ScanAsync()
     {
         SetRetryFailures([]);
+        var recheckCompletedAlbums = RecheckCompletedAlbums;
         Busy = true;
         Progress = 0;
         _runStartedAt = DateTimeOffset.UtcNow;
         RefreshProgressTime();
         _progressTimer.Start();
         StatusTitle = "Inventorying albums…";
-        StatusDetail = $"Reading media, CUE references, artwork, and provenance without changing files. Report evidence and album folders use up to {AlbumScanner.InventoryWorkerLimit} concurrent inventory workers.";
+        StatusDetail = $"Reading media, CUE references, artwork, and provenance without changing files. Report evidence and album folders use up to {AlbumScanner.InventoryWorkerLimit} concurrent inventory workers." +
+                       (recheckCompletedAlbums
+                           ? " Prior completion status will be ignored; current tags and embedded artwork will be validated instead."
+                           : string.Empty);
         Log("SCAN", $"Read-only inventory started with up to {AlbumScanner.InventoryWorkerLimit} concurrent inventory workers.");
         try
         {
@@ -398,7 +428,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                         $"{update.Stage}: {InventoryItemName(update.CurrentItem)}",
                         $"Discovering · {update.Percent}%");
                 });
-                var rootScan = await _scanner.ScanAsync(sourceFolder, rootProgress, lifetimeCancellation.Token);
+                var rootScan = await _scanner.ScanAsync(sourceFolder, rootProgress, recheckCompletedAlbums, lifetimeCancellation.Token);
                 IReadOnlyList<ScanResult> albums;
                 if (rootScan.Mode == WorkflowMode.MultipleAlbums)
                 {
@@ -416,7 +446,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                         if (update.Completed > 0 && inventoryRows.TryGetValue(update.CurrentItem, out var row))
                             row.PresentAlbumState(AlbumState.Inventoried, "Detailed read-only inventory completed.", "Inventoried · 100%");
                     });
-                    albums = await _scanner.ScanAlbumsAsync(rootScan, albumProgress, lifetimeCancellation.Token);
+                    albums = await _scanner.ScanAlbumsAsync(rootScan, albumProgress, recheckCompletedAlbums, lifetimeCancellation.Token);
                     foreach (var row in inventoryRows.Values)
                         row.PresentAlbumState(AlbumState.Inventoried, "Detailed read-only inventory completed.", "Inventoried · 100%");
                 }
@@ -450,13 +480,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 _albumCheckRows.Clear();
                 PreflightChecks.Clear();
                 Replace(Albums, completedScans.Select(scan => CreateAlbumStateRow(scan.AlbumName, scan.AlbumRoot,
-                    AlbumState.Completed, "Verified outputs and preserved provenance require no pending work.")));
+                    AlbumState.Completed, CompletedInventoryDetail(scan))));
                 AlbumName = completedScans.Length == 1 ? completedScans[0].AlbumName : $"{completedScans.Length} completed albums";
                 Workflow = completedScans.Length == 1 ? completedScans[0].WorkflowLabel : "Already completed — no pending work";
                 Inventory = $"{completedScans.Length} completed album{S(completedScans.Length)}  •  0 pending";
                 SourceSize = "—";
                 StatusTitle = "No work needed";
-                StatusDetail = $"{completedScans.Length} report-confirmed completed album{S(completedScans.Length)} skipped. Verified outputs and preserved provenance remain unchanged.";
+                var rechecked = completedScans.Count(scan => scan.RecheckCompleted);
+                var reportConfirmed = completedScans.Length - rechecked;
+                StatusDetail = rechecked > 0
+                    ? $"{rechecked} completed album{S(rechecked)} freshly validated from current tags and artwork; everything required already exists, so no files were rewritten or externally looked up." +
+                      (reportConfirmed > 0 ? $" {reportConfirmed} additional report-confirmed album{S(reportConfirmed)} skipped." : string.Empty)
+                    : $"{completedScans.Length} report-confirmed completed album{S(completedScans.Length)} skipped. Verified outputs and preserved provenance remain unchanged.";
                 Log("COMPLETE", StatusDetail);
                 NotifyAlbumStateChanged();
                 await LoadReportAsync();
@@ -508,7 +543,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 }
             }
             albumRows.AddRange(completedScans.Select(scan => CreateAlbumStateRow(scan.AlbumName, scan.AlbumRoot,
-                AlbumState.Completed, "Already completed; verified outputs were skipped.")));
+                AlbumState.Completed, CompletedInventoryDetail(scan))));
             Replace(PreflightChecks, preflightRows);
             Replace(Albums, OrderAlbumRows(albumRows));
             NotifyAlbumStateChanged();
@@ -561,6 +596,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Path.IsPathRooted(path)
             ? Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
             : path;
+
+    private static string CompletedInventoryDetail(ScanResult scan) => scan.RecheckCompleted
+        ? "Previous completion status was ignored. Current tags and embedded artwork are complete, so no file was rewritten and no external lookup was used."
+        : "Already completed; verified outputs were skipped.";
 
     private async Task StartAsync()
     {
@@ -622,7 +661,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 {
                     try
                     {
-                        return await _scanner.ScanAsync(failure.Root, ct).ConfigureAwait(false);
+                        return await _scanner.ScanAsync(failure.Root, RecheckCompletedAlbums, ct).ConfigureAwait(false);
                     }
                     finally
                     {
@@ -767,6 +806,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var runIsBatch = runTotal > 1;
         var runBlocked = runAlbums.Count - runnable.Length + preservedOutsideRun.Count;
         var deleteOriginals = DeleteOriginals;
+        var recheckCompletedAlbums = RecheckCompletedAlbums;
         IsRunActive = true; Busy = true; Progress = 1; foreach (var item in Timeline) item.State = "Pending"; _cancel = new();
         _activeRunAdmittedCount = runnable.Length;
         _activeRunBlockedCount = runBlocked;
@@ -809,7 +849,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var runToken = _cancel.Token;
             var results = await Task.Run(() => BoundedBatchProcessor.RunAsync<AlbumPreflightResult, AlbumJobOutcome>(
                 runnable,
-                (album, index, token) => ProcessAlbumAsync(album.Scan, index, album.Index, runPreflight, runIsBatch, pipeline, uiUpdates, deleteOriginals, token),
+                (album, index, token) => ProcessAlbumAsync(album.Scan, index, album.Index, runPreflight, runIsBatch, pipeline, uiUpdates,
+                    deleteOriginals, recheckCompletedAlbums, token),
                 workerLimit,
                 runToken));
 
@@ -908,6 +949,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         BatchPipelineScheduler pipeline,
         IProgress<JobUiUpdate> uiUpdates,
         bool deleteOriginals,
+        bool recheckCompletedAlbums,
         CancellationToken token)
     {
         var jobDirectory = runIsBatch
@@ -928,11 +970,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             Report(new(JobPhase.Ready, 0, "queued", "Waiting for exclusive ownership of this album transaction.", DateTimeOffset.UtcNow));
             transactionLock = await AlbumTransactionLock.AcquireAsync(scan.AlbumRoot, token);
-            var refreshedScan = await _scanner.ScanAsync(scan.AlbumRoot, token);
+            var refreshedScan = await _scanner.ScanAsync(scan.AlbumRoot, recheckCompletedAlbums, token);
             if (refreshedScan.Mode == WorkflowMode.Completed &&
                 PreviousOutputCleanupService.DiscoverCompleted(scan.AlbumRoot) is { } completed)
             {
-                const string detail = "Another transaction already completed this album; its verified report and outputs were preserved.";
+                var detail = refreshedScan.RecheckCompleted
+                    ? "A fresh read found complete current tags and embedded artwork. No repair, rewrite, or external lookup was needed."
+                    : "Another transaction already completed this album; its verified report and outputs were preserved.";
                 uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Kind: "COMPLETE", Message: detail));
                 Report(new(JobPhase.CleanupCompleted, 100, "already_completed", detail, DateTimeOffset.UtcNow));
                 return new(jobDirectory, completed.ReportPath, 0, false, false, AlreadyCompleted: true);

@@ -31,8 +31,8 @@ public static class HostReportWriter
             album = scan.AlbumName,
             edition = "Unresolved — run stopped before release identification completed",
             format = scan.HasFlac ? "flac" : scan.HasDsd ? "dsd" : "unknown",
-            source_type = SourceType(scan.Mode),
-            workflow_mode = WorkflowId(scan.Mode),
+            source_type = SourceType(scan),
+            workflow_mode = WorkflowId(scan),
             album_root = scan.AlbumRoot,
             generated_by = "Album Fixer host fallback",
             generated_at_utc = now,
@@ -134,9 +134,10 @@ public static class HostReportWriter
         }
     }
 
-    private static string SourceType(WorkflowMode mode) => mode switch
+    private static string SourceType(ScanResult scan) => scan.Mode switch
     {
-        WorkflowMode.FlacCueSplit => "flac_cue",
+        WorkflowMode.FlacCueSplit => CueAudioImagePolicy.SourceType(
+            scan.Media.Where(item => CueAudioImagePolicy.IsImageKind(item.Kind)).Select(item => item.Path)),
         WorkflowMode.DsdExtraction => "dsd_image",
         WorkflowMode.ExistingTrackRepair => "existing_track_repair",
         WorkflowMode.MultipleAlbums => "multiple_albums",
@@ -145,9 +146,10 @@ public static class HostReportWriter
         _ => "unsupported"
     };
 
-    private static string WorkflowId(WorkflowMode mode) => mode switch
+    private static string WorkflowId(ScanResult scan) => scan.Mode switch
     {
-        WorkflowMode.FlacCueSplit => "flac_cue_split",
+        WorkflowMode.FlacCueSplit => CueAudioImagePolicy.WorkflowId(
+            scan.Media.Where(item => CueAudioImagePolicy.IsImageKind(item.Kind)).Select(item => item.Path)),
         WorkflowMode.DsdExtraction => "sacd_iso_extract",
         WorkflowMode.ExistingTrackRepair => "existing_track_repair",
         WorkflowMode.MultipleAlbums => "multiple_albums",

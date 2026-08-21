@@ -32,7 +32,7 @@ public sealed class LocalFlacProcessor
         CancellationToken token = default)
     {
         if (scan.Mode != WorkflowMode.FlacCueSplit)
-            throw new NotSupportedException("The deterministic local processor currently supports FLAC + CUE image splits only.");
+            throw new NotSupportedException("The deterministic local processor currently supports FLAC/APE + CUE image splits only.");
 
         var inputAlbumRoot = staged.InputAlbumRoot;
         progress.Report(Snapshot(JobPhase.Processing, 19, staged.SourceCacheUsed
@@ -61,7 +61,7 @@ public sealed class LocalFlacProcessor
             var cue = await ParseCueAsync(cuePaths[index], token);
             var source = ResolveSource(inputAlbumRoot, cuePaths[index], cue.SourceFiles);
             if (!sources.Add(source))
-                throw new InvalidDataException($"More than one CUE sheet references the same FLAC image: {HostStagingService.SafeRelative(inputAlbumRoot, source)}.");
+                throw new InvalidDataException($"More than one CUE sheet references the same audio image: {HostStagingService.SafeRelative(inputAlbumRoot, source)}.");
             var probe = await ProbeAudioAsync(staged.FfprobePath, source, token);
             ValidateBoundaries(cue.Tracks, probe.SampleRate, probe.TotalSamples);
             inputs.Add(new(cue, source, probe, ResolveMetadata(scan, cue)));
@@ -185,7 +185,7 @@ public sealed class LocalFlacProcessor
 
         sheet.SourceFiles = sheet.SourceFiles.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         if (sheet.SourceFiles.Count != 1)
-            throw new InvalidDataException($"The local splitter supports one FLAC image per CUE; this CUE names {sheet.SourceFiles.Count} source files.");
+            throw new InvalidDataException($"The local splitter supports one FLAC or APE image per CUE; this CUE names {sheet.SourceFiles.Count} source files.");
         if (sheet.Tracks.Count == 0) throw new InvalidDataException("The CUE sheet contains no AUDIO tracks.");
         if (sheet.Tracks.Any(track => track.Index01Frames is null)) throw new InvalidDataException("Every CUE track must contain an INDEX 01 boundary.");
         if (sheet.Tracks.Select(track => track.Number).Distinct().Count() != sheet.Tracks.Count)
@@ -213,8 +213,8 @@ public sealed class LocalFlacProcessor
         var candidate = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(cuePath)!, sourceFiles[0]));
         HostStagingService.SafeRelative(albumRoot, candidate);
         if (!File.Exists(candidate)) throw new FileNotFoundException("The CUE source does not exist.", candidate);
-        if (!Path.GetExtension(candidate).Equals(".flac", StringComparison.OrdinalIgnoreCase))
-            throw new NotSupportedException("The deterministic local CUE splitter currently accepts FLAC sources only.");
+        if (!CueAudioImagePolicy.IsSupportedPath(candidate))
+            throw new NotSupportedException("The deterministic local CUE splitter accepts FLAC and APE image sources only.");
         return candidate;
     }
 
@@ -225,11 +225,11 @@ public sealed class LocalFlacProcessor
             null, token);
         using var document = JsonDocument.Parse(output);
         if (!document.RootElement.TryGetProperty("streams", out var streams) || streams.GetArrayLength() == 0)
-            throw new InvalidDataException("ffprobe found no audio stream in the staged FLAC source.");
+            throw new InvalidDataException("ffprobe found no audio stream in the staged FLAC/APE source.");
         var stream = streams[0];
         var sampleText = stream.TryGetProperty("sample_rate", out var rateNode) ? rateNode.GetString() : null;
         if (!int.TryParse(sampleText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var sampleRate) || sampleRate <= 0)
-            throw new InvalidDataException("ffprobe did not return a valid FLAC sample rate.");
+            throw new InvalidDataException("ffprobe did not return a valid source sample rate.");
         long? totalSamples = null;
         if (stream.TryGetProperty("duration_ts", out var durationNode))
         {
@@ -249,7 +249,7 @@ public sealed class LocalFlacProcessor
             if (numerator % 75 != 0) throw new InvalidDataException("A CUE boundary does not align to a whole audio sample.");
             var sample = numerator / 75;
             if (sample <= previous) throw new InvalidDataException("CUE INDEX 01 boundaries are not strictly increasing.");
-            if (totalSamples is not null && sample >= totalSamples.Value) throw new InvalidDataException("A CUE boundary lies beyond the FLAC audio stream.");
+            if (totalSamples is not null && sample >= totalSamples.Value) throw new InvalidDataException("A CUE boundary lies beyond the source audio stream.");
             previous = sample;
         }
     }
@@ -468,6 +468,8 @@ public sealed class LocalFlacProcessor
         }
 
         var metadata = discs[0].Metadata;
+        var sourceType = CueAudioImagePolicy.SourceType(discs.Select(disc => disc.Source));
+        var workflowId = CueAudioImagePolicy.WorkflowId(discs.Select(disc => disc.Source));
 
         var report = new JsonObject
         {
@@ -476,8 +478,8 @@ public sealed class LocalFlacProcessor
             ["artist"] = metadata.AlbumArtist ?? string.Empty,
             ["edition"] = scan.AlbumName,
             ["format"] = "flac",
-            ["source_type"] = "flac_cue",
-            ["workflow_mode"] = "flac_cue_split",
+            ["source_type"] = sourceType,
+            ["workflow_mode"] = workflowId,
             ["generated_by"] = "Album Fixer deterministic local processor",
             ["generated_at_utc"] = DateTimeOffset.UtcNow,
             ["metadata_sources"] = new JsonArray("local CUE, album folder, rip sidecars, and local artwork"),
