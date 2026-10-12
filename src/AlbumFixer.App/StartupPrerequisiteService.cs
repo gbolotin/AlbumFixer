@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using AlbumFixer.Core;
+using Microsoft.Extensions.Logging;
 
 namespace AlbumFixer.App;
 
@@ -13,10 +14,12 @@ public sealed record StartupPrerequisiteResult(
 public sealed class StartupPrerequisiteService
 {
     private readonly PreflightService preflightService;
+    private readonly ILogger<StartupPrerequisiteService> logger;
 
-    public StartupPrerequisiteService(PreflightService preflightService)
+    public StartupPrerequisiteService(PreflightService preflightService, ILogger<StartupPrerequisiteService> logger)
     {
         this.preflightService = preflightService;
+        this.logger = logger;
     }
 
     public async Task<StartupPrerequisiteResult> EnsureInstalledAsync(
@@ -29,6 +32,7 @@ public sealed class StartupPrerequisiteService
 
         if (tools["ffmpeg"] is null || tools["ffprobe"] is null)
         {
+            logger.LogWarning("FFmpeg is missing (ffmpeg {Ffmpeg}, ffprobe {Ffprobe}); installing Gyan.FFmpeg with WinGet", tools["ffmpeg"], tools["ffprobe"]);
             progress?.Report("FFmpeg components are missing. Installing Gyan.FFmpeg with WinGet…");
             ffmpegInstallError = await InstallFfmpegAsync(token);
         }
@@ -47,6 +51,8 @@ public sealed class StartupPrerequisiteService
             failures.Add("sacd_extract: the bundled executable is missing. Reinstall Album Fixer from the complete published folder");
         }
 
+        logger.Log(failures.Count == 0 ? LogLevel.Information : LogLevel.Warning,
+            "Startup component check: {Tools}; failures {Failures}", tools, failures);
         return new(tools, failures);
     }
 

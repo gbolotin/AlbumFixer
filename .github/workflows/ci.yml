@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # Shared with WpfFoundation; pinned to a commit so a change there can't break this build unannounced.
+      # Report-only until the theme slice moves the window onto Fluent resources: findings show in the log
+      # without failing the build. Justified exceptions go in xaml-design-allowlist.txt with a reason.
+      - name: XAML design check (report only)
+        continue-on-error: true
+        uses: gbolotin/WpfFoundation/.github/actions/xaml-design-check@222e37c4082b438e717820cec5c0545504931c79
+
+      # A vX.Y.Z tag builds and releases version X.Y.Z. Every other build is <VersionPrefix>-ci.<run number>.
+      - name: Choose version
+        id: version
+        shell: pwsh
+        run: |
+          $release = 'false'
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME.TrimStart('v')
+            if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') { throw "Tag $env:GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH[-prerelease]." }
+            "property=-p:Version=$version" >> $env:GITHUB_OUTPUT
+            $release = 'true'
+          } else {
+            $version = dotnet msbuild src/AlbumFixer.Core/AlbumFixer.Core.csproj -getProperty:Version -p:VersionSuffix=ci.$env:GITHUB_RUN_NUMBER
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            "property=-p:VersionSuffix=ci.$env:GITHUB_RUN_NUMBER" >> $env:GITHUB_OUTPUT
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "release=$release" >> $env:GITHUB_OUTPUT
+
+      # Always build against the pinned WpfFoundation package, never a local checkout.
+      # The App build also checks the bundled sacd_extract.exe against its approved SHA-256.
+      - name: Build
+        run: dotnet build AlbumFixer.slnx -c Release -p:UseLocalWpfFoundation=false ${{ steps.version.outputs.property }}
+
+      # A console runner that exits non-zero on failure. Parts that need FFmpeg are skipped on the runner.
+      - name: Smoke tests
+        run: dotnet run --project tests/AlbumFixer.Core.SmokeTests -c Release --no-build
+
+      # Self-contained win-x64, as the README describes: running it needs no .NET installation.
+      # sacd_extract.exe is GPL-2.0, so the ZIP must carry its license and provenance beside it.
+      - name: Publish
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          dotnet publish src/AlbumFixer.App/AlbumFixer.App.csproj -c Release -r win-x64 --self-contained -p:UseLocalWpfFoundation=false ${{ steps.version.outputs.property }} -o "out/Album Fixer"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($file in 'Album Fixer.exe', 'Tools/sacd_extract.exe', 'Tools/COPYING.sacd_extract.txt', 'Tools/README.md') {
+            if (-not (Test-Path -LiteralPath "out/Album Fixer/$file")) { throw "The publish did not produce $file." }
+          }
+          Compress-Archive -Path "out/Album Fixer" -DestinationPath "out/AlbumFixer-$version-win-x64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: albumfixer
+          path: out/*.zip
+
+  release:
+    if: needs.build.outputs.release == 'true'
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: albumfixer
+          path: out
+
+      # The notes link the exact upstream source of the bundled GPL-2.0 sacd_extract, as its license requires.
+      - name: Create GitHub release with the app
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.build.outputs.version }}
+        run: |
+          $notes = @'
+          Self-contained for 64-bit Windows: unzip and run `Album Fixer.exe`; no .NET installation is needed.
+
+          This ZIP bundles `sacd_extract` 0.3.9.3b (Windows x64 build 173), licensed under GPL-2.0. Its license is in `Tools/COPYING.sacd_extract.txt` and its provenance in `Tools/README.md`. The corresponding source is at https://github.com/EuFlo/sacd-ripper/tree/0.3.9.3b (release asset `sacd_extract-0.3.9.3-173-win64.zip` at https://github.com/EuFlo/sacd-ripper/releases/tag/0.3.9.3b).
+          '@
+          $options = @('--repo', $env:GITHUB_REPOSITORY, '--title', $env:TAG, '--verify-tag', '--notes', $notes, '--generate-notes')
+          if ($env:TAG.Contains('-')) {
+            $options += '--prerelease'
+          }
+          gh release create $env:TAG (Get-ChildItem out/*.zip).FullName @options

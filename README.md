@@ -57,7 +57,7 @@ The published application includes the pinned `sacd_extract` 0.3.9.3b Windows ex
 
 The WPF application uses MVVM. `MainViewModel` owns presentation state and exposes CommunityToolkit commands, while `MainWindow` contains only view-specific drag/drop and close-event adaptation. Dialogs, shell access, clipboard access, and the UI timer are behind injected interfaces.
 
-`App.xaml.cs` is the composition root. It builds the `Microsoft.Extensions.DependencyInjection` service provider, registers the core processing services and WPF adapters, resolves the main window, and disposes the graph when the application exits.
+`App.xaml.cs` is the composition root. It builds the `Microsoft.Extensions.DependencyInjection` service provider, registers logging, the core processing services and WPF adapters, resolves the main window, and disposes the graph when the application exits.
 
 ## Build and test
 
@@ -67,3 +67,9 @@ dotnet run --project tests\AlbumFixer.Core.SmokeTests\AlbumFixer.Core.SmokeTests
 ```
 
 The smoke suite covers FLAC+CUE classification, multi-album batch planning, partial preflight admission, bounded parallel execution and failure isolation, guarded legacy-output cleanup, repair-only precedence, verified local staging, real local splits with tags and embedded artwork, deterministic local metadata enrichment, terminal reports, and transactional commit behavior.
+
+`AlbumFixer.Local.slnx` builds against a WpfFoundation checkout next to this repository instead of the pinned package. CI (`.github/workflows/ci.yml`) builds, runs the smoke suite and publishes the self-contained `win-x64` ZIP on every push and pull request; see [AGENTS.md](AGENTS.md) for versioning and releases.
+
+## Logs and version
+
+The window title and every conversion report (`album_fixer_version`) show the Album Fixer version. Album Fixer also writes an application log in compact JSON under `%LOCALAPPDATA%\Album Fixer\Logs`, kept for 14 days: startup component checks, each album's scan, preflight, phases, terminal result and source disposition, and errors with their stack traces. **Open logs folder** on the Report tab opens it. The log complements the per-album reports; it doesn't replace them.

@@ -1,6 +1,7 @@
 using System.Windows;
 using AlbumFixer.Core;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace AlbumFixer.App;
 
@@ -12,6 +13,7 @@ public partial class App : Application
     {
         var services = new ServiceCollection();
 
+        services.AddAppLogging();
         services.AddSingleton<AlbumScanner>();
         services.AddSingleton<PreflightService>();
         services.AddSingleton<HostStagingService>();
@@ -36,6 +38,12 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
+        var logger = _services.GetRequiredService<ILogger<App>>();
+        logger.LogInformation("Starting Album Fixer {ApplicationVersion} on {OSVersion}", ApplicationVersion.Current, Environment.OSVersion);
+        DispatcherUnhandledException += (_, args) => logger.LogError(args.Exception, "Unhandled exception on the UI thread");
+        AppDomain.CurrentDomain.UnhandledException += (_, args) => logger.LogCritical(args.ExceptionObject as Exception, "Unhandled exception; Album Fixer is terminating");
+        TaskScheduler.UnobservedTaskException += (_, args) => logger.LogError(args.Exception, "Unobserved task exception");
+
         MainWindow = _services.GetRequiredService<MainWindow>();
         MainWindow.Show();
         await _services.GetRequiredService<MainViewModel>().InitializeAsync();
@@ -43,6 +51,7 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        _services.GetRequiredService<ILogger<App>>().LogInformation("Album Fixer exited with code {ExitCode}", e.ApplicationExitCode);
         _services.Dispose();
         base.OnExit(e);
     }

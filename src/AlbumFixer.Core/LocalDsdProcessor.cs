@@ -226,6 +226,7 @@ public sealed partial class LocalDsdProcessor
             ["source_type"] = "sacd_iso",
             ["workflow_mode"] = "sacd_iso_extract",
             ["generated_by"] = "Album Fixer deterministic SACD processor",
+            ["album_fixer_version"] = ApplicationVersion.Current,
             ["generated_at_utc"] = DateTimeOffset.UtcNow,
             ["source"] = new JsonObject
             {
