@@ -7,6 +7,7 @@
     <ResourceDictionary>
       <ResourceDictionary.MergedDictionaries>
         <ResourceDictionary Source="pack://application:,,,/WpfFoundation;component/Themes/WpfFoundation.xaml"/>
+        <ResourceDictionary Source="/Views/CheckRowTemplate.xaml"/>
       </ResourceDictionary.MergedDictionaries>
       <SolidColorBrush x:Key="Bg" Color="#0B1017"/>
       <SolidColorBrush x:Key="Panel" Color="#111923"/>

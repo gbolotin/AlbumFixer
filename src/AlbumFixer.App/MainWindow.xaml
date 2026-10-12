@@ -1,294 +1,95 @@
 <Window x:Class="AlbumFixer.App.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:core="clr-namespace:AlbumFixer.Core;assembly=AlbumFixer.Core"
-        xmlns:behaviors="clr-namespace:WpfFoundation.Behaviors;assembly=WpfFoundation"
-        Title="{Binding WindowTitle}" Width="1300" Height="840" MinWidth="1040" MinHeight="680"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:app="clr-namespace:AlbumFixer.App"
+        xmlns:views="clr-namespace:AlbumFixer.App.Views"
+        mc:Ignorable="d"
+        d:DataContext="{d:DesignInstance Type=app:MainViewModel}"
+        Title="{Binding WindowTitle}"
+        Width="1300"
+        Height="840"
+        MinWidth="1040"
+        MinHeight="680"
         Icon="Assets/AlbumFixer.ico"
-        Background="{StaticResource Bg}" WindowStartupLocation="CenterScreen" Closing="Window_Closing">
-  <Grid Background="{StaticResource Bg}"><Grid.RowDefinitions><RowDefinition Height="68"/><RowDefinition/></Grid.RowDefinitions>
-    <Border Background="#0E151D" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1"><Grid Margin="24,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><StackPanel Orientation="Horizontal" VerticalAlignment="Center"><Border Width="40" Height="40" CornerRadius="10" Background="{StaticResource MintDark}" Margin="0,0,13,0"><TextBlock Text="♫" Foreground="{StaticResource Mint}" FontSize="23" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><StackPanel VerticalAlignment="Center"><TextBlock Text="Album Fixer" FontWeight="SemiBold" FontSize="20"/><TextBlock Text="Verified library repair · every album is a transaction" Foreground="{StaticResource Muted}" FontSize="12"/></StackPanel></StackPanel><Border Grid.Column="1" Background="#17242D" CornerRadius="12" Padding="10,5" VerticalAlignment="Center"><TextBlock Text="ALBUM-FIXER SKILL" Foreground="{StaticResource Mint}" FontSize="10" FontWeight="Bold"/></Border></Grid></Border>
-    <Grid Grid.Row="1" Margin="20"><Grid.ColumnDefinitions><ColumnDefinition Width="360"/><ColumnDefinition Width="16"/><ColumnDefinition/></Grid.ColumnDefinitions>
-      <Border Style="{StaticResource CardStyle}">
-        <Grid>
-          <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-          </Grid.RowDefinitions>
-          <TextBlock Text="SOURCE FOLDERS" Foreground="{StaticResource Muted}" FontSize="10" FontWeight="Bold" Margin="0,0,0,9"/>
-          <Border Grid.Row="1" Background="#0E161F" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6" Padding="9" MinHeight="74"
-                  AllowDrop="True" IsEnabled="{Binding CanBrowse}" behaviors:FileDrop.Command="{Binding AddDroppedFoldersCommand}">
-            <Grid>
-              <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-              <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <ItemsControl ItemsSource="{Binding SourceFolders}">
-                  <ItemsControl.ItemTemplate>
-                    <DataTemplate>
-                      <Border BorderBrush="#253644" BorderThickness="0,0,0,1" Padding="0,4">
-                        <Grid>
-                          <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                          <TextBlock Text="{Binding}" ToolTip="{Binding}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                          <Button Grid.Column="1"
-                                  Command="{Binding DataContext.RemoveSourceFolderCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                                  CommandParameter="{Binding}"
-                                  Width="24" Height="24" Padding="4"
-                                  ToolTip="Remove source folder" AutomationProperties.Name="Remove source folder" Focusable="False">
-                            <Button.Style>
-                              <Style TargetType="Button">
-                                <Setter Property="Background" Value="Transparent"/>
-                                <Setter Property="BorderThickness" Value="0"/>
-                                <Setter Property="Cursor" Value="Hand"/>
-                                <Style.Triggers>
-                                  <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#3A1D22"/></Trigger>
-                                </Style.Triggers>
-                              </Style>
-                            </Button.Style>
-                            <Image Source="Assets/Remove.png" Width="16" Height="16" Stretch="Uniform" SnapsToDevicePixels="True"/>
-                          </Button>
-                        </Grid>
-                      </Border>
-                    </DataTemplate>
-                  </ItemsControl.ItemTemplate>
-                </ItemsControl>
-              </ScrollViewer>
-              <TextBlock Grid.Row="1" Text="Browse or drag album / parent folders here. Each is scanned recursively."
-                         Foreground="{StaticResource Muted}" FontSize="10" Margin="0,7,0,0" TextWrapping="Wrap"/>
-            </Grid>
+        Background="{StaticResource Bg}"
+        WindowStartupLocation="CenterScreen"
+        Closing="Window_Closing">
+  <Window.Resources>
+    <DataTemplate DataType="{x:Type app:InventoryViewModel}"><views:InventoryView /></DataTemplate>
+    <DataTemplate DataType="{x:Type app:ReportViewModel}"><views:ReportView /></DataTemplate>
+    <DataTemplate DataType="{x:Type app:ActivityViewModel}"><views:ActivityView /></DataTemplate>
+  </Window.Resources>
+  <Grid Background="{StaticResource Bg}">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="68" />
+      <RowDefinition />
+    </Grid.RowDefinitions>
+    <Border Background="#0E151D" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1">
+      <Grid Margin="24,0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <Border Width="40"
+                  Height="40"
+                  CornerRadius="10"
+                  Background="{StaticResource MintDark}"
+                  Margin="0,0,13,0">
+            <TextBlock Text="♫"
+                       Foreground="{StaticResource Mint}"
+                       FontSize="23"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center" />
           </Border>
-          <Grid Grid.Row="2" Margin="0,9,0,0">
-            <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-            <Button Content="+ Add" Command="{Binding BrowseCommand}" Style="{StaticResource ButtonStyle}" Padding="11,8"/>
-            <Button Grid.Column="1" Content="Clear" Command="{Binding ClearSourceFoldersCommand}" Style="{StaticResource ButtonStyle}" Margin="7,0,0,0" Padding="11,8"/>
-          </Grid>
-          <Button Grid.Row="3" Content="Scan albums" Command="{Binding ScanCommand}" Style="{StaticResource ButtonStyle}" Margin="0,9,0,0"/>
-          <Border Grid.Row="4" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Margin="0,15,0,0" Padding="0,13,0,0">
-            <StackPanel>
-              <TextBlock Text="{Binding AlbumName}" FontSize="16" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-              <TextBlock Text="{Binding Workflow}" Foreground="{StaticResource Mint}" Margin="0,3,0,0"/>
-              <TextBlock Text="{Binding Inventory}" Foreground="{StaticResource Muted}" Margin="0,7,0,0"/>
-              <TextBlock Text="{Binding SourceSize, StringFormat=Source material: {0}}" Foreground="{StaticResource Muted}"/>
-            </StackPanel>
-          </Border>
-          <StackPanel Grid.Row="5" Margin="0,15,0,0">
-            <CheckBox Content="Recheck completed albums" IsChecked="{Binding RecheckCompletedAlbums, Mode=TwoWay}" IsEnabled="{Binding CanBrowse}"
-                      Foreground="{StaticResource Text}" FontWeight="SemiBold"
-                      ToolTip="Ignore only the previous report's completion status. Read current tags and embedded artwork again, repair missing values only, and preserve existing nonempty tags and artwork. Run Scan albums after changing this option."/>
-            <TextBlock Text="Valid tags and artwork stay untouched; only genuine gaps are repaired."
-                       Foreground="{StaticResource Muted}" FontSize="10" Margin="20,3,0,0" TextWrapping="Wrap"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Text="Album Fixer" FontWeight="SemiBold" FontSize="20" />
+            <TextBlock Text="Verified library repair · every album is a transaction"
+                       Foreground="{StaticResource Muted}"
+                       FontSize="12" />
           </StackPanel>
-          <CheckBox Grid.Row="6" Content="Delete originals" IsChecked="{Binding DeleteOriginals, Mode=TwoWay}" IsEnabled="{Binding CanBrowse}"
-                    Margin="0,12,0,0" Foreground="{StaticResource Text}" FontWeight="SemiBold"
-                    ToolTip="When selected, eligible single-image originals are deleted only after final verification. Clear this option to retain every original."/>
-          <Button Grid.Row="7" Margin="0,10,0,0" VerticalAlignment="Center">
-            <Button.Resources>
-              <DataTemplate x:Key="StartButtonContentTemplate">
-                <StackPanel Orientation="Horizontal">
-                  <Path Data="M 2,1 L 13,7.5 L 2,14 Z" Width="14" Height="14" Stretch="Uniform" Margin="0,0,8,0"
-                        Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
-                  <TextBlock Text="{Binding}" VerticalAlignment="Center"
-                             Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
-                </StackPanel>
-              </DataTemplate>
-              <DataTemplate x:Key="CancelButtonContentTemplate">
-                <StackPanel Orientation="Horizontal">
-                  <Path Data="M 2,2 L 13,13 M 13,2 L 2,13" Width="14" Height="14" Stretch="Uniform" Margin="0,0,8,0"
-                        Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2.25"
-                        StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-                  <TextBlock Text="{Binding}" VerticalAlignment="Center"
-                             Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
-                </StackPanel>
-              </DataTemplate>
-            </Button.Resources>
-            <Button.Style>
-              <Style TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
-                <Setter Property="Content" Value="Start"/>
-                <Setter Property="ContentTemplate" Value="{StaticResource StartButtonContentTemplate}"/>
-                <Setter Property="Command" Value="{Binding StartCommand}"/>
-                <Setter Property="AutomationProperties.Name" Value="Start"/>
-                <Style.Triggers>
-                  <DataTrigger Binding="{Binding IsRunActive}" Value="True">
-                    <Setter Property="Content" Value="Cancel"/>
-                    <Setter Property="ContentTemplate" Value="{StaticResource CancelButtonContentTemplate}"/>
-                    <Setter Property="Command" Value="{Binding CancelCommand}"/>
-                    <Setter Property="AutomationProperties.Name" Value="Cancel"/>
-                    <Setter Property="Background" Value="{StaticResource Red}"/>
-                    <Setter Property="Foreground" Value="#2A0808"/>
-                  </DataTrigger>
-                </Style.Triggers>
-              </Style>
-            </Button.Style>
-          </Button>
-        </Grid>
-      </Border>
-      <Grid Grid.Column="2"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="13"/><RowDefinition/></Grid.RowDefinitions>
-        <Border Style="{StaticResource CardStyle}" Padding="22">
-          <Grid>
-            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-            <Grid.ColumnDefinitions><ColumnDefinition Width="96"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-            <Border Width="76" Height="76" CornerRadius="38" Background="{StaticResource MintDark}">
-              <StackPanel VerticalAlignment="Center">
-                <TextBlock Text="{Binding Progress, Mode=OneWay, StringFormat={}{0:0}%}" Foreground="{StaticResource Mint}" FontSize="21" FontWeight="Bold" HorizontalAlignment="Center"/>
-                <TextBlock Text="PROGRESS" Foreground="{StaticResource Muted}" FontSize="8" HorizontalAlignment="Center"/>
-              </StackPanel>
-            </Border>
-            <StackPanel Grid.Column="1" VerticalAlignment="Center">
-              <TextBlock Text="{Binding StatusTitle}" FontSize="21" FontWeight="SemiBold"/>
-              <TextBlock Text="{Binding StatusDetail}"
-                         Foreground="{StaticResource Muted}"
-                         FontSize="12"
-                         Height="34"
-                         LineHeight="17"
-                         LineStackingStrategy="BlockLineHeight"
-                         TextWrapping="Wrap"
-                         TextTrimming="CharacterEllipsis"
-                         Margin="0,4,0,5"/>
-              <TextBlock Text="{Binding ProgressTime}" Foreground="{StaticResource Muted}" FontSize="11"/>
-            </StackPanel>
-            <StackPanel Grid.Column="2" MinWidth="112" Margin="22,0,0,0" VerticalAlignment="Center">
-              <Button Content="{Binding RetryFailedButtonLabel}"
-                      Command="{Binding RetryFailedCommand}"
-                      AutomationProperties.Name="Retry failed albums"
-                      ToolTip="Freshly rescan and preflight only albums that failed in the previous run, then retry only those that pass."
-                      Margin="0">
-                <Button.Style>
-                  <Style TargetType="Button" BasedOn="{StaticResource ButtonStyle}">
-                    <Setter Property="Visibility" Value="Collapsed"/>
-                    <Style.Triggers>
-                      <DataTrigger Binding="{Binding HasRetryFailures}" Value="True">
-                        <Setter Property="Visibility" Value="Visible"/>
-                      </DataTrigger>
-                      <DataTrigger Binding="{Binding IsRunActive}" Value="True">
-                        <Setter Property="Visibility" Value="Collapsed"/>
-                      </DataTrigger>
-                    </Style.Triggers>
-                  </Style>
-                </Button.Style>
-              </Button>
-            </StackPanel>
-            <ProgressBar Grid.Row="1" Grid.ColumnSpan="3"
-                         Value="{Binding Progress, Mode=OneWay}" Maximum="100" Height="7" Margin="0,9,0,0"/>
-          </Grid>
+        </StackPanel>
+        <Border Grid.Column="1"
+                Background="#17242D"
+                CornerRadius="12"
+                Padding="10,5"
+                VerticalAlignment="Center">
+          <TextBlock Text="ALBUM-FIXER SKILL"
+                     Foreground="{StaticResource Mint}"
+                     FontSize="10"
+                     FontWeight="Bold" />
         </Border>
-        <Border Grid.Row="2" Style="{StaticResource CardStyle}" Padding="0"><TabControl Background="Transparent" BorderThickness="0">
-          <TabControl.Resources>
-            <DataTemplate x:Key="StatusRowTemplate">
-              <Grid Margin="0,0,0,10">
-                <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                <StackPanel>
-                  <Grid>
-                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Visibility="{Binding AlbumNameTextVisibility}"/>
-                    <Button x:Name="AlbumNameLink"
-                            Content="{Binding Name}"
-                            Command="{Binding DataContext.OpenAlbumFolderCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                            CommandParameter="{Binding AlbumFolderPath}"
-                            Visibility="{Binding AlbumNameLinkVisibility}" HorizontalAlignment="Left" ToolTip="Open album folder in File Explorer">
-                      <Button.Style>
-                        <Style TargetType="Button">
-                          <Setter Property="Background" Value="Transparent"/>
-                          <Setter Property="Foreground" Value="{StaticResource Mint}"/>
-                          <Setter Property="BorderThickness" Value="0"/>
-                          <Setter Property="Padding" Value="0"/>
-                          <Setter Property="FontWeight" Value="SemiBold"/>
-                          <Setter Property="Cursor" Value="Hand"/>
-                          <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><ContentPresenter/></ControlTemplate></Setter.Value></Setter>
-                          <Style.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter Property="TextBlock.TextDecorations" Value="Underline"/></Trigger></Style.Triggers>
-                        </Style>
-                      </Button.Style>
-                    </Button>
-                  </Grid>
-                  <TextBlock Text="{Binding Detail}" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,2,10,0"/>
-                </StackPanel>
-                <Border Grid.Column="1" CornerRadius="8" Padding="8,3" VerticalAlignment="Top">
-                  <Border.Style>
-                    <Style TargetType="Border">
-                      <Setter Property="Background" Value="#0F1A21"/>
-                      <Style.Triggers>
-                        <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Warning}"><Setter Property="Background" Value="#3A2B16"/></DataTrigger>
-                        <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Failed}"><Setter Property="Background" Value="#3A1D22"/></DataTrigger>
-                      </Style.Triggers>
-                    </Style>
-                  </Border.Style>
-                  <TextBlock Text="{Binding State}" FontSize="9" FontWeight="Bold">
-                    <TextBlock.Style>
-                      <Style TargetType="TextBlock">
-                        <Setter Property="Foreground" Value="{StaticResource Mint}"/>
-                        <Style.Triggers>
-                          <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Warning}"><Setter Property="Foreground" Value="{StaticResource Amber}"/></DataTrigger>
-                          <DataTrigger Binding="{Binding RawState}" Value="{x:Static core:CheckState.Failed}"><Setter Property="Foreground" Value="{StaticResource Red}"/></DataTrigger>
-                        </Style.Triggers>
-                      </Style>
-                    </TextBlock.Style>
-                  </TextBlock>
-                </Border>
-              </Grid>
-            </DataTemplate>
-          </TabControl.Resources>
-          <TabItem Header="Albums">
-            <Grid Margin="16">
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
-              <TextBlock Text="Albums" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,12"/>
-              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <ItemsControl ItemsSource="{Binding Albums}" ItemTemplate="{StaticResource StatusRowTemplate}"/>
-              </ScrollViewer>
-            </Grid>
-          </TabItem>
-          <TabItem Header="Preflight">
-            <Grid Margin="16">
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
-              <TextBlock Text="Preflight checks" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,12"/>
-              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <ItemsControl ItemsSource="{Binding PreflightChecks}" ItemTemplate="{StaticResource StatusRowTemplate}"/>
-              </ScrollViewer>
-            </Grid>
-          </TabItem>
-          <TabItem Header="Inventory">
-            <Grid Margin="16">
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions>
-              <TextBlock Text="Detected media and preserved sidecars" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,12"/>
-              <Grid Grid.Row="1" Margin="0,0,0,4">
-                <Grid.ColumnDefinitions><ColumnDefinition Width="3*"/><ColumnDefinition Width="1.15*"/><ColumnDefinition Width="90"/><ColumnDefinition Width="2*"/></Grid.ColumnDefinitions>
-                <TextBlock Text="FILE" Foreground="{StaticResource Muted}" FontSize="9" FontWeight="Bold"/>
-                <TextBlock Grid.Column="1" Text="TYPE" Foreground="{StaticResource Muted}" FontSize="9" FontWeight="Bold" Margin="14,0,0,0"/>
-                <TextBlock Grid.Column="2" Text="SIZE" Foreground="{StaticResource Muted}" FontSize="9" FontWeight="Bold" Margin="14,0,0,0"/>
-                <TextBlock Grid.Column="3" Text="DETAIL" Foreground="{StaticResource Muted}" FontSize="9" FontWeight="Bold" Margin="14,0,0,0"/>
-              </Grid>
-              <ListBox Grid.Row="2" ItemsSource="{Binding Media}" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                <ListBox.ItemTemplate>
-                  <DataTemplate>
-                    <Border BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1" Padding="0,9">
-                      <Grid>
-                        <Grid.ColumnDefinitions><ColumnDefinition Width="3*"/><ColumnDefinition Width="1.15*"/><ColumnDefinition Width="90"/><ColumnDefinition Width="2*"/></Grid.ColumnDefinitions>
-                        <TextBlock Text="{Binding Path}" ToolTip="{Binding Path}" TextTrimming="CharacterEllipsis"/>
-                        <TextBlock Grid.Column="1" Text="{Binding Kind}" Foreground="{StaticResource Mint}" Margin="14,0,0,0" TextTrimming="CharacterEllipsis"/>
-                        <TextBlock Grid.Column="2" Text="{Binding Size}" Foreground="{StaticResource Muted}" Margin="14,0,0,0"/>
-                        <TextBlock Grid.Column="3" Text="{Binding Note}" Foreground="{StaticResource Muted}" Margin="14,0,0,0" TextWrapping="Wrap"/>
-                      </Grid>
-                    </Border>
-                  </DataTemplate>
-                </ListBox.ItemTemplate>
-              </ListBox>
-            </Grid>
-          </TabItem>
-          <TabItem Header="Report"><Grid Margin="16"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions><Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><StackPanel><TextBlock Text="{Binding ReportHeadline}" FontSize="17" FontWeight="SemiBold"/><TextBlock Text="{Binding ReportDetail}" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,3,16,0"/></StackPanel><Button Grid.Column="1" Content="Refresh" Command="{Binding RefreshReportCommand}" Style="{StaticResource ButtonStyle}" Padding="11,7" Margin="0,0,7,0"/><Button Grid.Column="2" Content="Copy JSON" Command="{Binding CopyReportCommand}" Style="{StaticResource ButtonStyle}" Padding="11,7"/><TextBlock Grid.Column="3" VerticalAlignment="Center" Margin="12,0,0,0"><Hyperlink Command="{Binding OpenLogsFolderCommand}" ToolTip="{Binding LogsFolder}" Foreground="{StaticResource Mint}">Open logs folder</Hyperlink></TextBlock></Grid><StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,13"><Border Background="#101923" CornerRadius="7" Padding="10,6" Margin="0,0,7,0"><TextBlock Text="{Binding ReportStatus, StringFormat=Status  {0}}"/></Border><Border Background="#101923" CornerRadius="7" Padding="10,6" Margin="0,0,7,0"><TextBlock Text="{Binding ReportTracks, StringFormat=Tracks  {0}}"/></Border><Border Background="#101923" CornerRadius="7" Padding="10,6" Margin="0,0,7,0"><TextBlock Text="{Binding ReportSections, StringFormat=Discs / areas  {0}}"/></Border><Border Background="#101923" CornerRadius="7" Padding="10,6"><TextBlock Text="{Binding ReportDisposition, StringFormat=Originals  {0}}"/></Border></StackPanel><TextBox Grid.Row="2" Text="{Binding ReportJson, Mode=OneWay}" IsReadOnly="True" FontFamily="Cascadia Mono, Consolas" FontSize="11" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/></Grid></TabItem>
-          <TabItem Header="Activity"><Grid Margin="16"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/></Grid.RowDefinitions><TextBlock Text="Live activity" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,10"/><ListBox Grid.Row="1" ItemsSource="{Binding Activity}"><ListBox.ItemTemplate><DataTemplate><Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="72"/><ColumnDefinition Width="80"/><ColumnDefinition/></Grid.ColumnDefinitions><TextBlock Text="{Binding Time}" Foreground="{StaticResource Muted}" FontFamily="Consolas"/><TextBlock Grid.Column="1" Text="{Binding Kind}" FontSize="10" FontWeight="Bold">
-  <TextBlock.Style>
-    <Style TargetType="TextBlock">
-      <Setter Property="Foreground" Value="{StaticResource Mint}"/>
-      <Style.Triggers>
-        <DataTrigger Binding="{Binding Kind}" Value="NOTICE"><Setter Property="Foreground" Value="{StaticResource Muted}"/></DataTrigger>
-        <DataTrigger Binding="{Binding Kind}" Value="WARNING"><Setter Property="Foreground" Value="{StaticResource Amber}"/></DataTrigger>
-        <DataTrigger Binding="{Binding Kind}" Value="ERROR"><Setter Property="Foreground" Value="{StaticResource Red}"/></DataTrigger>
-      </Style.Triggers>
-    </Style>
-  </TextBlock.Style>
-</TextBlock><TextBlock Grid.Column="2" Text="{Binding Message}" TextWrapping="Wrap"/></Grid></DataTemplate></ListBox.ItemTemplate></ListBox></Grid></TabItem>
-        </TabControl></Border>
+      </Grid>
+    </Border>
+    <Grid Grid.Row="1" Margin="20">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="360" />
+        <ColumnDefinition Width="16" />
+        <ColumnDefinition />
+      </Grid.ColumnDefinitions>
+      <views:SourcesView />
+      <Grid Grid.Column="2">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto" />
+          <RowDefinition Height="13" />
+          <RowDefinition />
+        </Grid.RowDefinitions>
+        <views:RunStatusView />
+        <Border Grid.Row="2" Style="{StaticResource CardStyle}" Padding="0">
+          <TabControl Background="Transparent" BorderThickness="0">
+            <TabItem Header="Albums">
+              <views:AlbumsView />
+            </TabItem>
+            <TabItem Header="Preflight">
+              <views:PreflightView />
+            </TabItem>
+            <TabItem Header="Inventory" Content="{Binding MediaInventory}" />
+            <TabItem Header="Report" Content="{Binding Report}" />
+            <TabItem Header="Activity" Content="{Binding Activity}" />
+          </TabControl>
+        </Border>
       </Grid>
     </Grid>
   </Grid>
