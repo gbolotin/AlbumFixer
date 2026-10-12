@@ -4,6 +4,7 @@ using System.Text.Json;
 using AlbumFixer.Core;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using Microsoft.Extensions.Logging;
 
 namespace AlbumFixer.App;
 
@@ -20,6 +21,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly StartupPrerequisiteService startupPrerequisites;
     private readonly IUserInteractionService _userInteraction;
     private readonly IUiTimer _progressTimer;
+    private readonly ILogger<MainViewModel> _logger;
     private readonly CancellationTokenSource lifetimeCancellation = new();
     private CancellationTokenSource? _cancel;
     private ScanResult? _scan;
@@ -72,7 +74,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         HostCommitService commit,
         StartupPrerequisiteService startupPrerequisites,
         IUserInteractionService userInteraction,
-        IUiTimer progressTimer)
+        IUiTimer progressTimer,
+        ILogger<MainViewModel> logger)
     {
         _scanner = scanner;
         _preflightService = preflightService;
@@ -85,6 +88,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         this.startupPrerequisites = startupPrerequisites;
         _userInteraction = userInteraction;
         _progressTimer = progressTimer;
+        _logger = logger;
 
         _progressTimer.Tick += ProgressTimer_Tick;
 
@@ -98,6 +102,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         RefreshReportCommand = new AsyncRelayCommand(LoadReportAsync, () => !Busy && SourceFolders.Count > 0);
         ClearSourceFoldersCommand = new RelayCommand(ClearSourceFolders, () => CanBrowse && SourceFolders.Count > 0);
         CopyReportCommand = new RelayCommand(CopyReport, () => ReportJson.Length > 0);
+        OpenLogsFolderCommand = new RelayCommand(AppLogging.OpenLogsFolder);
 
         var titles = new[] { "Inventoried", "Preparing source", "Source size checked", "Split / extract", "Tagging", "Local verification", "Copying back", "Destination sizes", "Final commit", "Final verification", "Source disposition", "Cleanup" };
         for (var i = 0; i < titles.Length; i++) Timeline.Add(new() { Number = i + 1, Phase = (JobPhase)(i + 1), Title = titles[i] });
@@ -120,6 +125,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public IAsyncRelayCommand RefreshReportCommand { get; }
     public IRelayCommand ClearSourceFoldersCommand { get; }
     public IRelayCommand CopyReportCommand { get; }
+    public IRelayCommand OpenLogsFolderCommand { get; }
+
+    /// <summary>The window title with the version, for example "Album Fixer 0.1.0-dev".</summary>
+    public string WindowTitle => $"Album Fixer {ApplicationVersion.Current}";
+    public string LogsFolder => AppLogging.LogsFolder;
 
     public int SourceFolderCount => SourceFolders.Count;
     public string? BrowseInitialDirectory => SourceFolders.LastOrDefault();
@@ -288,6 +298,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         catch (Exception error)
         {
+            _logger.LogError(error, "Startup component check failed");
             StatusTitle = "Component check failed";
             StatusDetail = error.Message;
             Log("COMPONENT", error.Message);
@@ -465,6 +476,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 .GroupBy(scan => scan.AlbumRoot, StringComparer.OrdinalIgnoreCase)
                 .Select(group => group.First())
                 .ToArray();
+            foreach (var scan in discoveredScans)
+                _logger.LogInformation("Album {AlbumName} scanned: {WorkflowMode}, RequiresProcessing={RequiresProcessing}, {SourceBytes} source bytes, {WarningCount} warnings, {ErrorCount} errors; root {AlbumRoot}",
+                    scan.AlbumName, scan.Mode, scan.RequiresProcessing, scan.SourceBytes, scan.Warnings.Count, scan.Errors.Count, scan.AlbumRoot);
             var completedScans = discoveredScans.Where(scan => !scan.RequiresProcessing).ToArray();
             _scans = discoveredScans.Where(scan => scan.RequiresProcessing).ToArray();
             var firstRootScan = sourceScans[0].RootScan;
@@ -519,6 +533,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _albumPreflights = preflightLoad.Albums;
             _previousOutputFileCount = preflightLoad.PreviousOutputFileCount;
             _preflight = PreflightService.CombineBatch(_albumPreflights);
+            foreach (var album in _albumPreflights)
+                _logger.Log(album.CanStart ? LogLevel.Information : LogLevel.Warning,
+                    "Album {AlbumName} preflight: CanStart={CanStart}; blockers {Blockers}",
+                    album.Scan.AlbumName, album.CanStart, album.Blockers.Select(check => $"{check.Name}: {check.Detail}").ToArray());
             _albumCheckRows.Clear();
             _activeAlbumActivity.Clear();
             _albumActivitySequence = 0;
@@ -558,7 +576,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 StatusDetail += $" {completedScans.Length} already completed album{S(completedScans.Length)} skipped.";
             Log(_preflight.CanStart ? "READY" : "BLOCKED", StatusDetail); await LoadReportAsync();
         }
-        catch (Exception error) { _scan = null; _scans = []; _albumPreflights = []; _preflight = null; _previousOutputFileCount = 0; _albumCheckRows.Clear(); PreflightChecks.Clear(); Albums.Clear(); StatusTitle = "Could not inventory this folder"; StatusDetail = error.Message; Log("ERROR", error.Message); }
+        catch (Exception error) { _scan = null; _scans = []; _albumPreflights = []; _preflight = null; _previousOutputFileCount = 0; _albumCheckRows.Clear(); PreflightChecks.Clear(); Albums.Clear(); _logger.LogError(error, "Inventory failed"); StatusTitle = "Could not inventory this folder"; StatusDetail = error.Message; Log("ERROR", error.Message); }
         finally
         {
             _progressTimer.Stop();
@@ -770,6 +788,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         catch (Exception error)
         {
+            _logger.LogError(error, "Failed-album refresh failed");
             SetRetryFailures(failures.Select(item => new KeyValuePair<string, int>(item.Root, item.Index)));
             StatusTitle = "Could not refresh failed albums";
             StatusDetail = error.Message;
@@ -918,6 +937,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         catch (Exception error)
         {
+            _logger.LogError(error, "The run failed");
             Apply(new(JobPhase.Failed, (int)Progress, "failed", error.Message, DateTimeOffset.UtcNow)); Log("ERROR", error.Message);
             if (!retryOnly && _scans.Count == 1) await EnsureTerminalReportAsync(false);
             await LoadReportAsync();
@@ -981,6 +1001,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 Report(new(JobPhase.CleanupCompleted, 100, "already_completed", detail, DateTimeOffset.UtcNow));
                 return new(jobDirectory, completed.ReportPath, 0, false, false, AlreadyCompleted: true);
             }
+            _logger.LogInformation("Album {AlbumName} started: {WorkflowMode}, {SourceBytes} source bytes, {ImageCount} images, {TrackCount} tracks, {CueCount} CUE; DeleteOriginals={DeleteOriginals}; root {AlbumRoot}",
+                scan.AlbumName, refreshedScan.Mode, refreshedScan.SourceBytes, refreshedScan.ImageCount, refreshedScan.TrackCount, refreshedScan.CueCount, deleteOriginals, scan.AlbumRoot);
             if (!SameSourceInventory(scan, refreshedScan))
                 throw new IOException("The album source inventory changed after preflight. No files were changed; scan again before retrying.");
             scan = refreshedScan;
@@ -1063,11 +1085,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 var commitStaged = staged with { PipelineTelemetry = pipeline.Telemetry };
                 return _commit.CommitAsync(scan, commitStaged, progress, deleteOriginals, ct);
             }, token);
+            _logger.LogInformation(
+                "Album {AlbumName} committed: {Tracks} tracks; Incomplete={Incomplete} ({IncompleteKind}); source {SourceDisposition}; report {ReportPath}",
+                scan.AlbumName, committed.Tracks, committed.Incomplete, committed.IncompleteKind,
+                committed.SourcesDeleted ? "deleted after verification" : "retained", committed.ReportPath);
             return new(jobDirectory, committed.ReportPath, committed.Tracks, committed.SourcesDeleted,
                 committed.Incomplete, IncompleteKind: committed.IncompleteKind);
         }
         catch (OperationCanceledException error)
         {
+            _logger.LogWarning("Album {AlbumName} canceled at {Phase}; source retained", scan.AlbumName, last.Phase);
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: new(JobPhase.Canceled, last.Percent, "canceled", error.Message, DateTimeOffset.UtcNow)));
             if (transactionLock is not null)
                 await EnsureAlbumTerminalReportAsync(scan, runPreflight, jobDirectory, last with { Detail = error.Message }, true, uiUpdates, index, albumIndex);
@@ -1075,6 +1102,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         catch (Exception error)
         {
+            _logger.LogError(error, "Album {AlbumName} failed at {Phase}; source retained", scan.AlbumName, last.Phase);
             uiUpdates.Report(new(index, albumIndex, scan.AlbumName, Progress: new(JobPhase.Failed, last.Percent, "failed", error.Message, DateTimeOffset.UtcNow)));
             if (transactionLock is not null)
                 await EnsureAlbumTerminalReportAsync(scan, runPreflight, jobDirectory, last with { Detail = error.Message }, false, uiUpdates, index, albumIndex,
@@ -1116,6 +1144,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Log(update.Kind, $"[{update.AlbumName}] {update.Message}");
         }
         if (update.Progress is null) return;
+        if (!_jobProgress.TryGetValue(update.Index, out var previous) || previous.Phase != update.Progress.Phase || previous.Status != update.Progress.Status)
+            _logger.Log(update.Progress.Phase switch { JobPhase.Failed => LogLevel.Error, JobPhase.Canceled => LogLevel.Warning, _ => LogLevel.Information },
+                "Album {AlbumName} reached {Phase} ({Status}, {Percent}%): {Detail}",
+                update.AlbumName, update.Progress.Phase, update.Progress.Status, update.Progress.Percent, update.Progress.Detail);
         _jobProgress[update.Index] = update.Progress;
         if (_albumCheckRows.TryGetValue(update.AlbumIndex, out var albumRow))
             albumRow.PresentAlbumState(AlbumStateFor(update.Progress), update.Progress.Detail,
@@ -1271,6 +1303,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var report = new
         {
             schema_version = "1.0",
+            album_fixer_version = ApplicationVersion.Current,
             workflow_mode = retryOnly ? "retry_failed_album_batch" : "parallel_album_batch",
             retry_failed_only = retryOnly,
             source_folders = SourceFolders.ToArray(),
@@ -1605,10 +1638,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
     private void Log(string kind, string message)
     {
+        _logger.Log(LogLevelFor(kind), "{ActivityKind}: {ActivityMessage}", kind, message);
         Activity.Insert(0, new(DateTime.Now.ToString("HH:mm:ss"), kind, message.ReplaceLineEndings(" ")));
         while (Activity.Count > 250)
             Activity.RemoveAt(Activity.Count - 1);
     }
+    private static LogLevel LogLevelFor(string kind) => kind switch
+    {
+        "ERROR" => LogLevel.Error,
+        "COMPONENT" or "BLOCKED" or "CANCELED" or "CANCEL" or "INCOMPLETE" => LogLevel.Warning,
+        _ => LogLevel.Information
+    };
     private static void Replace<T>(RangeObservableCollection<T> target, IEnumerable<T> items) => target.ReplaceAll(items);
     private static string S(int count) => count == 1 ? "" : "s";
     private static string PhaseTitle(JobPhase phase) => phase switch { JobPhase.Inventoried => "Inventory complete", JobPhase.CopyingIn => "Preparing the source…", JobPhase.SourceCopyVerified => "Source verified", JobPhase.Processing => "Splitting or extracting…", JobPhase.Tagging => "Writing metadata and artwork…", JobPhase.LocalVerificationPassed => "Local verification passed", JobPhase.CopyingBack => "Copying verified output back…", JobPhase.DestinationSizesVerified => "Destination-side sizes verified", JobPhase.FinalCommit => "Committing final files…", JobPhase.FinalVerificationPassed => "Final-path verification passed", JobPhase.SourceDisposition => "Recording source disposition…", JobPhase.CleanupCompleted => "Album completed", JobPhase.Failed => "Run stopped safely", JobPhase.Canceled => "Run canceled", _ => "Preparing the job…" };

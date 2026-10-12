@@ -1,4 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><RootNamespace>AlbumFixer.Core</RootNamespace></PropertyGroup>
-  <ItemGroup><PackageReference Include="TagLibSharp" Version="2.3.0" /></ItemGroup>
+  <ItemGroup><PackageReference Include="TagLibSharp" /></ItemGroup>
 </Project>

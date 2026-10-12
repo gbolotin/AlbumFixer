@@ -553,6 +553,7 @@ public sealed partial class LocalTrackRepairProcessor
             ["source_type"] = $"existing_{format}_tracks",
             ["workflow_mode"] = "existing_track_repair",
             ["generated_by"] = "Album Fixer deterministic existing-track repair processor",
+            ["album_fixer_version"] = ApplicationVersion.Current,
             ["generated_at_utc"] = DateTimeOffset.UtcNow,
             ["metadata_sources"] = new JsonArray(evidence.Select(value => JsonValue.Create(value)).ToArray()),
             ["sources"] = new JsonArray(scan.Media

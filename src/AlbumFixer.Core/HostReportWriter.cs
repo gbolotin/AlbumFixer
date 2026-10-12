@@ -35,6 +35,7 @@ public static class HostReportWriter
             workflow_mode = WorkflowId(scan),
             album_root = scan.AlbumRoot,
             generated_by = "Album Fixer host fallback",
+            album_fixer_version = ApplicationVersion.Current,
             generated_at_utc = now,
             sources = scan.Media.Select(item => new
             {

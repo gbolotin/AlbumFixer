@@ -481,6 +481,7 @@ public sealed class LocalFlacProcessor
             ["source_type"] = sourceType,
             ["workflow_mode"] = workflowId,
             ["generated_by"] = "Album Fixer deterministic local processor",
+            ["album_fixer_version"] = ApplicationVersion.Current,
             ["generated_at_utc"] = DateTimeOffset.UtcNow,
             ["metadata_sources"] = new JsonArray("local CUE, album folder, rip sidecars, and local artwork"),
             ["discs"] = discReports,
