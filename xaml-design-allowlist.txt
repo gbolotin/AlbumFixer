@@ -1,0 +1,6 @@
+# Exceptions to the XAML design check (WpfFoundation tools/XamlDesignCheck), one per line:
+#   path | rule | attribute as written | reason
+# Rules: color, spacing, typography, corner-radius. A path ending in / covers a folder, and * matches any rule or attribute.
+# Every entry needs a reason. An entry that no longer matches anything fails the check, so remove it when you fix the XAML.
+
+src/AlbumFixer.App/Views/ReportView.xaml | typography | FontFamily="Cascadia Mono, Consolas" | The report JSON is shown monospaced so its indentation lines up, as WpfFoundation's own code samples are.

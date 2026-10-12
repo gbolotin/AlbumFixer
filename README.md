@@ -75,3 +75,7 @@ The smoke suite covers FLAC+CUE classification, multi-album batch planning, part
 ## Logs and version
 
 The window title and every conversion report (`album_fixer_version`) show the Album Fixer version. Album Fixer also writes an application log in compact JSON under `%LOCALAPPDATA%\Album Fixer\Logs`, kept for 14 days: startup component checks, each album's scan, preflight, phases, terminal result and source disposition, and errors with their stack traces. **Open logs folder** on the Report tab opens it. The log complements the per-album reports; it doesn't replace them.
+
+## Theme
+
+Album Fixer uses the Windows Fluent theme. **Theme** in the header switches between System (follows Windows), Light and Dark; the choice is remembered in `%LOCALAPPDATA%\Album Fixer\settings.json`. High contrast follows Windows.

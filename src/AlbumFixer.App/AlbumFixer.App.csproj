@@ -31,7 +31,6 @@
   <ItemGroup>
     <ProjectReference Include="..\AlbumFixer.Core\AlbumFixer.Core.csproj" />
     <Resource Include="Assets\AlbumFixer.ico" />
-    <Resource Include="Assets\Remove.png" />
     <None Update="Tools\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
