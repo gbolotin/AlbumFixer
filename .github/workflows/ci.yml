@@ -26,10 +26,8 @@ jobs:
           global-json-file: global.json
 
       # Shared with WpfFoundation; pinned to a commit so a change there can't break this build unannounced.
-      # Report-only until the theme slice moves the window onto Fluent resources: findings show in the log
-      # without failing the build. Justified exceptions go in xaml-design-allowlist.txt with a reason.
-      - name: XAML design check (report only)
-        continue-on-error: true
+      # A finding fails the build; justified exceptions go in xaml-design-allowlist.txt with a reason.
+      - name: XAML design check
         uses: gbolotin/WpfFoundation/.github/actions/xaml-design-check@222e37c4082b438e717820cec5c0545504931c79
 
       # A vX.Y.Z tag builds and releases version X.Y.Z. Every other build is <VersionPrefix>-ci.<run number>.

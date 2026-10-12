@@ -20,6 +20,7 @@
        Only that solution lists the library project. -p:UseLocalWpfFoundation=true|false overrides. -->
   <PropertyGroup>
     <WpfFoundationProject>$(MSBuildThisFileDirectory)..\WpfFoundation\src\WpfFoundation\WpfFoundation.csproj</WpfFoundationProject>
+    <WpfFoundationNotificationsProject>$(MSBuildThisFileDirectory)..\WpfFoundation\src\WpfFoundation.Notifications\WpfFoundation.Notifications.csproj</WpfFoundationNotificationsProject>
     <UseLocalWpfFoundation Condition="'$(UseLocalWpfFoundation)' == '' and '$(SolutionFileName)' == 'AlbumFixer.Local.slnx' and Exists('$(WpfFoundationProject)')">true</UseLocalWpfFoundation>
   </PropertyGroup>
 </Project>

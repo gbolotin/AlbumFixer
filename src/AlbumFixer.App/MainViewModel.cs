@@ -6,6 +6,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.Logging;
 using WpfFoundation.Dialogs;
+using WpfFoundation.Operations;
 
 namespace AlbumFixer.App;
 
@@ -23,6 +24,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly IUserInteractionService _userInteraction;
     private readonly IFileDialogService _fileDialogs;
     private readonly IUiTimer _progressTimer;
+    private readonly IOperationFeedback _operationFeedback;
     private readonly ILogger<MainViewModel> _logger;
     private readonly CancellationTokenSource lifetimeCancellation = new();
     private CancellationTokenSource? _cancel;
@@ -41,6 +43,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _statusTitle = "Ready for a safe run";
     private string _statusDetail = "Inventory first. Originals stay in place whenever a proof is missing.";
     private double _progress;
+    private IOperationActivity? _runActivity;
     private string _progressTime = "Elapsed —";
     private bool _busy;
     private bool _isRunActive;
@@ -72,6 +75,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         IFileDialogService fileDialogs,
         AppearanceViewModel appearance,
         IUiTimer progressTimer,
+        IOperationFeedback operationFeedback,
         ILogger<MainViewModel> logger)
     {
         _scanner = scanner;
@@ -87,6 +91,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _fileDialogs = fileDialogs;
         Appearance = appearance;
         _progressTimer = progressTimer;
+        _operationFeedback = operationFeedback;
         _logger = logger;
 
         _progressTimer.Tick += ProgressTimer_Tick;
@@ -137,7 +142,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string SourceSize { get => _sourceSize; private set => SetProperty(ref _sourceSize, value); }
     public string StatusTitle { get => _statusTitle; private set => SetProperty(ref _statusTitle, value); }
     public string StatusDetail { get => _statusDetail; private set => SetProperty(ref _statusDetail, value); }
-    public double Progress { get => _progress; private set => SetProperty(ref _progress, value); }
+    public double Progress
+    {
+        get => _progress;
+        private set
+        {
+            if (SetProperty(ref _progress, value))
+            {
+                _runActivity?.Report(Math.Clamp(value / 100, 0, 1));
+            }
+        }
+    }
     public string ProgressTime { get => _progressTime; private set => SetProperty(ref _progressTime, value); }
 
     public bool Busy
@@ -823,6 +838,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var runBlocked = runAlbums.Count - runnable.Length + preservedOutsideRun.Count;
         var deleteOriginals = DeleteOriginals;
         var recheckCompletedAlbums = RecheckCompletedAlbums;
+        _runActivity = _operationFeedback.Start(retryOnly ? "Retrying failed albums" : "Processing albums");
         IsRunActive = true; Busy = true; Progress = 1; foreach (var item in Timeline) item.State = "Pending"; _cancel = new();
         _activeRunAdmittedCount = runnable.Length;
         _activeRunBlockedCount = runBlocked;
@@ -909,6 +925,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     : "Run canceled. The unfinished album transaction retained its original source.";
                 Apply(new(JobPhase.Canceled, (int)Progress, "canceled", detail, DateTimeOffset.UtcNow));
                 Log("CANCELED", detail);
+                _runActivity?.Complete(OperationOutcome.Cancelled);
             }
             else if (failed > 0)
             {
@@ -917,6 +934,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     : results[0].Error?.Message ?? "The album transaction failed and retained its original source.";
                 Apply(new(JobPhase.Failed, (int)Progress, "failed", detail, DateTimeOffset.UtcNow));
                 Log("ERROR", detail);
+                _runActivity?.Complete(succeeded > 0 ? OperationOutcome.CompletedWithErrors : OperationOutcome.Failed,
+                    runIsBatch ? $"{succeeded} of {runnable.Length} albums completed; {failed} failed" : "The album failed; its original was kept.");
             }
             else
             {
@@ -929,12 +948,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     : runIsBatch ? "Batch completed with quick checks" : "Album completed with quick checks";
                 StatusDetail = $"{tracks} track{S(tracks)} passed quick checks across {delivered} delivered album{S(delivered)}; {alreadyCompleted} already completed; {incomplete} incomplete; {blocked} blocked; {deleted} source image{S(deleted)} deleted.";
                 Log(incomplete > 0 ? "INCOMPLETE" : "DONE", $"{delivered} albums delivered, {alreadyCompleted} already completed, {incomplete} incomplete, {blocked} blocked, {tracks} tracks passed.");
+                _runActivity?.Complete(incomplete > 0 || blocked > 0 ? OperationOutcome.CompletedWithErrors : OperationOutcome.Succeeded,
+                    $"{delivered} album{S(delivered)} delivered, {alreadyCompleted} already completed, {incomplete} incomplete, {blocked} blocked");
             }
         }
         catch (Exception error)
         {
             _logger.LogError(error, "The run failed");
             Apply(new(JobPhase.Failed, (int)Progress, "failed", error.Message, DateTimeOffset.UtcNow)); Log("ERROR", error.Message);
+            _runActivity?.Complete(OperationOutcome.Failed, error.Message);
             if (!retryOnly && _scans.Count == 1) await EnsureTerminalReportAsync(false);
             await LoadReportAsync();
         }
@@ -952,6 +974,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     Log("CLEANUP", $"Could not remove the Album Fixer Temp job: {error.Message}");
                 }
             }
+            // Complete is ignored once an outcome was reported; this only covers an exit no branch above reached.
+            _runActivity?.Complete(OperationOutcome.Failed);
+            _runActivity = null;
             _progressTimer.Stop(); RefreshProgressTime(); _cancel.Dispose(); _cancel = null; IsRunActive = false; Busy = false;
         }
     }

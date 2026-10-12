@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/WpfFoundation/">
     <Project Path="../WpfFoundation/src/WpfFoundation/WpfFoundation.csproj" />
+    <Project Path="../WpfFoundation/src/WpfFoundation.Notifications/WpfFoundation.Notifications.csproj" />
   </Folder>
   <Project Path="src/AlbumFixer.App/AlbumFixer.App.csproj" />
   <Project Path="src/AlbumFixer.Core/AlbumFixer.Core.csproj" />
