@@ -13,7 +13,6 @@
         MinWidth="1040"
         MinHeight="680"
         Icon="Assets/AlbumFixer.ico"
-        Background="{StaticResource Bg}"
         WindowStartupLocation="CenterScreen"
         Closing="Window_Closing">
   <Window.Resources>
@@ -21,49 +20,41 @@
     <DataTemplate DataType="{x:Type app:ReportViewModel}"><views:ReportView /></DataTemplate>
     <DataTemplate DataType="{x:Type app:ActivityViewModel}"><views:ActivityView /></DataTemplate>
   </Window.Resources>
-  <Grid Background="{StaticResource Bg}">
+  <Grid>
     <Grid.RowDefinitions>
-      <RowDefinition Height="68" />
+      <RowDefinition Height="Auto" />
       <RowDefinition />
     </Grid.RowDefinitions>
-    <Border Background="#0E151D" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1">
-      <Grid Margin="24,0">
+    <Border BorderBrush="{DynamicResource DividerStrokeColorDefaultBrush}" BorderThickness="0,0,0,1" Padding="24,12">
+      <Grid>
         <Grid.ColumnDefinitions>
           <ColumnDefinition />
           <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-          <Border Width="40"
-                  Height="40"
-                  CornerRadius="10"
-                  Background="{StaticResource MintDark}"
-                  Margin="0,0,13,0">
-            <TextBlock Text="♫"
-                       Foreground="{StaticResource Mint}"
-                       FontSize="23"
-                       HorizontalAlignment="Center"
-                       VerticalAlignment="Center" />
-          </Border>
+          <TextBlock Text="&#xE8D6;"
+                     Style="{StaticResource TitleTextBlockStyle}"
+                     FontFamily="{DynamicResource SymbolThemeFontFamily}"
+                     Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                     VerticalAlignment="Center"
+                     Margin="0,0,12,0" />
           <StackPanel VerticalAlignment="Center">
-            <TextBlock Text="Album Fixer" FontWeight="SemiBold" FontSize="20" />
+            <TextBlock Text="Album Fixer" Style="{StaticResource SubtitleTextBlockStyle}" />
             <TextBlock Text="Verified library repair · every album is a transaction"
-                       Foreground="{StaticResource Muted}"
-                       FontSize="12" />
+                       Style="{StaticResource CaptionTextBlockStyle}"
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
           </StackPanel>
         </StackPanel>
-        <Border Grid.Column="1"
-                Background="#17242D"
-                CornerRadius="12"
-                Padding="10,5"
-                VerticalAlignment="Center">
-          <TextBlock Text="ALBUM-FIXER SKILL"
-                     Foreground="{StaticResource Mint}"
-                     FontSize="10"
-                     FontWeight="Bold" />
-        </Border>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+          <TextBlock Text="Theme" VerticalAlignment="Center" Margin="0,0,8,0" />
+          <ComboBox ItemsSource="{Binding Appearance.Themes}"
+                    SelectedItem="{Binding Appearance.SelectedTheme}"
+                    MinWidth="120"
+                    AutomationProperties.Name="Theme" />
+        </StackPanel>
       </Grid>
     </Border>
-    <Grid Grid.Row="1" Margin="20">
+    <Grid Grid.Row="1" Margin="24">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="360" />
         <ColumnDefinition Width="16" />
@@ -73,12 +64,12 @@
       <Grid Grid.Column="2">
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto" />
-          <RowDefinition Height="13" />
+          <RowDefinition Height="16" />
           <RowDefinition />
         </Grid.RowDefinitions>
         <views:RunStatusView />
-        <Border Grid.Row="2" Style="{StaticResource CardStyle}" Padding="0">
-          <TabControl Background="Transparent" BorderThickness="0">
+        <Border Grid.Row="2" Style="{StaticResource WfCardStyle}" Padding="0">
+          <TabControl Margin="8,8,8,0">
             <TabItem Header="Albums">
               <views:AlbumsView />
             </TabItem>

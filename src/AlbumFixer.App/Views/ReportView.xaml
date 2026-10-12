@@ -6,14 +6,6 @@
              xmlns:app="clr-namespace:AlbumFixer.App"
              mc:Ignorable="d"
              d:DataContext="{d:DesignInstance Type=app:ReportViewModel}">
-  <UserControl.Resources>
-    <Style x:Key="ReportFactStyle" TargetType="Border">
-      <Setter Property="Background" Value="#101923" />
-      <Setter Property="CornerRadius" Value="7" />
-      <Setter Property="Padding" Value="10,6" />
-      <Setter Property="Margin" Value="0,0,7,0" />
-    </Style>
-  </UserControl.Resources>
   <Grid Margin="16">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
@@ -28,50 +20,48 @@
         <ColumnDefinition Width="Auto" />
       </Grid.ColumnDefinitions>
       <StackPanel>
-        <TextBlock Text="{Binding Headline}" FontSize="17" FontWeight="SemiBold" />
+        <TextBlock Text="{Binding Headline}" Style="{StaticResource SubtitleTextBlockStyle}" />
         <TextBlock Text="{Binding Detail}"
-                   Foreground="{StaticResource Muted}"
+                   Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                    TextWrapping="Wrap"
-                   Margin="0,3,16,0" />
+                   Margin="0,4,16,0" />
       </StackPanel>
       <Button Grid.Column="1"
               Content="Refresh"
               Command="{Binding RefreshCommand}"
-              Style="{StaticResource ButtonStyle}"
-              Padding="11,7"
-              Margin="0,0,7,0" />
+              VerticalAlignment="Top"
+              Margin="0,0,8,0" />
       <Button Grid.Column="2"
               Content="Copy JSON"
               Command="{Binding CopyCommand}"
-              Style="{StaticResource ButtonStyle}"
-              Padding="11,7" />
-      <TextBlock Grid.Column="3" VerticalAlignment="Center" Margin="12,0,0,0">
-        <Hyperlink Command="{Binding OpenLogsFolderCommand}"
-                   ToolTip="{Binding LogsFolder}"
-                   Foreground="{StaticResource Mint}">Open logs folder</Hyperlink>
+              VerticalAlignment="Top" />
+      <TextBlock Grid.Column="3" Margin="12,8,0,0">
+        <Hyperlink Command="{Binding OpenLogsFolderCommand}" ToolTip="{Binding LogsFolder}">Open logs folder</Hyperlink>
       </TextBlock>
     </Grid>
-    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,13">
-      <Border Style="{StaticResource ReportFactStyle}">
+    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,12">
+      <Border Style="{StaticResource FactChipStyle}">
         <TextBlock Text="{Binding Status, StringFormat=Status  {0}}" />
       </Border>
-      <Border Style="{StaticResource ReportFactStyle}">
+      <Border Style="{StaticResource FactChipStyle}">
         <TextBlock Text="{Binding Tracks, StringFormat=Tracks  {0}}" />
       </Border>
-      <Border Style="{StaticResource ReportFactStyle}">
+      <Border Style="{StaticResource FactChipStyle}">
         <TextBlock Text="{Binding Sections, StringFormat=Discs / areas  {0}}" />
       </Border>
-      <Border Style="{StaticResource ReportFactStyle}" Margin="0">
+      <Border Style="{StaticResource FactChipStyle}" Margin="0">
         <TextBlock Text="{Binding Disposition, StringFormat=Originals  {0}}" />
       </Border>
     </StackPanel>
+    <!-- Monospaced, so the JSON's indentation lines up (allowlisted in xaml-design-allowlist.txt). -->
     <TextBox Grid.Row="2"
              Text="{Binding Json, Mode=OneWay}"
              IsReadOnly="True"
              FontFamily="Cascadia Mono, Consolas"
-             FontSize="11"
+             FontSize="{DynamicResource CaptionTextBlockFontSize}"
              AcceptsReturn="True"
              VerticalScrollBarVisibility="Auto"
-             HorizontalScrollBarVisibility="Auto" />
+             HorizontalScrollBarVisibility="Auto"
+             AutomationProperties.Name="Report JSON" />
   </Grid>
 </UserControl>

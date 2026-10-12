@@ -11,10 +11,7 @@
       <RowDefinition Height="Auto" />
       <RowDefinition />
     </Grid.RowDefinitions>
-    <TextBlock Text="Albums"
-               FontSize="15"
-               FontWeight="SemiBold"
-               Margin="0,0,0,12" />
+    <TextBlock Text="Albums" Style="{StaticResource BodyStrongTextBlockStyle}" Margin="0,0,0,12" />
     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
       <ItemsControl ItemsSource="{Binding Albums}" ItemTemplate="{StaticResource StatusRowTemplate}" />
     </ScrollViewer>

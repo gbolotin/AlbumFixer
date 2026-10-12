@@ -11,36 +11,33 @@
       <RowDefinition Height="Auto" />
       <RowDefinition />
     </Grid.RowDefinitions>
-    <TextBlock Text="Live activity"
-               FontSize="15"
-               FontWeight="SemiBold"
-               Margin="0,0,0,10" />
+    <TextBlock Text="Live activity" Style="{StaticResource BodyStrongTextBlockStyle}" Margin="0,0,0,12" />
     <ListBox Grid.Row="1" ItemsSource="{Binding Items}">
       <ListBox.ItemTemplate>
         <DataTemplate>
-          <Grid Margin="0,0,0,8">
+          <Grid>
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="72" />
-              <ColumnDefinition Width="80" />
+              <ColumnDefinition Width="96" />
               <ColumnDefinition />
             </Grid.ColumnDefinitions>
-            <TextBlock Text="{Binding Time}" Foreground="{StaticResource Muted}" FontFamily="Consolas" />
-            <TextBlock Grid.Column="1"
-                       Text="{Binding Kind}"
-                       FontSize="10"
-                       FontWeight="Bold">
+            <!-- Tabular figures keep the times aligned without a monospaced font. -->
+            <TextBlock Text="{Binding Time}"
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                       Typography.NumeralAlignment="Tabular" />
+            <TextBlock Grid.Column="1" Text="{Binding Kind}">
               <TextBlock.Style>
-                <Style TargetType="TextBlock">
-                  <Setter Property="Foreground" Value="{StaticResource Mint}" />
+                <Style TargetType="TextBlock" BasedOn="{StaticResource BodyStrongTextBlockStyle}">
+                  <Setter Property="Foreground" Value="{DynamicResource AccentTextFillColorPrimaryBrush}" />
                   <Style.Triggers>
                     <DataTrigger Binding="{Binding Kind}" Value="NOTICE">
-                      <Setter Property="Foreground" Value="{StaticResource Muted}" />
+                      <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}" />
                     </DataTrigger>
                     <DataTrigger Binding="{Binding Kind}" Value="WARNING">
-                      <Setter Property="Foreground" Value="{StaticResource Amber}" />
+                      <Setter Property="Foreground" Value="{DynamicResource SystemFillColorCautionBrush}" />
                     </DataTrigger>
                     <DataTrigger Binding="{Binding Kind}" Value="ERROR">
-                      <Setter Property="Foreground" Value="{StaticResource Red}" />
+                      <Setter Property="Foreground" Value="{DynamicResource SystemFillColorCriticalBrush}" />
                     </DataTrigger>
                   </Style.Triggers>
                 </Style>

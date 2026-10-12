@@ -70,6 +70,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         StartupPrerequisiteService startupPrerequisites,
         IUserInteractionService userInteraction,
         IFileDialogService fileDialogs,
+        AppearanceViewModel appearance,
         IUiTimer progressTimer,
         ILogger<MainViewModel> logger)
     {
@@ -84,6 +85,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         this.startupPrerequisites = startupPrerequisites;
         _userInteraction = userInteraction;
         _fileDialogs = fileDialogs;
+        Appearance = appearance;
         _progressTimer = progressTimer;
         _logger = logger;
 
@@ -108,6 +110,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public RangeObservableCollection<CheckRow> PreflightChecks { get; } = [];
     public RangeObservableCollection<CheckRow> Albums { get; } = [];
     public ObservableCollection<TimelineRow> Timeline { get; } = [];
+    public AppearanceViewModel Appearance { get; }
     public ReportViewModel Report { get; }
     public ActivityViewModel Activity { get; } = new();
     public InventoryViewModel MediaInventory { get; } = new();
