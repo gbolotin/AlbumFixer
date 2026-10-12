@@ -1,0 +1,82 @@
+<UserControl x:Class="AlbumFixer.App.Views.RunStatusView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:app="clr-namespace:AlbumFixer.App"
+             mc:Ignorable="d"
+             d:DataContext="{d:DesignInstance Type=app:MainViewModel}">
+  <!-- The run's progress, status and elapsed time, with Retry failed when a previous run left failures. -->
+  <Border Style="{StaticResource CardStyle}" Padding="22">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+      </Grid.RowDefinitions>
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="96" />
+        <ColumnDefinition />
+        <ColumnDefinition Width="Auto" />
+      </Grid.ColumnDefinitions>
+      <Border Width="76"
+              Height="76"
+              CornerRadius="38"
+              Background="{StaticResource MintDark}">
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="{Binding Progress, Mode=OneWay, StringFormat={}{0:0}%}"
+                     Foreground="{StaticResource Mint}"
+                     FontSize="21"
+                     FontWeight="Bold"
+                     HorizontalAlignment="Center" />
+          <TextBlock Text="PROGRESS"
+                     Foreground="{StaticResource Muted}"
+                     FontSize="8"
+                     HorizontalAlignment="Center" />
+        </StackPanel>
+      </Border>
+      <StackPanel Grid.Column="1" VerticalAlignment="Center">
+        <TextBlock Text="{Binding StatusTitle}" FontSize="21" FontWeight="SemiBold" />
+        <TextBlock Text="{Binding StatusDetail}"
+                   Foreground="{StaticResource Muted}"
+                   FontSize="12"
+                   Height="34"
+                   LineHeight="17"
+                   LineStackingStrategy="BlockLineHeight"
+                   TextWrapping="Wrap"
+                   TextTrimming="CharacterEllipsis"
+                   Margin="0,4,0,5" />
+        <TextBlock Text="{Binding ProgressTime}" Foreground="{StaticResource Muted}" FontSize="11" />
+      </StackPanel>
+      <StackPanel Grid.Column="2"
+                  MinWidth="112"
+                  Margin="22,0,0,0"
+                  VerticalAlignment="Center">
+        <Button Content="{Binding RetryFailedButtonLabel}"
+                Command="{Binding RetryFailedCommand}"
+                AutomationProperties.Name="Retry failed albums"
+                ToolTip="Freshly rescan and preflight only albums that failed in the previous run, then retry only those that pass."
+                Margin="0">
+          <Button.Style>
+            <Style TargetType="Button" BasedOn="{StaticResource ButtonStyle}">
+              <Setter Property="Visibility" Value="Collapsed" />
+              <Style.Triggers>
+                <DataTrigger Binding="{Binding HasRetryFailures}" Value="True">
+                  <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding IsRunActive}" Value="True">
+                  <Setter Property="Visibility" Value="Collapsed" />
+                </DataTrigger>
+              </Style.Triggers>
+            </Style>
+          </Button.Style>
+        </Button>
+      </StackPanel>
+      <ProgressBar Grid.Row="1"
+                   Grid.ColumnSpan="3"
+                   Value="{Binding Progress, Mode=OneWay}"
+                   Maximum="100"
+                   Height="7"
+                   Margin="0,9,0,0" />
+    </Grid>
+  </Border>
+</UserControl>

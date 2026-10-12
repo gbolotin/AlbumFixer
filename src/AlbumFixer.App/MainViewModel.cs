@@ -46,13 +46,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _isRunActive;
     private bool _deleteOriginals = true;
     private bool _recheckCompletedAlbums;
-    private string _reportHeadline = "No conversion report yet";
-    private string _reportDetail = "A validated summary and JSON report will appear here.";
-    private string _reportJson = "";
-    private string _reportStatus = "Pending";
-    private string _reportTracks = "—";
-    private string _reportSections = "—";
-    private string _reportDisposition = "—";
     private string _jobDirectory = "—";
     private JobPhase _lastPhase = JobPhase.Ready;
     private string _lastRunDetail = "No run has started.";
@@ -104,10 +97,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         StartCommand = new AsyncRelayCommand(StartAsync, () => CanStart);
         RetryFailedCommand = new AsyncRelayCommand(RetryFailedAsync, () => CanRetryFailed);
         CancelCommand = new RelayCommand(Cancel, () => IsRunActive);
-        RefreshReportCommand = new AsyncRelayCommand(LoadReportAsync, () => !Busy && SourceFolders.Count > 0);
         ClearSourceFoldersCommand = new RelayCommand(ClearSourceFolders, () => CanBrowse && SourceFolders.Count > 0);
-        CopyReportCommand = new RelayCommand(CopyReport, () => ReportJson.Length > 0);
-        OpenLogsFolderCommand = new RelayCommand(AppLogging.OpenLogsFolder);
+        Report = new ReportViewModel(userInteraction, LoadReportAsync, () => !Busy && SourceFolders.Count > 0);
 
         var titles = new[] { "Inventoried", "Preparing source", "Source size checked", "Split / extract", "Tagging", "Local verification", "Copying back", "Destination sizes", "Final commit", "Final verification", "Source disposition", "Cleanup" };
         for (var i = 0; i < titles.Length; i++) Timeline.Add(new() { Number = i + 1, Phase = (JobPhase)(i + 1), Title = titles[i] });
@@ -116,10 +107,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ObservableCollection<string> SourceFolders { get; } = [];
     public RangeObservableCollection<CheckRow> PreflightChecks { get; } = [];
     public RangeObservableCollection<CheckRow> Albums { get; } = [];
-    public RangeObservableCollection<MediaRow> Media { get; } = [];
     public ObservableCollection<TimelineRow> Timeline { get; } = [];
-    public ObservableCollection<ActivityRow> Activity { get; } = [];
-    public RangeObservableCollection<string> ReportErrors { get; } = [];
+    public ReportViewModel Report { get; }
+    public ActivityViewModel Activity { get; } = new();
+    public InventoryViewModel MediaInventory { get; } = new();
     public IAsyncRelayCommand BrowseCommand { get; }
 
     /// <summary>Adds folders dropped on the source list; WpfFoundation's FileDrop passes the dropped paths.</summary>
@@ -130,14 +121,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public IAsyncRelayCommand StartCommand { get; }
     public IAsyncRelayCommand RetryFailedCommand { get; }
     public IRelayCommand CancelCommand { get; }
-    public IAsyncRelayCommand RefreshReportCommand { get; }
     public IRelayCommand ClearSourceFoldersCommand { get; }
-    public IRelayCommand CopyReportCommand { get; }
-    public IRelayCommand OpenLogsFolderCommand { get; }
 
     /// <summary>The window title with the version, for example "Album Fixer 0.1.0-dev".</summary>
     public string WindowTitle => $"Album Fixer {ApplicationVersion.Current}";
-    public string LogsFolder => AppLogging.LogsFolder;
 
     public int SourceFolderCount => SourceFolders.Count;
     public string? BrowseInitialDirectory => SourceFolders.LastOrDefault();
@@ -253,23 +240,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         : DeletesSourceAfterSuccess
             ? "PCM/MD5 and cryptographic hash comparisons are skipped. Album Fixer deletes only the exact inventoried image, and only after tracks are committed and pass quick FLAC, tag, artwork, and file-size checks. If artwork cannot be completed, usable tracks are delivered as incomplete work and the image is retained."
             : "PCM/MD5 comparison is skipped. Multiple original images are retained after tracks are committed and pass quick checks.";
-    public string ReportHeadline { get => _reportHeadline; private set => SetProperty(ref _reportHeadline, value); }
-    public string ReportDetail { get => _reportDetail; private set => SetProperty(ref _reportDetail, value); }
-
-    public string ReportJson
-    {
-        get => _reportJson;
-        private set
-        {
-            if (SetProperty(ref _reportJson, value))
-                CopyReportCommand.NotifyCanExecuteChanged();
-        }
-    }
-
-    public string ReportStatus { get => _reportStatus; private set => SetProperty(ref _reportStatus, value); }
-    public string ReportTracks { get => _reportTracks; private set => SetProperty(ref _reportTracks, value); }
-    public string ReportSections { get => _reportSections; private set => SetProperty(ref _reportSections, value); }
-    public string ReportDisposition { get => _reportDisposition; private set => SetProperty(ref _reportDisposition, value); }
     public string JobDirectory { get => _jobDirectory; private set => SetProperty(ref _jobDirectory, value); }
 
     public async Task InitializeAsync()
@@ -282,8 +252,24 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         try
         {
-            var progress = new Progress<string>(detail => StatusDetail = detail);
-            var result = await startupPrerequisites.EnsureInstalledAsync(progress, lifetimeCancellation.Token);
+            // Progress<T> posts its updates, so a late "Verifying…" could otherwise replace the final status.
+            var checking = true;
+            var progress = new Progress<string>(detail =>
+            {
+                if (checking)
+                {
+                    StatusDetail = detail;
+                }
+            });
+            StartupPrerequisiteResult result;
+            try
+            {
+                result = await startupPrerequisites.EnsureInstalledAsync(progress, lifetimeCancellation.Token);
+            }
+            finally
+            {
+                checking = false;
+            }
             if (result.Succeeded)
             {
                 StatusTitle = "Required components are ready";
@@ -491,7 +477,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _scans = discoveredScans.Where(scan => scan.RequiresProcessing).ToArray();
             var firstRootScan = sourceScans[0].RootScan;
             _scan = _scans.Count == 1 ? _scans[0] : completedScans.Length == 1 && _scans.Count == 0 ? completedScans[0] : firstRootScan;
-            Replace(Media, sourceScans.SelectMany(source => source.RootScan.Media.Select(item => new MediaRow(
+            Replace(MediaInventory.Media, sourceScans.SelectMany(source => source.RootScan.Media.Select(item => new MediaRow(
                 SourceFolderCount == 1 ? item.RelativePath : Path.Combine(source.Folder, item.RelativePath),
                 item.Kind, item.Size > 0 ? SizeText.Format(item.Size) : "—", item.Note))));
             if (_scans.Count == 0 && completedScans.Length > 0)
@@ -851,8 +837,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _runStartedAt = DateTimeOffset.UtcNow;
         RefreshProgressTime();
         _progressTimer.Start();
-        ReportStatus = "Pending"; ReportTracks = ReportSections = ReportDisposition = "—"; ReportJson = "";
-        ReportHeadline = "Run in progress"; ReportDetail = "Terminal status will be recorded before transient staging is cleaned.";
+        Report.ShowRunInProgress();
         JobDirectory = PreflightService.CreateJobDirectory(runPreflight.TempRoot);
         var pipelineLimits = PreflightService.PipelineLimits(runAlbums);
         var workerLimit = pipelineLimits.MaxInFlight;
@@ -1388,20 +1373,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                         .ToArray();
                     return (status, total, succeeded, alreadyCompleted, failed, canceled, incomplete, blocked, tracks, sourceImages, deleted, workerLimit, prettyJson, errors);
                 });
-                ReportStatus = batch.status;
-                ReportHeadline = $"Batch {batch.status.Replace('_', ' ')} · {batch.succeeded + batch.alreadyCompleted}/{batch.total} albums completed";
-                ReportDetail = $"{batch.tracks} tracks · {batch.alreadyCompleted} already completed · {batch.incomplete} incomplete · {batch.failed} failed · {batch.blocked} blocked · {batch.canceled} canceled · worker limit {batch.workerLimit}";
-                ReportJson = batch.prettyJson;
-                ReportTracks = batch.tracks.ToString();
-                ReportSections = batch.total.ToString();
-                ReportDisposition = $"{batch.deleted} deleted · {batch.sourceImages - batch.deleted} retained";
-                Replace(ReportErrors, batch.errors);
+                Report.Show(
+                    batch.status,
+                    $"Batch {batch.status.Replace('_', ' ')} · {batch.succeeded + batch.alreadyCompleted}/{batch.total} albums completed",
+                    $"{batch.tracks} tracks · {batch.alreadyCompleted} already completed · {batch.incomplete} incomplete · {batch.failed} failed · {batch.blocked} blocked · {batch.canceled} canceled · worker limit {batch.workerLimit}",
+                    batch.prettyJson,
+                    batch.tracks.ToString(),
+                    batch.total.ToString(),
+                    $"{batch.deleted} deleted · {batch.sourceImages - batch.deleted} retained",
+                    batch.errors);
                 return;
             }
             catch (Exception error) when (error is IOException or JsonException)
             {
-                ReportHeadline = "Batch report is not readable yet";
-                ReportDetail = error.Message;
+                Report.ShowUnreadable("Batch report is not readable yet", error.Message);
                 return;
             }
         }
@@ -1415,8 +1400,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             .OrderByDescending(File.GetLastWriteTimeUtc)
             .ToArray());
         if (candidates.Length == 0) return;
-        try { var report = await Task.Run(() => ReportReader.LoadAsync(candidates[0])); ReportHeadline = report.Headline; ReportDetail = report.Detail; ReportJson = report.Json; ReportStatus = report.Status; ReportTracks = report.Tracks.ToString(); ReportSections = report.Sections.ToString(); ReportDisposition = report.Deleted ? "Deleted after quick checks" : "Retained"; Replace(ReportErrors, report.Errors); }
-        catch (Exception error) when (error is IOException or System.Text.Json.JsonException) { ReportHeadline = "Report is not readable yet"; ReportDetail = error.Message; }
+        try
+        {
+            var report = await Task.Run(() => ReportReader.LoadAsync(candidates[0]));
+            Report.Show(report.Status, report.Headline, report.Detail, report.Json, report.Tracks.ToString(), report.Sections.ToString(),
+                report.Deleted ? "Deleted after quick checks" : "Retained", report.Errors);
+        }
+        catch (Exception error) when (error is IOException or System.Text.Json.JsonException)
+        {
+            Report.ShowUnreadable("Report is not readable yet", error.Message);
+        }
     }
 
     private async Task EnsureTerminalReportAsync(bool canceled)
@@ -1532,12 +1525,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         return true;
     }
 
-    private void CopyReport()
-    {
-        if (ReportJson.Length > 0)
-            _userInteraction.CopyToClipboard(ReportJson);
-    }
-
     private void Invalidate()
     {
         if (Busy) return;
@@ -1554,7 +1541,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         PreflightChecks.Clear();
         Albums.Clear();
-        Media.Clear();
+        MediaInventory.Media.Clear();
 
         AlbumName = SourceFolderCount switch
         {
@@ -1607,7 +1594,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         StartCommand.NotifyCanExecuteChanged();
         RetryFailedCommand.NotifyCanExecuteChanged();
         CancelCommand.NotifyCanExecuteChanged();
-        RefreshReportCommand.NotifyCanExecuteChanged();
+        Report.RefreshCommand.NotifyCanExecuteChanged();
         ClearSourceFoldersCommand.NotifyCanExecuteChanged();
     }
 
@@ -1653,9 +1640,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private void Log(string kind, string message)
     {
         _logger.Log(LogLevelFor(kind), "{ActivityKind}: {ActivityMessage}", kind, message);
-        Activity.Insert(0, new(DateTime.Now.ToString("HH:mm:ss"), kind, message.ReplaceLineEndings(" ")));
-        while (Activity.Count > 250)
-            Activity.RemoveAt(Activity.Count - 1);
+        Activity.Add(kind, message);
     }
     private static LogLevel LogLevelFor(string kind) => kind switch
     {

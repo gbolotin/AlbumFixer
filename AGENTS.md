@@ -8,7 +8,7 @@ Album Fixer is a .NET 10 WPF application that locally splits FLAC+CUE images, ex
 
 Projects:
 - src/AlbumFixer.Core: scanning, preflight, staging, processing, metadata, verification, commit, reports and the source-retention policy. No WPF.
-- src/AlbumFixer.App: the WPF application. `MainViewModel` owns presentation state and the run orchestration; `App.xaml.cs` is the composition root (`Microsoft.Extensions.DependencyInjection`, validated on build).
+- src/AlbumFixer.App: the WPF application. `MainViewModel` coordinates the run and owns the source, album and status state; `ReportViewModel`, `InventoryViewModel` and `ActivityViewModel` hold their tabs' state. Each tab and panel is a UserControl in `Views`. `App.xaml.cs` is the composition root (`Microsoft.Extensions.DependencyInjection`, validated on build).
 - tests/AlbumFixer.Core.SmokeTests: a console runner that exercises Core end to end on generated fixtures.
 
 The adoption of WpfFoundation is scoped in [docs/wpffoundation-adoption.md](docs/wpffoundation-adoption.md), one pull request per slice.
