@@ -33,6 +33,11 @@ Album Fixer adopts WpfFoundation after UPSWarden, as section 11 of the WpfFounda
 - Add CI. It builds Release, runs the smoke tests, and publishes the self-contained `win-x64` app as a ZIP. Versions are `ci.<run>`, and a `vX.Y.Z` tag becomes a public GitHub Release (tags only with Gabi's approval).
 - Because the ZIP bundles `sacd_extract.exe` (GPL-2.0), every release keeps `Tools/COPYING.sacd_extract.txt` and `Tools/README.md` in the ZIP, and its notes link the exact corresponding upstream source (EuFlo/sacd-ripper 0.3.9.3b, build 173).
 - Add the XAML design check, report-only at first.
+- **Serilog:** add an application log, as UPSWarden and DoViFixer have.
+  - `AddLogging` plus `Serilog.Extensions.Hosting` behind `ILogger<T>` in the existing container.
+  - Rolling compact JSON files (`Serilog.Formatting.Compact`) under `%LOCALAPPDATA%\Album Fixer\Logs`, kept for 14 days and rolled over at 10 MB, with the application's name and version on every event.
+  - The log records startup checks, each album's lifecycle (scan, preflight, phases, terminal result and source disposition) and errors. It complements the per-album JSON reports and doesn't replace them.
+  - An **Open logs folder** link sits next to the report.
 
 ### 2. Dialogs and files
 - Move `WpfUserInteractionService` onto WpfFoundation's `IDialogService`:
@@ -62,10 +67,11 @@ Album Fixer adopts WpfFoundation after UPSWarden, as section 11 of the WpfFounda
 
 - **Processing:** all processing, verification, metadata lookup, staging and source-retention rules in `AlbumFixer.Core` stay as they are.
 - **Smoke tests:** the runner stays as it is. Converting it to MSTest is a separate decision.
-- **No other production dependencies:** `WpfFoundation` and `WpfFoundation.Notifications` are the only additions.
+- **No other production dependencies:** `WpfFoundation`, `WpfFoundation.Notifications` and the Serilog packages (`Serilog.Extensions.Hosting`, `Serilog.Sinks.File`, `Serilog.Formatting.Compact`) are the only additions.
 
 ## Decisions (Gabi, 2026-10-12)
 
 1. **Releases:** public GitHub Releases include `sacd_extract.exe` together with its GPL-2.0 license text and a link to the exact upstream source (slice 1).
 2. **Notifications:** a finished batch raises a Windows notification through `WpfFoundation.Notifications` (slice 5).
 3. **Theme:** Album Fixer supports System, Light and Dark instead of staying dark-only (slice 4).
+4. **Logging:** Album Fixer logs with Serilog, like UPSWarden and DoViFixer (slice 1).
