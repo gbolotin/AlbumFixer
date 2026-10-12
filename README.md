@@ -37,7 +37,9 @@ Download the `AlbumFixer-<version>-win-x64.zip` from a GitHub Release (or from a
 dotnet publish src\AlbumFixer.App\AlbumFixer.App.csproj -c Release -r win-x64 --self-contained -o publish\win-x64
 ```
 
-The packaged app is self-contained for 64-bit Windows and does not require a separate .NET installation. Keep the `Tools` folder beside `Album Fixer.exe`.
+The packaged app is self-contained for 64-bit Windows 10 version 2004 or later and does not require a separate .NET installation. Keep the `Tools` and `Assets` folders beside `Album Fixer.exe`.
+
+While a run is active, its progress shows on the Album Fixer taskbar button, and the outcome stays there as a badge until you return to the window. When a run ends while the window is in the background, Album Fixer also sends a Windows notification; it registers a Start menu shortcut for that at every start, and Settings > System > Notifications can turn it off.
 
 1. Add one or more album folders or parent folders. Each listed source is scanned recursively; duplicate or nested source selections are ignored.
 2. Select **Scan albums**. Review which albums are ready and which will be skipped; a blocked album does not block ready siblings.
