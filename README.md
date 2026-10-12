@@ -57,7 +57,7 @@ The published application includes the pinned `sacd_extract` 0.3.9.3b Windows ex
 
 ## Application architecture
 
-The WPF application uses MVVM. `MainViewModel` owns presentation state and exposes CommunityToolkit commands, while `MainWindow` contains only view-specific drag/drop and close-event adaptation. Dialogs, shell access, clipboard access, and the UI timer are behind injected interfaces.
+The WPF application uses MVVM. `MainViewModel` owns presentation state and exposes CommunityToolkit commands, while `MainWindow` contains only the close-event adaptation. Dropped folders reach the ViewModel through WpfFoundation's `FileDrop` behavior. Dialogs use WpfFoundation's shared dialog window and native folder picker; dialogs, shell access, clipboard access, and the UI timer are behind injected interfaces.
 
 `App.xaml.cs` is the composition root. It builds the `Microsoft.Extensions.DependencyInjection` service provider, registers logging, the core processing services and WPF adapters, resolves the main window, and disposes the graph when the application exits.
 

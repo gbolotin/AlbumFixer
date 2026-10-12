@@ -5,6 +5,7 @@ using AlbumFixer.Core;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.Logging;
+using WpfFoundation.Dialogs;
 
 namespace AlbumFixer.App;
 
@@ -20,6 +21,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly HostCommitService _commit;
     private readonly StartupPrerequisiteService startupPrerequisites;
     private readonly IUserInteractionService _userInteraction;
+    private readonly IFileDialogService _fileDialogs;
     private readonly IUiTimer _progressTimer;
     private readonly ILogger<MainViewModel> _logger;
     private readonly CancellationTokenSource lifetimeCancellation = new();
@@ -74,6 +76,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         HostCommitService commit,
         StartupPrerequisiteService startupPrerequisites,
         IUserInteractionService userInteraction,
+        IFileDialogService fileDialogs,
         IUiTimer progressTimer,
         ILogger<MainViewModel> logger)
     {
@@ -87,12 +90,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _commit = commit;
         this.startupPrerequisites = startupPrerequisites;
         _userInteraction = userInteraction;
+        _fileDialogs = fileDialogs;
         _progressTimer = progressTimer;
         _logger = logger;
 
         _progressTimer.Tick += ProgressTimer_Tick;
 
         BrowseCommand = new AsyncRelayCommand(BrowseAsync, () => CanBrowse);
+        AddDroppedFoldersCommand = new AsyncRelayCommand<string[]>(paths => AddSourceFoldersAsync(paths ?? []), _ => CanBrowse);
         RemoveSourceFolderCommand = new AsyncRelayCommand<string>(RemoveSourceFolderAsync, CanRemoveSourceFolder);
         OpenAlbumFolderCommand = new AsyncRelayCommand<string>(OpenAlbumFolderAsync, CanOpenAlbumFolder);
         ScanCommand = new AsyncRelayCommand(ScanAsync, () => CanBrowse && SourceFolders.Count > 0);
@@ -116,6 +121,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ObservableCollection<ActivityRow> Activity { get; } = [];
     public RangeObservableCollection<string> ReportErrors { get; } = [];
     public IAsyncRelayCommand BrowseCommand { get; }
+
+    /// <summary>Adds folders dropped on the source list; WpfFoundation's FileDrop passes the dropped paths.</summary>
+    public IAsyncRelayCommand<string[]> AddDroppedFoldersCommand { get; }
     public IAsyncRelayCommand<string> RemoveSourceFolderCommand { get; }
     public IAsyncRelayCommand<string> OpenAlbumFolderCommand { get; }
     public IAsyncRelayCommand ScanCommand { get; }
@@ -287,7 +295,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             StatusTitle = "Some components could not be installed";
             StatusDetail = "Affected workflows will remain blocked until the missing components are installed.";
             foreach (var failure in result.Failures) Log("COMPONENT", failure);
-            _userInteraction.ShowError(
+            await _userInteraction.ShowErrorAsync(
                 "Component installation failed",
                 "Album Fixer could not install these required components:\n\n" +
                 string.Join("\n\n", result.Failures.Select(failure => "• " + failure)) +
@@ -302,7 +310,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             StatusTitle = "Component check failed";
             StatusDetail = error.Message;
             Log("COMPONENT", error.Message);
-            _userInteraction.ShowError(
+            await _userInteraction.ShowErrorAsync(
                 "Component check failed",
                 $"Album Fixer could not complete its startup component check.\n\n{error.Message}\n\nThe app will remain open, but affected workflows may be blocked.");
         }
@@ -314,7 +322,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task BrowseAsync()
     {
-        var folder = _userInteraction.SelectSourceFolder(BrowseInitialDirectory);
+        var folder = _fileDialogs.PickFolder("Add an album or parent folder containing albums", BrowseInitialDirectory);
         if (folder is not null)
             await AddSourceFoldersAsync([folder]);
     }
@@ -630,7 +638,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             IsSingleTrackRepair,
             DeletesSourceAfterSuccess,
             PreviousOutputFileCount);
-        if (!_userInteraction.ConfirmStart(confirmation)) return;
+        if (!await _userInteraction.ConfirmStartAsync(confirmation)) return;
         await RunAlbumsAsync(_albumPreflights, _preflight, retryOnly: false,
             preservedRetryFailures: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase));
     }
@@ -1508,9 +1516,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (SourceFolders.Count > 0) await ScanAsync();
     }
 
-    public bool TryClose()
+    /// <summary>Whether closing needs <see cref="ConfirmCloseAsync"/> first, because a job is active.</summary>
+    public bool CloseNeedsConfirmation => Busy;
+
+    /// <summary>Asks before closing while a job is active, and cancels the job when the user confirms.</summary>
+    /// <returns>Whether the window may close.</returns>
+    public async Task<bool> ConfirmCloseAsync()
     {
-        if (Busy && !_userInteraction.ConfirmCloseWhileRunning())
+        if (Busy && !await _userInteraction.ConfirmCloseWhileRunningAsync())
             return false;
 
         if (Busy)
@@ -1588,6 +1601,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private void NotifyCommandStates()
     {
         BrowseCommand.NotifyCanExecuteChanged();
+        AddDroppedFoldersCommand.NotifyCanExecuteChanged();
         RemoveSourceFolderCommand.NotifyCanExecuteChanged();
         ScanCommand.NotifyCanExecuteChanged();
         StartCommand.NotifyCanExecuteChanged();
