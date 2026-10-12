@@ -2,6 +2,7 @@ using System.Windows;
 using AlbumFixer.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using WpfFoundation.Dialogs;
 
 namespace AlbumFixer.App;
 
@@ -25,6 +26,9 @@ public partial class App : Application
         services.AddSingleton<HostCommitService>();
         services.AddSingleton<StartupPrerequisiteService>();
 
+        services.AddSingleton<Application>(this);
+        services.AddSingleton<IDialogService, DialogService>();
+        services.AddSingleton<IFileDialogService, FileDialogService>();
         services.AddSingleton<IUserInteractionService, WpfUserInteractionService>();
         services.AddSingleton<IUiTimer, DispatcherUiTimer>();
         services.AddSingleton<MainViewModel>();

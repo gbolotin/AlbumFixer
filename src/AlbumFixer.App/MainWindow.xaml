@@ -2,6 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:core="clr-namespace:AlbumFixer.Core;assembly=AlbumFixer.Core"
+        xmlns:behaviors="clr-namespace:WpfFoundation.Behaviors;assembly=WpfFoundation"
         Title="{Binding WindowTitle}" Width="1300" Height="840" MinWidth="1040" MinHeight="680"
         Icon="Assets/AlbumFixer.ico"
         Background="{StaticResource Bg}" WindowStartupLocation="CenterScreen" Closing="Window_Closing">
@@ -22,7 +23,7 @@
           </Grid.RowDefinitions>
           <TextBlock Text="SOURCE FOLDERS" Foreground="{StaticResource Muted}" FontSize="10" FontWeight="Bold" Margin="0,0,0,9"/>
           <Border Grid.Row="1" Background="#0E161F" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6" Padding="9" MinHeight="74"
-                  AllowDrop="True" IsEnabled="{Binding CanBrowse}" DragOver="SourceFolders_DragOver" Drop="SourceFolders_Drop">
+                  AllowDrop="True" IsEnabled="{Binding CanBrowse}" behaviors:FileDrop.Command="{Binding AddDroppedFoldersCommand}">
             <Grid>
               <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
               <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">

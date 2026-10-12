@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Windows;
 using System.Windows.Threading;
-using Microsoft.Win32;
+using WpfFoundation.Dialogs;
 
 namespace AlbumFixer.App;
 
@@ -13,41 +13,29 @@ public sealed record StartConfirmation(
     bool DeletesSourceAfterSuccess,
     int PreviousOutputFileCount);
 
+/// <summary>Album Fixer's confirmations, errors, clipboard and Explorer access, so the ViewModel stays testable.</summary>
 public interface IUserInteractionService
 {
-    string? SelectSourceFolder(string? initialDirectory);
-    bool ConfirmStart(StartConfirmation confirmation);
-    bool ConfirmCloseWhileRunning();
+    Task<bool> ConfirmStartAsync(StartConfirmation confirmation);
+    Task<bool> ConfirmCloseWhileRunningAsync();
     void CopyToClipboard(string text);
     Task OpenFolderAsync(string path);
-    void ShowError(string title, string message);
+    Task ShowErrorAsync(string title, string message);
 }
 
-public sealed class WpfUserInteractionService : IUserInteractionService
+/// <summary>
+/// Shows Album Fixer's wording through WpfFoundation's shared dialog window. Every confirmation that can delete
+/// a source or interrupt a job keeps the safe choice as the default button.
+/// </summary>
+public sealed class WpfUserInteractionService(IDialogService dialogs) : IUserInteractionService
 {
-    private static Window? Owner => Application.Current.MainWindow;
-
-    public string? SelectSourceFolder(string? initialDirectory)
-    {
-        var picker = new OpenFolderDialog
-        {
-            Title = "Add an album or parent folder containing albums",
-            Multiselect = false
-        };
-
-        if (!string.IsNullOrWhiteSpace(initialDirectory))
-            picker.InitialDirectory = initialDirectory;
-
-        return picker.ShowDialog(Owner) == true ? picker.FolderName : null;
-    }
-
-    public bool ConfirmStart(StartConfirmation confirmation)
+    public Task<bool> ConfirmStartAsync(StartConfirmation confirmation)
     {
         if (!confirmation.DeleteOriginals && !confirmation.IsSingleTrackRepair ||
             confirmation.IsBatch ||
             !confirmation.IsSingleSacd && !confirmation.IsSingleTrackRepair && confirmation.DeletesSourceAfterSuccess)
         {
-            return true;
+            return Task.FromResult(true);
         }
 
         var cleanup = confirmation.PreviousOutputFileCount > 0
@@ -87,36 +75,31 @@ public sealed class WpfUserInteractionService : IUserInteractionService
                    Start this run?
                    """;
 
-        var title = confirmation.IsSingleTrackRepair
-            ? "Confirm verified track repair"
+        var (title, confirmLabel) = confirmation.IsSingleTrackRepair
+            ? confirmation.DeletesSourceAfterSuccess
+                ? ("Confirm verified track repair", "Repair and delete ISO")
+                : ("Confirm verified track repair", "Start repair")
             : confirmation.IsSingleSacd
-            ? "Confirm verified SACD extraction"
+            ? ("Confirm verified SACD extraction", "Extract and delete ISO")
             : confirmation.DeletesSourceAfterSuccess
-                ? "Confirm source deletion"
-                : "Confirm multi-image split";
+                ? ("Confirm source deletion", "Split and delete image")
+                : ("Confirm multi-image split", "Start split");
 
-        return MessageBox.Show(
-            Owner,
-            message,
-            title,
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning,
-            MessageBoxResult.No) == MessageBoxResult.Yes;
+        // Destructive: the safe "Don't start" stays the default button, as No was with the message box.
+        return dialogs.ConfirmAsync(title, message.Trim(), confirmLabel, "Don't start", isDestructive: true);
     }
 
-    public bool ConfirmCloseWhileRunning() =>
-        MessageBox.Show(
-            Owner,
-            "A job is active. Cancel it and close? Staging may need review.",
+    public Task<bool> ConfirmCloseWhileRunningAsync() =>
+        dialogs.ConfirmAsync(
             "Album Fixer is running",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning,
-            MessageBoxResult.No) == MessageBoxResult.Yes;
+            "A job is active. Cancel it and close? Staging may need review.",
+            "Cancel job and close",
+            "Keep running",
+            isDestructive: true);
 
     public void CopyToClipboard(string text) => Clipboard.SetText(text);
 
-    public void ShowError(string title, string message) =>
-        MessageBox.Show(Owner, message, title, MessageBoxButton.OK, MessageBoxImage.Error);
+    public Task ShowErrorAsync(string title, string message) => dialogs.ShowMessageAsync(title, message);
 
     public async Task OpenFolderAsync(string path)
     {
@@ -132,12 +115,7 @@ public sealed class WpfUserInteractionService : IUserInteractionService
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception or InvalidOperationException)
         {
-            MessageBox.Show(
-                Owner,
-                error.Message,
-                "Could not open album folder",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
+            await dialogs.ShowMessageAsync("Could not open album folder", error.Message);
         }
     }
 }
