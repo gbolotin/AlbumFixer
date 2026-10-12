@@ -31,11 +31,13 @@ Album Fixer is a native Windows app that locally splits FLAC+CUE images and extr
 
 ## Run
 
-Open:
+Download the `AlbumFixer-<version>-win-x64.zip` from a GitHub Release (or from a CI run's artifacts), unzip it anywhere, and open `Album Fixer.exe`. To build the same package locally:
 
-`publish\win-x64\Album Fixer.exe`
+```powershell
+dotnet publish src\AlbumFixer.App\AlbumFixer.App.csproj -c Release -r win-x64 --self-contained -o publish\win-x64
+```
 
-The packaged app is self-contained for 64-bit Windows and does not require a separate .NET installation.
+The packaged app is self-contained for 64-bit Windows and does not require a separate .NET installation. Keep the `Tools` folder beside `Album Fixer.exe`.
 
 1. Add one or more album folders or parent folders. Each listed source is scanned recursively; duplicate or nested source selections are ignored.
 2. Select **Scan albums**. Review which albums are ready and which will be skipped; a blocked album does not block ready siblings.
